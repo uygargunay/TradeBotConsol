@@ -1,0 +1,1 @@
+public interface IBroker{ void SubmitOrder(string symbol,int qty,decimal price,TradeSide side);}
