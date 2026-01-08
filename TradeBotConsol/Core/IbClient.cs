@@ -64,7 +64,7 @@ public class IbClient : EWrapper
 
         // 3. STARTUP NOTIFICATIONS
         Console.WriteLine("Connected! Sending Startup Email...");
-        _broker.SendEmailSummary("uygargunay@gmail.com"); // Reusing your existing email logic
+        _broker.SendEmailSummary("uygargunay@gmail.com"); 
 
         _client.reqAccountSummary(9001, "All", "NetLiquidation,AvailableFunds");
         _client.reqMarketDataType(4); // Ensure delayed data works for SPY
@@ -94,13 +94,13 @@ public class IbClient : EWrapper
         _nextReqId = orderId;
         Console.WriteLine($"Connected. Next Valid ID: {orderId}");
 
-        // Request delayed data (Type 1) if you don't have a live feed subscription
+        // Request delayed data (Type 1) 
         _client.reqMarketDataType(4);
 
         // --- Market Benchmark (Required for the Regime Filter) ---
         Subscribe("SPY");
         Subscribe("QQQ");
-        // --- Your Trading Universe ---
+        // --- Trading Universe ---
         Subscribe("AAPL");
         Subscribe("GOOG");
         Subscribe("PLTR");
@@ -113,7 +113,7 @@ public class IbClient : EWrapper
 
     // Inside IbClient class
     private readonly Dictionary<string, decimal> _currentBatch = new();
-    private readonly SimulatedBroker _broker = new(); // Your logic class
+    private readonly SimulatedBroker _broker = new(); //  logic class
 
     public void tickPrice(int tickerId, int field, double price, TickAttrib attribs)
     {
@@ -143,7 +143,7 @@ public class IbClient : EWrapper
         _client.reqPositions();
     }
 
-    // This is an EWrapper method
+
     private void ExecuteRealTrade(Trade trade)
     {
         Contract contract = new Contract
@@ -197,8 +197,8 @@ public class IbClient : EWrapper
     }
     public void StartStartupSequence()
     {
-        _broker.LoadState(); // 1. Load what we thought we had
-        _client.reqPositions(); // 2. Ask IBKR what we ACTUALLY have
+        _broker.LoadState(); // 1. Load 
+        _client.reqPositions(); // 2. Ask IBKR what  ACTUALLY have
     }
 
     // EWrapper Method
@@ -206,7 +206,7 @@ public class IbClient : EWrapper
     {
         if (pos == 0) return;
 
-        // If IBKR says we have it, but our bot doesn't know about it:
+        // If IBKR says  have it, but  bot doesn't know about it:
         if (!_broker.Positions.ContainsKey(contract.Symbol))
         {
             Console.WriteLine($"[ALERT] Found untracked position: {contract.Symbol}. Adding to bot.");
@@ -235,14 +235,14 @@ public class IbClient : EWrapper
     public void openOrderEnd() { }
     public void currentTime(long time) { }
     public void managedAccounts(string accountsList) { }
-    // Call this in your Connect method
+
 public void accountSummary(int reqId, string account, string tag, string value, string currency)
     {
         if (tag == "AvailableFunds")
         {
             decimal cash = decimal.Parse(value);
             Console.WriteLine($"Available Cash: {cash}");
-            // You can use this to stop the bot if cash < tradeDollarAmount
+           
         }
     }
     public void accountSummaryEnd(int reqId) { }
@@ -259,15 +259,12 @@ public void accountSummary(int reqId, string account, string tag, string value, 
     public void historicalDataEnd(int reqId, string start, string end) { }
     public void marketDataType(int reqId, int marketDataType)
     {
-        // Look up which symbol this request ID belongs to
-        // (Assuming you have a way to map reqId to symbol, 
-        // or just print the raw update)
+   
 
         string status = (marketDataType == 1) ? "LIVE" : "DELAYED";
         Console.WriteLine($"[DATA] Stream Status Update: Request {reqId} is now {status}");
 
-        // Pass this to your broker if you want it tracked in the summary
-        // _broker.UpdateDataStatus(symbol, marketDataType);
+   
     }
     public void verifyMessageAPI(string apiData) { }
     public void verifyCompleted(bool isSuccessful, string errorText) { }

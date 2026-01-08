@@ -65,10 +65,10 @@ class Program
             while (true)
             {
                 // --- A. DATA HEALTH CHECK ---
-                // Alerts you if SPY or QQQ data stops updating for > 60 seconds
+                // Alerts  if SPY or QQQ data stops updating for > 60 seconds
                 if (!broker.CheckDataHealth())
                 {
-                    // The broker will print its own [ALERT] message to the console
+                   
                 }
 
                 // --- B. USER INPUT HANDLING ---

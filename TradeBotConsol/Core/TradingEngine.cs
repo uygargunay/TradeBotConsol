@@ -22,7 +22,7 @@ public class TradingEngine
         _positions.MarkToMarket(new Dictionary<string, decimal> { { symbol, price } });
 
 
-        // simple example strategy:
+
         // buy if flat and price ends in .00 just as a placeholder rule
         if (!_positions.Positions.ContainsKey(symbol) || _positions.Positions[symbol].Quantity == 0)
         {
