@@ -4,7 +4,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
 using System.Threading;
-using TradeBotConsol;
 
 class Program
 {
@@ -20,7 +19,6 @@ class Program
             if (File.Exists(stateFile))
             {
                 FileInfo fileInfo = new FileInfo(stateFile);
-
                 if (fileInfo.Length > 0)
                 {
                     broker.LoadState();
@@ -29,11 +27,8 @@ class Program
                     if (fileInfo.LastWriteTime.Date < DateTime.Now.Date)
                     {
                         Console.WriteLine("[SYSTEM] New day detected.");
-
-                        // Save yesterday's performance to trade_history_log.txt
                         broker.ArchiveDailyResults();
 
-                        // Reset PnL and Trade Counters for today
                         Console.WriteLine("[SYSTEM] Resetting daily counters for a fresh session...");
                         broker.ResetDailyTrades();
                     }
@@ -52,10 +47,11 @@ class Program
             // 2. CONNECT TO INTERACTIVE BROKERS
             bot.Connect();
 
+            // UPDATED STARTUP DISPLAY
             Console.WriteLine("\n===============================================");
             Console.WriteLine("   TRADING BOT ACTIVE (PST TIME)");
             Console.WriteLine("   Filters: SPY + QQQ (Double-Green Logic)");
-            Console.WriteLine("   Circuit Breaker: -$300.00 Daily");
+            Console.WriteLine("   Circuit Breaker: -$400.00 Daily"); // Updated label
             Console.WriteLine("===============================================");
             Console.WriteLine("   Press 'S' to Save & Exit Safely.");
             Console.WriteLine("   Press 'P' for Live Daily Summary.");
@@ -64,19 +60,11 @@ class Program
             // 3. MAIN MONITORING LOOP
             while (true)
             {
-                // --- A. DATA HEALTH CHECK ---
-                // Alerts  if SPY or QQQ data stops updating for > 60 seconds
-                if (!broker.CheckDataHealth())
-                {
-                   
-                }
-
                 // --- B. USER INPUT HANDLING ---
                 if (Console.KeyAvailable)
                 {
                     var key = Console.ReadKey(intercept: true).Key;
 
-                    // Manual Save and Exit
                     if (key == ConsoleKey.S)
                     {
                         Console.WriteLine("\n[EXIT] Saving final state...");
@@ -85,33 +73,27 @@ class Program
                         break;
                     }
 
-                    // Status Report
                     if (key == ConsoleKey.P)
                     {
+                        // This will now use the detailed summary we built
                         broker.PrintDailySummary();
                     }
                 }
 
                 // --- C. AUTOMATIC EOD CHECK ---
-                // Checks if it is 12:55 PM (5 mins before close) to liquidate positions
+                // The broker internal logic handles the 12:45 PM liquidation
                 broker.CheckEndOfDayLiquidation();
 
-                // Keep CPU usage low
                 Thread.Sleep(100);
             }
         }
         catch (Exception ex)
         {
             // 4. EMERGENCY CRASH HANDLING
-            string errorDetails = $"CRITICAL BOT CRASH\nTime: {DateTime.Now}\nError: {ex.Message}\nStack: {ex.StackTrace}";
+            string errorDetails = $"CRITICAL BOT CRASH\nTime: {DateTime.Now}\nError: {ex.Message}";
             Console.WriteLine("\n" + errorDetails);
 
-            // Attempt to send crash report via email
-            try
-            {
-                broker.SendEmailSummary("uygargunay@gmail.com");
-            }
-            catch { /* Avoid nested crash */ }
+            try { broker.SendEmailSummary("uygargunay@gmail.com"); } catch { }
 
             Console.WriteLine("\nPress any key to terminate...");
             Console.ReadKey();
