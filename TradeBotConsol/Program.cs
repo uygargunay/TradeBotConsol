@@ -51,10 +51,11 @@ class Program
             Console.WriteLine("\n===============================================");
             Console.WriteLine("   TRADING BOT ACTIVE (PST TIME)");
             Console.WriteLine("   Filters: SPY + QQQ (Double-Green Logic)");
-            Console.WriteLine("   Circuit Breaker: -$400.00 Daily"); // Updated label
+            Console.WriteLine("   Circuit Breaker: -$400.00 Daily");
             Console.WriteLine("===============================================");
             Console.WriteLine("   Press 'S' to Save & Exit Safely.");
             Console.WriteLine("   Press 'P' for Live Daily Summary.");
+            Console.WriteLine("   Press 'K' for EMERGENCY LIQUIDATION (Sell All)."); // Added hint
             Console.WriteLine("===============================================\n");
 
             // 3. MAIN MONITORING LOOP
@@ -75,13 +76,20 @@ class Program
 
                     if (key == ConsoleKey.P)
                     {
-                        // This will now use the detailed summary we built
                         broker.PrintDailySummary();
+                    }
+
+                    // --- NEW EMERGENCY MANUAL LIQUIDATION ---
+                    if (key == ConsoleKey.K)
+                    {
+                        Console.WriteLine("\n[!!!] MANUAL LIQUIDATION REQUESTED...");
+                        var closedTrades = broker.CheckEndOfDayLiquidation(force: true);
+                        Console.WriteLine($"[SYSTEM] Successfully closed {closedTrades.Count} positions.");
                     }
                 }
 
                 // --- C. AUTOMATIC EOD CHECK ---
-                // The broker internal logic handles the 12:45 PM liquidation
+                // This call ensures that at 12:45 PM the broker clears all positions
                 broker.CheckEndOfDayLiquidation();
 
                 Thread.Sleep(100);

@@ -1,0 +1,16 @@
+1. The "Entry" Gates (Must all be TRUE)Time: 
+	Must be between 08:10 AM and 12:40 PM PST.
+	Broad Market Trend: The QQQ 20-period SMA must be above the 100-period SMA.
+	Individual Stock Trend: The specific stock's 20-SMA must be above its 100-SMA.
+	Cooldown: The stock must not be in the "Penalty Box" from a previous sell.
+2. The "Exit" Logic (Triggers a SELL)Trailing Stop: 
+	If the price drops by the specific % (e.g., 2% for AAPL) from its highest point since you bought it.
+	Profit Target: If the price hits your goal (e.g., 1.2% for MSFT).
+	Hard Stop: If the price drops below the initial entry stop level.
+	End of Day: At 12:45 PM PST, all open positions are sold regardless of profit/loss to avoid "overnight gap" risk.
+3. Current "Personality" Settings
+	Category Symbol Stop-Loss Profit Target
+	Giants AAPL, MSFT 2.0% 1.2% 
+	Volatile NVDA, TSLA 3.0% 2.5% - 3.0%
+	Rockets RKLB, PLTR 3.5% - 4.5% 3.5% - 5.0%
+	Default (Anything else) 2.5% 2.0%
