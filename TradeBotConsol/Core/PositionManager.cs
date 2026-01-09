@@ -120,59 +120,86 @@ namespace TradeBotConsol
 
         public void OnPriceUpdate(Dictionary<string, decimal> marketPrices)
         {
+            // 1. Heartbeat check
             if ((DateTime.Now - _lastHeartbeatTime).TotalHours >= 2 && IsInTradingWindow())
             {
                 SendTradeAlert("HEARTBEAT", "SYSTEM", 0, 0);
                 _lastHeartbeatTime = DateTime.Now;
             }
 
+            // 2. Circuit Breaker (Loss Limit)
+            if (_totalRealizedPnL <= -400.00m)
+            {
+                if (_positions.Count > 0) CheckEndOfDayLiquidation(true);
+                Console.WriteLine("[CRITICAL] Daily Loss Limit Hit. Trading Suspended.");
+                return;
+            }
+
+            // 3. Time-based exit check (EOD)
             CheckEndOfDayLiquidation();
 
             foreach (var kv in marketPrices)
             {
-                var symbol = kv.Key; var price = kv.Value;
+                var symbol = kv.Key;
+                var price = kv.Value;
+
                 if (!_priceHistory.ContainsKey(symbol)) _priceHistory[symbol] = new List<decimal>();
                 _priceHistory[symbol].Add(price);
-                if (_priceHistory[symbol].Count > 100) _priceHistory[symbol].RemoveAt(0);
+                if (_priceHistory[symbol].Count > 110) _priceHistory[symbol].RemoveAt(0);
 
-                if (_priceHistory[symbol].Count >= longSmaPeriod)
+                // Ensure we have enough history for SMA + Slope check
+                if (_priceHistory[symbol].Count >= longSmaPeriod + 5)
                 {
                     var history = _priceHistory[symbol];
                     var shortSma = history.Skip(history.Count - shortSmaPeriod).Average();
                     var longSma = history.Skip(history.Count - longSmaPeriod).Average();
 
+                    // --- SLOPE CALCULATION ---
+                    // Look at where the Long SMA was 5 ticks ago
+                    var prevLongSma = history.Skip(history.Count - (longSmaPeriod + 5)).Take(longSmaPeriod).Average();
+                    bool isSlopingUp = longSma > prevLongSma;
+
+                    // Update Regime Filter based on QQQ
                     if (symbol == "QQQ") _qqqBullish = (shortSma > longSma);
 
-                    // Position Management (Exit Logic)
+                    // 4. POSITION MANAGEMENT (Exit Logic)
                     if (_positions.ContainsKey(symbol))
                     {
-                        var pos = _positions[symbol]; pos.CurrentPrice = price;
+                        var pos = _positions[symbol];
+                        pos.CurrentPrice = price;
+
                         decimal target = _customTargets.GetValueOrDefault(symbol, 0.02m);
                         decimal stopPct = _customStops.GetValueOrDefault(symbol, 0.025m);
 
+                        // Update Trailing Stop
                         decimal newStop = price * (1 - stopPct);
                         if (newStop > pos.TrailingStop) pos.TrailingStop = newStop;
 
+                        // Profit Target or Trailing Stop hit
                         if (price <= pos.TrailingStop || price >= pos.AvgPrice * (1 + target))
                         {
                             SubmitOrder(symbol, (int)pos.Quantity, price, TradeSide.Sell);
                         }
                     }
 
-                    // Entry Logic
+                    // 5. ENTRY LOGIC (Buy Logic)
                     bool isCooling = _sellCooldowns.TryGetValue(symbol, out var cd) && DateTime.Now < cd;
-                    if (_qqqBullish && (shortSma > longSma) && !_positions.ContainsKey(symbol) && IsInTradingWindow() && !isCooling)
+
+                    // Added isSlopingUp to ensure we aren't buying a downward trend
+                    if (_qqqBullish && (shortSma > longSma) && isSlopingUp && !_positions.ContainsKey(symbol) && IsInTradingWindow() && !isCooling)
                     {
                         if (_tradesExecutedToday < maxTradesGlobal && _tradesToday.GetValueOrDefault(symbol, 0) < maxTradesPerSymbol)
                         {
                             var qty = (int)Math.Floor(tradeDollarAmount / price);
-                            if (qty > 0) SubmitOrder(symbol, qty, price, TradeSide.Buy);
+                            if (qty > 0)
+                            {
+                                SubmitOrder(symbol, qty, price, TradeSide.Buy);
+                            }
                         }
                     }
                 }
             }
         }
-
         public List<Trade> CheckEndOfDayLiquidation(bool force = false)
         {
             var trades = new List<Trade>();
