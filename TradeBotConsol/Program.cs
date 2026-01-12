@@ -9,6 +9,7 @@ class Program
 {
     static void Main(string[] args)
     {
+        // Initialize the IB Client and get the Broker/PositionManager instance
         IbClient bot = new IbClient();
         var broker = bot.GetBroker();
 
@@ -21,12 +22,14 @@ class Program
                 FileInfo fileInfo = new FileInfo(stateFile);
                 if (fileInfo.Length > 0)
                 {
+                    // Load the previous memory
                     broker.LoadState();
 
                     // Check if the file is from a previous calendar day
+                    // We use .Date to compare only the Day/Month/Year
                     if (fileInfo.LastWriteTime.Date < DateTime.Now.Date)
                     {
-                        Console.WriteLine("[SYSTEM] New day detected.");
+                        Console.WriteLine("[SYSTEM] New day detected. Archiving old results...");
                         broker.ArchiveDailyResults();
 
                         Console.WriteLine("[SYSTEM] Resetting daily counters for a fresh session...");
@@ -34,7 +37,7 @@ class Program
                     }
                     else
                     {
-                        Console.WriteLine("[SYSTEM] Resuming existing session from today.");
+                        Console.WriteLine("[SYSTEM] Today's session found. Resuming...");
                     }
                 }
                 else
@@ -45,63 +48,76 @@ class Program
             }
 
             // 2. CONNECT TO INTERACTIVE BROKERS
+            // Note: Ensure your TWS or IB Gateway is open and API is enabled
             bot.Connect();
 
-            // UPDATED STARTUP DISPLAY
-            Console.WriteLine("\n===============================================");
-            Console.WriteLine("   TRADING BOT ACTIVE (PST TIME)");
-            Console.WriteLine("   Filters: SPY + QQQ (Double-Green Logic)");
-            Console.WriteLine("   Circuit Breaker: -$400.00 Daily");
-            Console.WriteLine("===============================================");
-            Console.WriteLine("   Press 'S' to Save & Exit Safely.");
-            Console.WriteLine("   Press 'P' for Live Daily Summary.");
-            Console.WriteLine("   Press 'K' for EMERGENCY LIQUIDATION (Sell All)."); // Added hint
-            Console.WriteLine("===============================================\n");
+            // 3. DISPLAY THE DASHBOARD
+            // This shows your Goals, Limits, and Active Positions clearly
+            broker.PrintStartupConfiguration();
 
-            // 3. MAIN MONITORING LOOP
+            Console.WriteLine("\n[CONTROLS]");
+            Console.WriteLine(" [S] Save & Exit | [P] PnL Summary | [K] EMERGENCY KILL (Sell All)");
+            Console.WriteLine("====================================================\n");
+
+            // 4. MAIN MONITORING LOOP
             while (true)
             {
-                // --- B. USER INPUT HANDLING ---
+                // --- A. USER INPUT HANDLING ---
                 if (Console.KeyAvailable)
                 {
                     var key = Console.ReadKey(intercept: true).Key;
 
+                    // [S] SAFE EXIT
                     if (key == ConsoleKey.S)
                     {
-                        Console.WriteLine("\n[EXIT] Saving final state...");
+                        Console.WriteLine("\n[EXIT] Saving final state and disconnecting...");
                         broker.SaveState();
                         bot.Disconnect();
                         break;
                     }
 
+                    // [P] PRINT SUMMARY
                     if (key == ConsoleKey.P)
                     {
                         broker.PrintDailySummary();
                     }
 
-                    // --- NEW EMERGENCY MANUAL LIQUIDATION ---
+                    // [K] EMERGENCY LIQUIDATION
                     if (key == ConsoleKey.K)
                     {
-                        Console.WriteLine("\n[!!!] MANUAL LIQUIDATION REQUESTED...");
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine("\n[!!!] EMERGENCY MANUAL LIQUIDATION INITIATED...");
+                        Console.ResetColor();
+
                         var closedTrades = broker.CheckEndOfDayLiquidation(force: true);
-                        Console.WriteLine($"[SYSTEM] Successfully closed {closedTrades.Count} positions.");
+                        Console.WriteLine($"[SYSTEM] Closed {closedTrades.Count} positions. Trading Halted.");
                     }
                 }
 
-                // --- C. AUTOMATIC EOD CHECK ---
-                // This call ensures that at 12:45 PM the broker clears all positions
+                // --- B. AUTOMATIC END-OF-DAY CHECK ---
+                // This method internally checks if the time is > 3:45 PM ET
                 broker.CheckEndOfDayLiquidation();
 
+                // --- C. PREVENT CPU OVERLOAD ---
+                // Small sleep prevents the while(true) loop from using 100% CPU
                 Thread.Sleep(100);
             }
         }
         catch (Exception ex)
         {
-            // 4. EMERGENCY CRASH HANDLING
+            // 5. EMERGENCY CRASH HANDLING
             string errorDetails = $"CRITICAL BOT CRASH\nTime: {DateTime.Now}\nError: {ex.Message}";
+            Console.ForegroundColor = ConsoleColor.Red;
             Console.WriteLine("\n" + errorDetails);
+            Console.ResetColor();
 
-            try { broker.SendEmailSummary("uygargunay@gmail.com"); } catch { }
+            // Try to alert you via email
+            try
+            {
+                broker.SaveState(); // Save whatever we can
+                broker.SendEmailSummary("uygargunay@gmail.com");
+            }
+            catch { /* Fallback if email or save fails */ }
 
             Console.WriteLine("\nPress any key to terminate...");
             Console.ReadKey();
