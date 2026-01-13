@@ -71,7 +71,7 @@ public class IbClient : EWrapper, IBroker
         { IsBackground = true }.Start();
 
         _broker.LoadState();
-        _client.reqMarketDataType(4);
+        //_client.reqMarketDataType(3);
         _client.reqPositions();
 
         var liquidationTimer = new System.Timers.Timer(30000);
@@ -83,11 +83,36 @@ public class IbClient : EWrapper, IBroker
     public void nextValidId(int orderId)
     {
         _nextReqId = orderId;
-        _client.reqMarketDataType(4);
-        string[] symbols = { "SPY", "QQQ", "AAPL", "GOOG", "PLTR", "RKLB", "NVDA", "TSLA", "AMD", "MSFT" };
-        foreach (var sym in symbols) Subscribe(sym);
-    }
 
+        // --- DATA TYPE SETTING ---
+        // Change from 4 to 1. This tells IBKR to use your paid Real-Time subscriptions.
+        // IBKR will automatically fall back to delayed data for SPY/QQQ if you don't sub to those.
+        _client.reqMarketDataType(1);
+
+        string[] marketFilters = { "SPY", "QQQ" };
+        string[] activeWatchlist = { "NVDA", "TSLA", "PLTR", "AMD" };
+
+        Console.WriteLine("====================================================");
+        Console.WriteLine($"[STARTUP] Initializing Live Data Feed...");
+
+        foreach (var sym in marketFilters)
+        {
+            Subscribe(sym);
+            Console.WriteLine($" -> Market Filter Active: {sym} (Context Only)");
+        }
+
+        foreach (var sym in activeWatchlist)
+        {
+            Subscribe(sym);
+            Console.WriteLine($" -> LIVE Trading Enabled: {sym} ($1,000 Cap)");
+        }
+
+        Console.WriteLine("====================================================");
+
+        var broker = GetBroker();
+        broker.LoadState();
+        broker.PrintStartupConfiguration();
+    }
     public void tickPrice(int tickerId, int field, double price, TickAttrib attribs)
     {
         if ((field == 4 || field == 68) && price > 0)
@@ -108,7 +133,7 @@ public class IbClient : EWrapper, IBroker
     private void ExecuteRealTrade(Trade trade)
     {
         Contract contract = new Contract { Symbol = trade.Symbol, SecType = "STK", Exchange = "SMART", Currency = "USD", PrimaryExch = "ISLAND" };
-        Order order = new Order { Action = trade.Action == TradeSide.Buy ? "BUY" : "SELL", OrderType = "MKT", TotalQuantity = (double)trade.Quantity, Tif = "GTC" };
+        Order order = new Order { Action = trade.Action == TradeSide.Buy ? "BUY" : "SELL", OrderType = "MKT", TotalQuantity = (double)trade.Quantity, Tif = "DAY" };
         _client.placeOrder(_nextReqId++, contract, order);
     }
 
