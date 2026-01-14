@@ -11,10 +11,10 @@ public class IbClient : EWrapper, IBroker
     private int _nextReqId = 1;
 
     private readonly Dictionary<int, string> _reqIdToSymbol = new();
-    private readonly Dictionary<string, decimal> _currentBatch = new();
+    private readonly Dictionary<string, decimal> _currentPriceBatch = new();
+    private readonly Dictionary<string, long> _currentVolumeBatch = new(); // Tracks latest volume ticks
     private readonly PositionManager _broker;
 
-    // --- Add back missing Events and Properties ---
     public event Action<string, decimal> OnPrice;
     public PositionManager Broker => _broker;
 
@@ -26,7 +26,10 @@ public class IbClient : EWrapper, IBroker
         _broker.RealBroker = this;
     }
 
-    // --- Add back missing Helper Methods ---
+    // --- Data Retrieval Methods for Main Loop ---
+    public Dictionary<string, decimal> GetLatestPrices() => new Dictionary<string, decimal>(_currentPriceBatch);
+    public Dictionary<string, long> GetLatestVolumes() => new Dictionary<string, long>(_currentVolumeBatch);
+
     public PositionManager GetBroker() => _broker;
 
     public void Disconnect()
@@ -71,7 +74,6 @@ public class IbClient : EWrapper, IBroker
         { IsBackground = true }.Start();
 
         _broker.LoadState();
-        //_client.reqMarketDataType(3);
         _client.reqPositions();
 
         var liquidationTimer = new System.Timers.Timer(30000);
@@ -83,11 +85,7 @@ public class IbClient : EWrapper, IBroker
     public void nextValidId(int orderId)
     {
         _nextReqId = orderId;
-
-        // --- DATA TYPE SETTING ---
-        // Change from 4 to 1. This tells IBKR to use your paid Real-Time subscriptions.
-        // IBKR will automatically fall back to delayed data for SPY/QQQ if you don't sub to those.
-        _client.reqMarketDataType(1);
+        _client.reqMarketDataType(1); // Live data
 
         string[] marketFilters = { "SPY", "QQQ" };
         string[] activeWatchlist = { "NVDA", "TSLA", "PLTR", "AMD" };
@@ -95,66 +93,111 @@ public class IbClient : EWrapper, IBroker
         Console.WriteLine("====================================================");
         Console.WriteLine($"[STARTUP] Initializing Live Data Feed...");
 
-        foreach (var sym in marketFilters)
+        foreach (var sym in marketFilters.Concat(activeWatchlist))
         {
             Subscribe(sym);
-            Console.WriteLine($" -> Market Filter Active: {sym} (Context Only)");
-        }
-
-        foreach (var sym in activeWatchlist)
-        {
-            Subscribe(sym);
-            Console.WriteLine($" -> LIVE Trading Enabled: {sym} ($1,000 Cap)");
+            Console.WriteLine($" -> Monitoring: {sym}");
         }
 
         Console.WriteLine("====================================================");
-
-        var broker = GetBroker();
-        broker.LoadState();
-        broker.PrintStartupConfiguration();
     }
+
     public void tickPrice(int tickerId, int field, double price, TickAttrib attribs)
     {
+        // Field 4 is 'Last' price
         if ((field == 4 || field == 68) && price > 0)
         {
             if (_reqIdToSymbol.TryGetValue(tickerId, out string symbol))
             {
                 decimal decPrice = (decimal)price;
-                _currentBatch[symbol] = decPrice;
-
-                // Trigger the event for any UI or external logging
+                _currentPriceBatch[symbol] = decPrice;
                 OnPrice?.Invoke(symbol, decPrice);
 
-                _broker.OnPriceUpdate(_currentBatch);
+                // Note: OnPriceUpdate is called in the Main loop now, 
+                // but we keep the internal batch updated here.
             }
         }
     }
 
+    public void tickSize(int tickerId, int field, int size)
+    {
+        // Field 8 is 'Volume' (Last trade size)
+        if (field == 8 && _reqIdToSymbol.TryGetValue(tickerId, out string symbol))
+        {
+            lock (_currentVolumeBatch) // Add lock for thread safety
+            {
+                if (!_currentVolumeBatch.ContainsKey(symbol))
+                    _currentVolumeBatch[symbol] = 0;
+
+                // We use long for the dictionary to prevent overflow 
+                // but the parameter 'size' stays 'int' to match your interface
+                _currentVolumeBatch[symbol] += (long)size;
+            }
+        }
+    }
+    public void ClearVolume(string symbol)
+    {
+        if (_currentVolumeBatch.ContainsKey(symbol))
+        {
+            _currentVolumeBatch[symbol] = 0;
+        }
+    }
     private void ExecuteRealTrade(Trade trade)
     {
         Contract contract = new Contract { Symbol = trade.Symbol, SecType = "STK", Exchange = "SMART", Currency = "USD", PrimaryExch = "ISLAND" };
         Order order = new Order { Action = trade.Action == TradeSide.Buy ? "BUY" : "SELL", OrderType = "MKT", TotalQuantity = (double)trade.Quantity, Tif = "DAY" };
         _client.placeOrder(_nextReqId++, contract, order);
     }
-
     public void Subscribe(string symbol)
     {
         var contract = new Contract { Symbol = symbol, SecType = "STK", Currency = "USD", Exchange = "SMART", PrimaryExch = "ISLAND" };
         int reqId = _nextReqId++;
         _reqIdToSymbol[reqId] = symbol;
-        _client.reqMktData(reqId, contract, "233", false, false, null);
-    }
 
-    // --- FIX: Explicitly implement required EWrapper members ---
+        Console.WriteLine($"[SYSTEM] Requesting History for {symbol}...");
+
+        // Request ONLY history first
+        _client.reqHistoricalData(reqId, contract, "", "1800 S", "1 min", "TRADES", 1, 1, false, null);
+    }
     public void position(string account, Contract contract, double pos, double avgCost)
     {
         if (pos != 0) _broker.SyncExistingPosition(contract.Symbol, (decimal)pos, (decimal)avgCost);
     }
+    // Add these to your IbClient class
+    public bool IsConnected() => _client != null && _client.IsConnected();
 
-    public void positionEnd()
+    public void RequestMarketData(string symbol)
     {
-        Console.WriteLine("Portfolio reconciliation complete.");
+        // Reuse your existing Subscribe logic
+        Subscribe(symbol);
     }
+    public void historicalData(int reqId, Bar bar)
+    {
+        if (_reqIdToSymbol.TryGetValue(reqId, out string symbol))
+        {
+            // Use Capital 'C' for Close
+            decimal price = (decimal)bar.Close;
+
+            _currentPriceBatch[symbol] = price;
+
+            // This pushes the historical bar into your SMA/Trend logic
+            OnPrice?.Invoke(symbol, price);
+        }
+    }
+
+    public void historicalDataEnd(int reqId, string start, string end)
+    {
+        if (_reqIdToSymbol.TryGetValue(reqId, out string symbol))
+        {
+            Console.WriteLine($"[SYSTEM] History loaded for {symbol}. Starting Live Stream...");
+
+            var contract = new Contract { Symbol = symbol, SecType = "STK", Currency = "USD", Exchange = "SMART", PrimaryExch = "ISLAND" };
+
+            // NOW start the live market data
+            _client.reqMktData(reqId, contract, "233", false, false, null);
+        }
+    }
+    public void positionEnd() => Console.WriteLine("Portfolio reconciliation complete.");
 
     #region EWrapper Implementation
     public void error(int id, int errorCode, string errorMsg) => Console.WriteLine($"IB {errorCode}: {errorMsg}");
@@ -162,7 +205,6 @@ public class IbClient : EWrapper, IBroker
     public void error(string str) => Console.WriteLine($"Error: {str}");
     public void connectionClosed() => Console.WriteLine("Connection closed.");
     public void connectAck() { }
-    public void tickSize(int tickerId, int field, int size) { }
     public void tickString(int tickerId, int tickType, string value) { }
     public void tickGeneric(int tickerId, int tickType, double value) { }
     public void tickOptionComputation(int tickerId, int field, double impliedVol, double delta, double optPrice, double pvDividend, double gamma, double vega, double theta, double undPrice) { }
@@ -183,8 +225,7 @@ public class IbClient : EWrapper, IBroker
     public void execDetails(int reqId, Contract contract, Execution execution) { }
     public void execDetailsEnd(int reqId) { }
     public void fundamentalData(int reqId, string data) { }
-    public void historicalData(int reqId, Bar bar) { }
-    public void historicalDataEnd(int reqId, string start, string end) { }
+
     public void marketDataType(int reqId, int marketDataType) { }
     public void verifyMessageAPI(string apiData) { }
     public void verifyCompleted(bool isSuccessful, string errorText) { }
