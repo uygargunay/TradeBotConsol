@@ -161,16 +161,24 @@ public class IbClient : EWrapper, IBroker
 
     public void tickSize(int tickerId, int field, int size)
     {
+        // Field 8 = Cumulative Daily Volume
         if (field == 8 && _reqIdToSymbol.TryGetValue(tickerId, out string symbol))
         {
-            lock (_currentVolumeBatch)
+            long newTotalVolume = (long)size;
+
+            // Get the previous total to find the volume of THIS specific update
+            _currentVolumeBatch.TryGetValue(symbol, out long lastTotalVolume);
+            long tickVolume = (lastTotalVolume == 0) ? 0 : (newTotalVolume - lastTotalVolume);
+
+            if (tickVolume > 0)
             {
-                if (!_currentVolumeBatch.ContainsKey(symbol)) _currentVolumeBatch[symbol] = 0;
-                _currentVolumeBatch[symbol] += (long)size;
+                // Send the incremental volume to the Brain for Surge calculation
+                _broker.UpdateHistory(symbol, _currentPriceBatch.GetValueOrDefault(symbol), tickVolume);
             }
+
+            _currentVolumeBatch[symbol] = newTotalVolume; // Store the new total
         }
     }
-
     public void position(string account, Contract contract, double pos, double avgCost)
     {
         if (pos != 0) _broker.SyncExistingPosition(contract.Symbol, (decimal)pos, (decimal)avgCost);
