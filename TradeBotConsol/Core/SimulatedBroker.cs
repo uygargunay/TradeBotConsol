@@ -40,6 +40,7 @@ public class BotPersistData
     public Dictionary<string, List<decimal>> PriceHistory { get; set; } = new();
     public Dictionary<string, List<long>> VolumeHistory { get; set; } = new();
     public Dictionary<string, DateTime> LastSellTimes { get; set; } = new();
+    public Dictionary<string, bool> LastTradeWasLoss { get; set; } = new();
 }
 
 public class PositionManager : SimulatedBroker { }
@@ -134,6 +135,10 @@ public class SimulatedBroker : IBroker
         }
         catch { }
     }
+    // Ensure these are at the top of your SimulatedBroker class
+    private Dictionary<string, double> _peakRsi = new();
+    private Dictionary<string, bool> _lastTradeWasLoss = new(); // NEW: Track loss state
+
     public void ExecuteTradeLogic(string symbol)
     {
         if (symbol == "QQQ") return;
@@ -150,14 +155,17 @@ public class SimulatedBroker : IBroker
             double rsi = CalculateRSI(symbol, 14);
             string trend = GetTrend(prices);
 
-            // VWAP Calculation
+            // --- 1. SYNTHETIC SPREAD CHECK ---
+            decimal lastPrice = prices[prices.Count - 2];
+            decimal priceChangePct = Math.Abs((currentPrice - lastPrice) / lastPrice) * 100;
+            bool spreadIsTight = priceChangePct <= 0.12m;
+
+            // --- 2. VWAP & VOLUME ANALYSIS ---
             decimal vwap = _cumVolume.ContainsKey(symbol) && _cumVolume[symbol] > 0
                 ? _cumVwapProd[symbol] / _cumVolume[symbol] : currentPrice;
-
-            // Volume Surge Logic (Compare current volume to last 10-tick average)
-            decimal avgVolume = volumes.Count >= 10
-                ? (decimal)volumes.Skip(volumes.Count - 10).Average() : 0;
+            decimal avgVolume = volumes.Count >= 10 ? (decimal)volumes.Skip(volumes.Count - 10).Average() : 0;
             bool volumeSurge = avgVolume > 0 && currentVolume > (avgVolume * 1.2m);
+            bool volumeClimax = avgVolume > 0 && currentVolume > (avgVolume * 5.0m);
 
             bool hasPosition = _positions.ContainsKey(symbol);
 
@@ -165,26 +173,34 @@ public class SimulatedBroker : IBroker
             if (!hasPosition && _positions.Count < MaxActivePositions)
             {
                 DateTime nyNow = GetEasternTime();
-
-                // 1. Wait first 45 mins (Starts at 10:15 AM EST)
                 bool marketOpenTime = nyNow.TimeOfDay >= new TimeSpan(10, 0, 0) && nyNow.TimeOfDay < _latestEntryTime;
-                // 2. Daily Loss Limit Check
                 bool underLossLimit = _dailyLossCount < 4;
 
-                bool inCooldown = _lastSellTimes.TryGetValue(symbol, out var lastSell) && (DateTime.UtcNow - lastSell).TotalMinutes < 15;
+                // --- COOLDOWN LOGIC ---
+                _lastSellTimes.TryGetValue(symbol, out var lastSell);
+                double minutesSinceLastTrade = (DateTime.UtcNow - lastSell).TotalMinutes;
+
+                _lastTradeWasLoss.TryGetValue(symbol, out bool wasLoss);
+                // Standard cooldown is 15 mins, but if it was a loss, we wait 30 mins (Revenge Trade Shield)
+                int requiredCooldown = wasLoss ? 30 : 15;
+                bool inCooldown = minutesSinceLastTrade < requiredCooldown;
+
+                decimal ma20 = (decimal)prices.Skip(prices.Count - 20).Average();
+                bool isOverextended = currentPrice > (ma20 * 1.012m);
 
                 if (marketOpenTime && underLossLimit && !inCooldown && IsMarketSafe())
                 {
-                    // SMART BULL LOGIC: Trend + RSI + Above VWAP + Volume Surge
-                    if (trend == "BULL" && rsi > 45 && rsi < 65 && currentPrice > vwap && volumeSurge)
+                    if (trend == "BULL" && rsi > 45 && rsi < 65 && currentPrice > vwap && volumeSurge &&
+                        !isOverextended && !volumeClimax && spreadIsTight)
                     {
                         decimal targetSpend = 1000m;
                         int qty = (int)Math.Floor((targetSpend - 1.00m) / currentPrice);
                         if (qty > 0)
                         {
+                            _peakRsi[symbol] = rsi;
                             SubmitOrder(symbol, qty, currentPrice, TradeSide.Buy);
                             Task.Run(() => SendEmailNotification($"🟢 SMART BUY: {symbol}",
-                                $"Bought {qty} @ {currentPrice:C2}\nVol Surge: {volumeSurge}\nTrend: {trend}\nRSI: {rsi:F1}"));
+                                $"Bought {qty} @ {currentPrice:C2}\nTrend: {trend}\nRSI: {rsi:F1}"));
                         }
                     }
                 }
@@ -195,37 +211,43 @@ public class SimulatedBroker : IBroker
                 var pos = _positions[symbol];
                 pos.CurrentPrice = currentPrice;
                 decimal netPnL = pos.UnrealizedPnL - roundTripFee;
-                bool isWin = netPnL > 0;
-
                 _buyTimes.TryGetValue(symbol, out var buyTime);
                 bool timeShieldActive = (DateTime.UtcNow - buyTime).TotalMinutes < 15;
 
-                // Breakeven Plus Logic (Covering $2 commission + $5 profit)
-                if (!pos.IsBreakEvenProtected && netPnL > 5.00m)
+                if (!_peakRsi.ContainsKey(symbol) || rsi > _peakRsi[symbol]) _peakRsi[symbol] = rsi;
+
+                // VOLATILITY STOP: Tighten stop to 0.4% once up $6.00
+                if (netPnL > 6.00m)
                 {
-                    pos.TrailingStop = pos.AvgPrice + (roundTripFee / pos.Quantity);
+                    decimal tightStop = currentPrice * 0.996m;
+                    if (tightStop > pos.TrailingStop) pos.TrailingStop = tightStop;
                     pos.IsBreakEvenProtected = true;
                 }
 
-                // Standard Trailing Stop Update
-                decimal standardStop = currentPrice * (1 - maxTradeLossPct);
-                if (standardStop > pos.TrailingStop) pos.TrailingStop = standardStop;
-
+                double peak = _peakRsi[symbol];
+                bool rsiHooked = peak > 75 && rsi < (peak - 3.0);
+                bool climaxExit = volumeClimax && netPnL > 2.00m;
                 bool hitStop = currentPrice <= pos.TrailingStop;
-                bool rsiWinExit = rsi >= 72 && isWin;
+                bool rsiWinExit = (rsi >= 80 && netPnL > 3.00m) || rsiHooked || (rsi >= 72 && trend == "FLAT" && netPnL > 1.50m);
 
-                if (hitStop || rsiWinExit)
+                if (hitStop || rsiWinExit || climaxExit)
                 {
-                    // 15-Min Loss Shield: Block exit if losing and under 15 mins
-                    if (!isWin && timeShieldActive && hitStop) return;
+                    if (hitStop && netPnL < 0 && timeShieldActive) return;
+
+                    // Track if this exit is a loss for the next cooldown
+                    _lastTradeWasLoss[symbol] = netPnL < 0;
 
                     SubmitOrder(symbol, (int)pos.Quantity, currentPrice, TradeSide.Sell);
-                    Task.Run(() => SendEmailNotification($"🟢 SMART SELL: {symbol}",
-    $"Sold {pos.Quantity} @ {currentPrice:C2}\nVol Surge: {volumeSurge}\nTrend: {trend}\nRSI: {rsi:F1}\nNet PnL: {netPnL:F1}"));
+                    _peakRsi.Remove(symbol);
+
+                    string reason = hitStop ? "STOP" : (climaxExit ? "CLIMAX" : "RSI_HOOK");
+                    Task.Run(() => SendEmailNotification($"🔴 SMART SELL ({reason}): {symbol}",
+                        $"Sold @ {currentPrice:C2}\nNet PnL: {netPnL:C2}\nCooldown Set: {(netPnL < 0 ? "30m" : "15m")}"));
                 }
             }
         }
     }
+
     public void CheckDailyGoal()
     {
         lock (_lock)
@@ -275,8 +297,11 @@ public class SimulatedBroker : IBroker
                 decimal execPrice = price * (1 - slippagePct);
                 decimal pnl = (execPrice - pos.AvgPrice) * pos.Quantity - roundTripFee;
 
-                // Track Daily Losses
-                if (pnl < 0)
+                // Update Revenge Trade Shield
+                bool isLoss = pnl < 0;
+                _lastTradeWasLoss[symbol] = isLoss;
+
+                if (isLoss)
                 {
                     _dailyLossCount++;
                     if (_dailyLossCount >= 4)
@@ -285,10 +310,12 @@ public class SimulatedBroker : IBroker
                         Task.Run(() => SendEmailNotification("⚠️ LOSS LIMIT REACHED", "4 losses hit. Stopping for the day."));
                     }
                 }
+
                 LogTradeToCSV(symbol, "SELL", execPrice, pnl, CalculateRSI(symbol, 14), true);
                 _totalRealizedPnL += pnl;
                 _tradeHistory.Add(new ClosedTrade { Symbol = symbol, Profit = pnl, ExitTime = DateTime.UtcNow });
                 _positions.Remove(symbol);
+                _peakRsi.Remove(symbol);
                 _lastSellTimes[symbol] = DateTime.UtcNow;
             }
             else if (side == TradeSide.Buy)
@@ -302,6 +329,10 @@ public class SimulatedBroker : IBroker
                     TrailingStop = price * (1 - maxTradeLossPct)
                 };
                 _buyTimes[symbol] = DateTime.UtcNow;
+
+                // Initialize RSI Peak at entry
+                _peakRsi[symbol] = CalculateRSI(symbol, 14);
+
                 LogTradeToCSV(symbol, "BUY", price, 0, CalculateRSI(symbol, 14), true);
             }
         }
