@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -38,9 +39,10 @@ public class BotPersistData
     public decimal StartingDayEquity { get; set; }
     public Dictionary<string, int> TradesPerSymbol { get; set; } = new();
     public Dictionary<string, DateTime> BuyTimes { get; set; } = new();
-    public Dictionary<string, List<decimal>> PriceHistory { get; set; } = new();
-    public Dictionary<string, List<long>> VolumeHistory { get; set; } = new();
-    public Dictionary<string, DateTime> LastSellTimes { get; set; } = new();
+
+public ConcurrentDictionary<string, List<decimal>> PriceHistory { get; set; } = new();
+public ConcurrentDictionary<string, List<long>> VolumeHistory { get; set; } = new();
+public Dictionary<string, DateTime> LastSellTimes { get; set; } = new();
     public Dictionary<string, bool> LastTradeWasLoss { get; set; } = new();
 }
 
@@ -73,16 +75,19 @@ public class SimulatedBroker : IBroker
     // High-Relative Volume Growth
     "RKLB", "MARA", "DKNG"
 };
+
+    public ConcurrentDictionary<string, List<decimal>> _priceHistory { get; set; } = new();
+    public ConcurrentDictionary<string, List<long>> _volumeHistory { get; set; } = new();
+
+    private ConcurrentDictionary<string, long> _cumVolume = new();
+    private ConcurrentDictionary<string, decimal> _cumVwapProd = new();
+    private ConcurrentDictionary<string, DateTime> _symbolLastResetDate = new();
     protected readonly Dictionary<string, SimPosition> _positions = new();
-    protected readonly Dictionary<string, List<decimal>> _priceHistory = new();
-    protected readonly Dictionary<string, List<long>> _volumeHistory = new();
+
     protected readonly Dictionary<string, int> _tradesToday = new();
     protected readonly Dictionary<string, DateTime> _buyTimes = new();
     protected readonly Dictionary<string, DateTime> _lastSellTimes = new();
 
-    // VWAP tracking
-    protected readonly Dictionary<string, long> _cumVolume = new();
-    protected readonly Dictionary<string, decimal> _cumVwapProd = new();
 
     private readonly HashSet<string> _pendingOrders = new();
     private readonly TimeSpan _latestEntryTime = new TimeSpan(15, 30, 0);
@@ -201,7 +206,7 @@ public void LoadState()
         catch { }
     }
     // Ensure these are at the top of your SimulatedBroker class
-    private Dictionary<string, double> _peakRsi = new();
+    private ConcurrentDictionary<string, double> _peakRsi = new ConcurrentDictionary<string, double>();
     private Dictionary<string, bool> _lastTradeWasLoss = new(); // NEW: Track loss state
 
     public void ExecuteTradeLogic(string symbol)
@@ -303,8 +308,7 @@ public void LoadState()
                     _lastTradeWasLoss[symbol] = netPnL < 0;
 
                     SubmitOrder(symbol, (int)pos.Quantity, currentPrice, TradeSide.Sell);
-                    _peakRsi.Remove(symbol);
-
+                    _peakRsi.TryRemove(symbol, out _);
                     string reason = hitStop ? "STOP" : (climaxExit ? "CLIMAX" : "RSI_HOOK");
                     Task.Run(() => SendEmailNotification($"🔴 SMART SELL ({reason}): {symbol}",
                         $"Sold @ {currentPrice:C2}\nNet PnL: {netPnL:C2}\nCooldown Set: {(netPnL < 0 ? "30m" : "15m")}"));
@@ -393,7 +397,7 @@ public void LoadState()
                 _totalRealizedPnL += pnl;
                 _tradeHistory.Add(new ClosedTrade { Symbol = symbol, Profit = pnl, ExitTime = DateTime.UtcNow });
                 _positions.Remove(symbol);
-                _peakRsi.Remove(symbol);
+                _peakRsi.TryRemove(symbol, out _);
                 _lastSellTimes[symbol] = DateTime.UtcNow;
 
                 // 3. Global Halt Check
@@ -422,56 +426,44 @@ public void LoadState()
     protected readonly Dictionary<string, decimal> _tenDayAvgVolume = new();
     private DateTime _lastResetDate = DateTime.MinValue;
     // 1. Add this private variable at the top of your class to track the date
-    private Dictionary<string, DateTime> _symbolLastResetDate = new();
+
 
     private void ManagePriceData(string symbol, decimal price, long volume)
     {
         DateTime nyNow = GetEasternTime();
-        // Market hours for cumulative volume (VWAP/RVOH)
         bool isMarketHours = nyNow.TimeOfDay >= new TimeSpan(9, 30, 0) && nyNow.TimeOfDay < new TimeSpan(16, 0, 0);
 
-        lock (_lock) // Ensure thread safety for dictionary writes
+        // 1. Get or Add handles initialization automatically
+        var prices = _priceHistory.GetOrAdd(symbol, _ => new List<decimal>());
+        var volumes = _volumeHistory.GetOrAdd(symbol, _ => new List<long>());
+
+        // 2. Safe Reset
+        DateTime lastReset = _symbolLastResetDate.GetOrAdd(symbol, DateTime.MinValue);
+        if (nyNow.TimeOfDay >= new TimeSpan(9, 30, 0) && lastReset.Date != nyNow.Date)
         {
-            // 1. COMPREHENSIVE INITIALIZATION
-            if (!_priceHistory.ContainsKey(symbol))
-            {
-                _priceHistory[symbol] = new List<decimal>();
-                _volumeHistory[symbol] = new List<long>();
-                _cumVolume[symbol] = 0;
-                _cumVwapProd[symbol] = 0;
-                _symbolLastResetDate[symbol] = DateTime.MinValue;
-            }
+            _cumVolume[symbol] = 0;
+            _cumVwapProd[symbol] = 0;
+            _symbolLastResetDate[symbol] = nyNow.Date;
+        }
 
-            // 2. DAILY RESET (9:30 AM EST)
-            // Checks if current time is market open and if we haven't reset for 'today' yet
-            if (nyNow.TimeOfDay >= new TimeSpan(9, 30, 0) &&
-                _symbolLastResetDate.ContainsKey(symbol) &&
-                _symbolLastResetDate[symbol].Date != nyNow.Date)
-            {
-                _cumVolume[symbol] = 0;
-                _cumVwapProd[symbol] = 0;
-                _symbolLastResetDate[symbol] = nyNow.Date;
-                Console.WriteLine($"[SYSTEM] {symbol} - Open Bell Reset (Volume & VWAP)");
-            }
+        // 3. Update Lists (List is NOT thread-safe, so we lock just the list update)
+        lock (prices)
+        {
+            prices.Add(price);
+            volumes.Add(volume);
 
-            // 3. UPDATE HISTORIES (Price and Volume Lists)
-            _priceHistory[symbol].Add(price);
-            _volumeHistory[symbol].Add(volume);
-
-            // 4. UPDATE CUMULATIVE METRICS
-            // Only add volume to total today if it's within 9:30 - 16:00
-            if (isMarketHours)
+            if (prices.Count > 300)
             {
-                _cumVolume[symbol] += volume;
-                _cumVwapProd[symbol] += (price * volume);
+                prices.RemoveAt(0);
+                volumes.RemoveAt(0);
             }
+        }
 
-            // 5. MEMORY MANAGEMENT
-            if (_priceHistory[symbol].Count > 300)
-            {
-                _priceHistory[symbol].RemoveAt(0);
-                _volumeHistory[symbol].RemoveAt(0);
-            }
+        // 4. Update Cumulative Metrics (Thread-safe addition)
+        if (isMarketHours)
+        {
+            _cumVolume.AddOrUpdate(symbol, volume, (key, oldVol) => oldVol + volume);
+            _cumVwapProd.AddOrUpdate(symbol, (price * volume), (key, oldProd) => oldProd + (price * volume));
         }
     }
     public void UpdateHistory(string symbol, decimal price, long volume)
@@ -521,35 +513,59 @@ public void LoadState()
     }
     private void CheckSpecificEntry(string symbol)
     {
-        // Reuse your existing logic from ScanAndExecuteBestTrades 
-        // but only for the provided 'symbol'
-        var prices = _priceHistory[symbol];
-        var volumes = _volumeHistory[symbol];
+        if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count < 50) return;
+        if (!_volumeHistory.TryGetValue(symbol, out var volumes) || volumes.Count < 10) return;
 
-        // Calculate Vol-X and RVOH for just this one symbol...
-        // If criteria met -> ExecuteEntry(symbol);
+        decimal currentPrice = prices.Last();
+
+        // 1. Calculate Indicators
+        decimal rsi = (decimal)CalculateRSI(symbol, 14); // Cast double to decimal
+        string trend = GetTrend(prices);
+
+        // 2. Fix the Double-to-Decimal conversion error here
+        // We cast the Average() result (double) to (decimal)
+        decimal avgVol = (decimal)volumes.Skip(volumes.Count - 10).Take(9).Average();
+        decimal volX = avgVol > 0 ? (decimal)volumes.Last() / avgVol : 0;
+
+        decimal rvoh = 0;
+        if (_learnedAvgVolume.TryGetValue(symbol, out decimal learnedAvg) && learnedAvg > 0)
+        {
+            _cumVolume.TryGetValue(symbol, out long currentCumVol);
+            rvoh = (decimal)currentCumVol / learnedAvg;
+        }
+
+        // 3. Entry Logic
+        if (trend == "BULL" && rsi < 40 && volX > 1.5m)
+        {
+            _lastSellTimes.TryGetValue(symbol, out var lastSell);
+            if ((DateTime.UtcNow - lastSell).TotalMinutes > 15)
+            {
+                // FIX: Removed the 'currentPrice' argument to match your method signature
+                ExecuteEntry(symbol);
+            }
+        }
     }
     private void ExecuteExitLogic(string symbol)
     {
-        var prices = _priceHistory[symbol];
-        var volumes = _volumeHistory[symbol];
+        // 1. SAFE DATA RETRIEVAL
+        // Use the underscore version to match the new declaration
+        if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count == 0) return;
+        if (!_volumeHistory.TryGetValue(symbol, out var volumes) || volumes.Count == 0) return;
+        if (!_positions.TryGetValue(symbol, out var pos)) return; // Position might have been closed already
+
         decimal currentPrice = prices.Last();
         long currentVolume = volumes.Last();
-        double rsi = CalculateRSI(symbol, 14);
+        double rsi = (double)CalculateRSI(symbol, 14); // Cast if your RSI returns decimal
         string trend = GetTrend(prices);
-
-        var pos = _positions[symbol];
+        double peak = _peakRsi.AddOrUpdate(symbol, rsi, (key, oldPeak) => Math.Max(oldPeak, rsi));
         pos.CurrentPrice = currentPrice;
         decimal netPnL = pos.UnrealizedPnL - roundTripFee;
 
         _buyTimes.TryGetValue(symbol, out var buyTime);
         bool timeShieldActive = (DateTime.UtcNow - buyTime).TotalMinutes < 15;
 
-        // Track Peak RSI for the Hook Logic
-        if (!_peakRsi.ContainsKey(symbol) || rsi > _peakRsi[symbol])
-            _peakRsi[symbol] = rsi;
 
-        // 1. VOLATILITY STOP: Tighten to 0.4% once in profit
+        // 3. VOLATILITY STOP: Tighten to 0.4% once in profit
         if (netPnL > 6.00m)
         {
             decimal tightStop = currentPrice * 0.996m;
@@ -557,24 +573,35 @@ public void LoadState()
             pos.IsBreakEvenProtected = true;
         }
 
-        // 2. DEFINE EXIT TRIGGERS
-        double peak = _peakRsi[symbol];
+        // 4. DEFINE EXIT TRIGGERS
         bool rsiHooked = peak > 75 && rsi < (peak - 3.0);
 
-        decimal avgVolume = volumes.Count >= 10 ? (decimal)volumes.Skip(volumes.Count - 10).Average() : 0;
-        bool volumeClimax = avgVolume > 0 && currentVolume > (avgVolume * 5.0m);
+        decimal avgVolume = 0;
+        lock (volumes) // Lock the list while calculating average
+        {
+            if (volumes.Count >= 10)
+                avgVolume = (decimal)volumes.Skip(volumes.Count - 10).Average();
+        }
 
+        bool volumeClimax = avgVolume > 0 && currentVolume > (avgVolume * 5.0m);
         bool hitStop = currentPrice <= pos.TrailingStop;
         bool rsiWinExit = (rsi >= 80 && netPnL > 3.00m) || rsiHooked || (rsi >= 72 && trend == "FLAT" && netPnL > 1.50m);
 
-        // 3. EXECUTE EXIT
+        // 5. EXECUTE EXIT
         if (hitStop || rsiWinExit || volumeClimax)
         {
-            // Don't let the Stop Loss trigger in the first 15 mins if it's a tiny "fake" dip
+            // Time shield: Don't let a stop-loss fire in the first 15 mins if it's a minor dip
             if (hitStop && netPnL < 0 && timeShieldActive) return;
 
             string reason = hitStop ? "STOP" : (volumeClimax ? "CLIMAX" : "RSI_WIN");
-            SubmitOrder(symbol, (int)pos.Quantity, currentPrice, TradeSide.Sell);
+
+            // FIX: Cast quantity to (int) to stop the "Fractional Share" API warning
+            int qtyToSell = (int)pos.Quantity;
+
+            SubmitOrder(symbol, qtyToSell, currentPrice, TradeSide.Sell);
+
+            // CLEANUP: Remove the peak RSI tracking so it's fresh for the next trade
+            _peakRsi.TryRemove(symbol, out _);
 
             Task.Run(() => SendEmailNotification($"🔴 SELL ({reason}): {symbol}",
                 $"Sold @ {currentPrice:C2} | Net PnL: {netPnL:C2}"));
@@ -582,76 +609,25 @@ public void LoadState()
     }
     private void ResetDailyStats()
     {
+        // Realized PnL and Flags
         _goalReached = false;
         _haltNewTrades = false;
-        _tradesExecutedToday = 0;
-        _totalRealizedPnL = 0;
         _dailyLossCount = 0;
-        _startingDayEquity = GetTotalEquity();
 
+        // Reset cumulative dictionaries without "Clearing" the keys
+        foreach (var key in _cumVolume.Keys)
+        {
+            _cumVolume[key] = 0;
+            _cumVwapProd[key] = 0;
+        }
+
+        // Trade history and active lists can still be cleared
         _tradesToday.Clear();
-        _cumVolume.Clear();
-        _cumVwapProd.Clear();
         _tradeHistory.Clear();
-        _lastTradeWasLoss.Clear(); // Clears revenge trade shields for a fresh start
 
-        Console.WriteLine($"\n[SYSTEM] {DateTime.Now:yyyy-MM-dd} - Daily stats reset. Equity: {_startingDayEquity:C2}");
-        SaveState();
+        Console.WriteLine("[SYSTEM] Daily stats reset successfully.");
     }
-    private void ScanAndExecuteBestTrades()
-    {
-        // List to hold potential candidates with their metrics for ranking
-        var candidates = new List<(string Symbol, decimal VolMultiplier, decimal RVOH)>();
 
-        foreach (var symbol in _tradeableStars)
-        {
-            // 1. Basic Safety Checks
-            if (_positions.ContainsKey(symbol) || _pendingOrders.Contains(symbol)) continue;
-            if (!_priceHistory.ContainsKey(symbol) || _priceHistory[symbol].Count < 50) continue;
-
-            var prices = _priceHistory[symbol];
-            var volumes = _volumeHistory[symbol];
-
-            // 2. Vol-X Calculation (Intraday Momentum)
-            // Compares current minute volume to the average of the last 10 minutes
-            decimal avgVolMinute = (decimal)volumes.Skip(Math.Max(0, volumes.Count - 10)).Average();
-            decimal volMultiplier = avgVolMinute > 0 ? (decimal)volumes.Last() / avgVolMinute : 0;
-
-            // 3. Daily RVOH Calculation (Learning Mode)
-            // Compares cumulative volume since 9:30 AM to the historical average stored in memory
-            decimal rvoh = 1.0m; // Default to neutral if no memory exists yet
-            if (_learnedAvgVolume.TryGetValue(symbol, out decimal learnedAvg) && learnedAvg > 0)
-            {
-                // Current cumulative volume / learned daily average
-                rvoh = (decimal)_cumVolume[symbol] / learnedAvg;
-            }
-
-            // 4. Entry Filters (Trend, RSI, and Market Health)
-            if (IsMarketSafe() && GetTrend(prices) == "BULL" && CalculateRSI(symbol, 14) < 65)
-            {
-                // --- UPDATED RVOH LOGIC ---
-                // Entry trigger: 
-                // Either the stock has 20%+ more volume than its historical average (Institutional)
-                // OR it is seeing a massive 2.5x spike in the last minute (Retail/News)
-                if (rvoh >= 1.2m || volMultiplier > 2.5m)
-                {
-                    candidates.Add((symbol, volMultiplier, rvoh));
-                }
-            }
-        }
-
-        // 5. Execution: Rank by highest Vol-X and fill available slots
-        var bestTrades = candidates.OrderByDescending(c => c.VolMultiplier).ToList();
-
-        foreach (var trade in bestTrades)
-        {
-            if (_positions.Count >= MaxActivePositions) break;
-
-            // Log the stats for debugging
-            Console.WriteLine($"[ENTRY] {trade.Symbol} | RVOH: {trade.RVOH:F2} | Vol-X: {trade.VolMultiplier:F2}");
-            ExecuteEntry(trade.Symbol);
-        }
-    }
     private void ExecuteEntry(string symbol)
     {
         var prices = _priceHistory[symbol];
@@ -731,22 +707,30 @@ public void LoadState()
                     _volumeHistory.TryGetValue(symbol, out var volumes);
                     currentPrice = prices.Last();
 
+                    // Safe Indicators
                     if (prices.Count >= 15) rsiDisplay = CalculateRSI(symbol, 14).ToString("F1");
                     if (prices.Count >= 20) trendStr = GetTrend(prices);
 
-                    // Safe Vol-X
+                    // Safe Vol-X (Short-term momentum)
                     if (volumes != null && volumes.Count >= 10)
                     {
                         decimal avgVol = (decimal)volumes.Skip(volumes.Count - 10).Average();
                         volXStr = $"{(avgVol > 0 ? (decimal)volumes.Last() / avgVol : 0):F1}x";
                     }
 
-                    // Safe RVOH
+                    // Safe RVOH (Daily Relative Volume) - FIXED TO PREVENT KEYNOTFOUND
                     if (_learnedAvgVolume.TryGetValue(symbol, out decimal learnedAvg) && learnedAvg > 0)
                     {
-                        _cumVolume.TryGetValue(symbol, out long currentCumVol);
-                        decimal rvoh = (decimal)currentCumVol / learnedAvg;
-                        rvohStr = $"{rvoh:F1}x";
+                        // Use TryGetValue here instead of [_cumVolume[symbol]]
+                        if (_cumVolume.TryGetValue(symbol, out long currentCumVol))
+                        {
+                            decimal rvoh = (decimal)currentCumVol / learnedAvg;
+                            rvohStr = $"{rvoh:F1}x";
+                        }
+                        else
+                        {
+                            rvohStr = "0.0x";
+                        }
                     }
 
                     // Safe Status/Cooldown
@@ -760,11 +744,15 @@ public void LoadState()
                     else if (trendStr == "BEAR")
                         statusStr = "BEAR_WAIT";
 
-                    // Position Info
+                    // Position Info & PnL Bar
                     if (_positions.TryGetValue(symbol, out var pos))
                     {
                         posStr = $"{pos.Quantity}@{pos.AvgPrice:F2}";
-                        pnlStr = $"{pos.UnrealizedPnL:C2}";
+
+                        // Calculate PnL % for the visual bar we added
+                        decimal pnlPercent = pos.AvgPrice > 0 ? ((currentPrice - pos.AvgPrice) / pos.AvgPrice) * 100 : 0;
+                        pnlStr = GetPnLBar(pnlPercent);
+
                         statusStr = "⭐ OWNED";
                     }
                 }
@@ -795,6 +783,26 @@ public void LoadState()
         Console.SetCursorPosition(0, 0);
         Console.Write(sb.ToString());
     }
+    private string GetPnLBar(decimal pnlPct)
+    {
+        // Width of the actual bar (excluding icon and text)
+        int barWidth = 10;
+
+        // Cap visual at +/- 3% for the bar scale so it doesn't break the UI
+        decimal clamped = Math.Max(-3, Math.Min(3, pnlPct));
+
+        // Calculate how many segments to fill
+        // (clamped + 3) shifts the range from [-3,3] to [0,6]
+        int greenChars = (int)((clamped + 3) / 6 * barWidth);
+
+        // Create the bar string (█ for filled, ░ for empty)
+        string bar = new string('█', greenChars).PadRight(barWidth, '░');
+
+        // Choose icon based on profit or loss
+        string colorIcon = pnlPct >= 0 ? "🟢" : "🔴";
+
+        return $"{colorIcon} [{bar}] {pnlPct:F2}%";
+    }
     protected double CalculateRSI(string symbol, int period = 14)
     {
         if (!_priceHistory.ContainsKey(symbol) || _priceHistory[symbol].Count <= period) return 50;
@@ -815,7 +823,7 @@ public void LoadState()
         return avgLoss == 0 ? 100 : 100 - (100 / (1 + (double)(avgGain / avgLoss)));
     }
 
-    public string GetTrend(List<decimal> prices)
+    private string GetTrend(IList<decimal> prices)
     {
         int fastPeriod = 20;
         int slowPeriod = 50;
