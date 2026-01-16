@@ -193,20 +193,28 @@ public class IbClient : EWrapper, IBroker
     public void positionEnd() => Console.WriteLine("Portfolio reconciliation complete.");
 
     // --- ORDER EXECUTION ---
-    public void SubmitOrder(string symbol, int qty, decimal price, TradeSide side)
+    public void SubmitOrder(string symbol, int qty, decimal price, TradeSide side, double currentRsi = 0, string orderType = "LMT")
     {
         if (_currentOrderId < 0) return;
 
         Contract contract = new Contract { Symbol = symbol, SecType = "STK", Exchange = "SMART", Currency = "USD" };
+
+        // Switch to LMT (Limit) to avoid "Flash Crash" fills
+        // For a BUY, we set the limit slightly above current price (e.g., +0.05)
+        // For a SELL, we set the limit slightly below.
+        decimal limitPrice = side == TradeSide.Buy ? price * 1.002m : price * 0.998m;
+
         Order order = new Order
         {
             Action = side == TradeSide.Buy ? "BUY" : "SELL",
-            OrderType = "MKT",
+            OrderType = "LMT", // Changed from MKT to LMT
+            LmtPrice = (double)Math.Round(limitPrice, 2),
             TotalQuantity = (double)qty,
-            Tif = "DAY"
+            Tif = "DAY",
+            OutsideRth = false // Ensure we don't trade in pre-market by accident
         };
 
-        Console.WriteLine($"[API] Placing {order.Action} order for {symbol}. OrderID: {_currentOrderId}");
+        Console.WriteLine($"[API] Placing {order.Action} Limit Order for {symbol} at {limitPrice:F2}. OrderID: {_currentOrderId}");
         _client.placeOrder(_currentOrderId++, contract, order);
     }
 

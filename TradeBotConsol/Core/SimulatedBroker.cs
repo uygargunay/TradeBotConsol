@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Mail;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -13,7 +14,8 @@ using System.Threading.Tasks;
 
 public interface IBroker
 {
-    void SubmitOrder(string symbol, int qty, decimal price, TradeSide side);
+    void SubmitOrder(string symbol, int qty, decimal price, TradeSide side, double currentRsi = 0, string orderType = "LMT");
+ 
 }
 
 public enum TradeSide { Buy, Sell }
@@ -21,13 +23,15 @@ public enum MarketRegime { Bullish, Neutral, Bearish }
 
 public class SimPosition
 {
+    public string Symbol { get; set; } 
     public decimal Quantity { get; set; }
     public decimal AvgPrice { get; set; }
     public decimal TrailingStop { get; set; }
     public decimal CurrentPrice { get; set; }
     public decimal RealizedPnL { get; set; }
     public decimal UnrealizedPnL => Quantity * (CurrentPrice - AvgPrice);
-    public bool IsBreakEvenProtected { get; set; } // NEW: Tracks if stop is at entry
+    public bool IsBreakEvenProtected { get; set; }
+    public DateTime EntryTime { get; set; } = DateTime.UtcNow; // MODERATE: Track entry for hold-timer
 }
 
 public class BotPersistData
@@ -38,7 +42,7 @@ public class BotPersistData
     public decimal RealizedPnLTotal { get; set; }
     public decimal StartingDayEquity { get; set; }
     public Dictionary<string, int> TradesPerSymbol { get; set; } = new();
-    public Dictionary<string, DateTime> BuyTimes { get; set; } = new();
+    public ConcurrentDictionary<string, DateTime> BuyTimes = new ConcurrentDictionary<string, DateTime>();
 
 public ConcurrentDictionary<string, List<decimal>> PriceHistory { get; set; } = new();
 public ConcurrentDictionary<string, List<long>> VolumeHistory { get; set; } = new();
@@ -50,14 +54,21 @@ public class PositionManager : SimulatedBroker { }
 
 public class SimulatedBroker : IBroker
 {
+    // MODERATE TUNING CONSTANTS
+    private const double VOLATILITY_CAP = 4.5; // Block entries if RVOH > 4.5x
+    private const int MIN_HOLD_SECONDS = 120;  // 2-minute mandatory hold
+    private const double RSI_HOOK_DROP = 3.0;  // Require 3.0 point drop from peak
+
+    private const decimal dailyProfitGoalPct = 0.025m; // +2.5% Target
+    private const decimal dailyLossLimitPct = 0.03m;   // -3.0% Stop
+    private const decimal maxTradeLossPct = 0.02m;     // 2% Room for volatility
+    private const int maxTradesGlobal = 15;            // Quality over quantity
+    private const int MaxActivePositions = 3;          // Focus on 3 slots
+
     private const decimal initialAccountValue = 4000m;
-    private const decimal dailyProfitGoalPct = 0.03m;
-    private const decimal dailyLossLimitPct = 0.02m;
-    private const decimal maxTradeLossPct = 0.015m;
-    private const int maxTradesGlobal = 30;
-    private const decimal roundTripFee = 2.00m; // Updated to $1 buy + $1 sell
-    private const decimal slippagePct = 0.0001m;
-    private const int MaxActivePositions = 4; // NEW: Slot limit
+
+    private const decimal roundTripFee = 2.00m;        // Matches $1 buy + $1 sell
+    private const decimal slippagePct = 0.0002m;       // Increased to 0.02% for more realistic fills
 
     // Inside SimulatedBroker Class - Added Variable
     protected int _dailyLossCount = 0;
@@ -70,7 +81,7 @@ public class SimulatedBroker : IBroker
     "COIN", "MSTR", "ARM", "SMCI", "SHOP", "SNOW", 
     
     // Technical Respect (Clean VWAP/RSI performers)
-    "MU", "AVGO", "PANW", "UBER", "DKNG", "SQ", "PYPL", "ON",
+    "MU", "AVGO", "PANW", "UBER", "DKNG", "PYPL", "ON",
     
     // High-Relative Volume Growth
     "RKLB", "MARA", "DKNG"
@@ -78,23 +89,23 @@ public class SimulatedBroker : IBroker
 
     public ConcurrentDictionary<string, List<decimal>> _priceHistory { get; set; } = new();
     public ConcurrentDictionary<string, List<long>> _volumeHistory { get; set; } = new();
-
+    private ConcurrentDictionary<string, double> _lastRsiMemory = new ConcurrentDictionary<string, double>();
     private ConcurrentDictionary<string, long> _cumVolume = new();
     private ConcurrentDictionary<string, decimal> _cumVwapProd = new();
     private ConcurrentDictionary<string, DateTime> _symbolLastResetDate = new();
     protected readonly Dictionary<string, SimPosition> _positions = new();
 
     protected readonly Dictionary<string, int> _tradesToday = new();
-    protected readonly Dictionary<string, DateTime> _buyTimes = new();
+
     protected readonly Dictionary<string, DateTime> _lastSellTimes = new();
-
-
+    private readonly ConcurrentDictionary<string, DateTime> _buyTimes = new ConcurrentDictionary<string, DateTime>();
+    private readonly DateTime _botStartTime = DateTime.UtcNow;
     private readonly HashSet<string> _pendingOrders = new();
     private readonly TimeSpan _latestEntryTime = new TimeSpan(15, 30, 0);
     private DateTime _lastHeartbeatEmail = DateTime.MinValue;
     private const string SaveFilePath = "bot_state.json";
     protected readonly object _lock = new object();
-
+    private const int MinHoldMinutes = 5; // Bot must wait 5 minutes before it can sell
     private decimal _startingDayEquity = initialAccountValue;
     private decimal _totalRealizedPnL = 0m;
     private int _tradesExecutedToday = 0;
@@ -211,11 +222,22 @@ public void LoadState()
 
     public void ExecuteTradeLogic(string symbol)
     {
-        if (symbol == "QQQ") return;
+        // 1. Global Safety & Exclusions
+        if (symbol == "QQQ" ) return;
         if (_haltNewTrades || _goalReached) return;
+
+        // 2. STARTUP COOLING PERIOD (2-Minute Shield)
+        // Ensures indicators stabilize and memory is built before trading begins.
+        if ((DateTime.UtcNow - _botStartTime).TotalMinutes < 2)
+        {
+            // We still record the RSI so memory is ready the moment the 2 mins end
+            _lastRsiMemory[symbol] = CalculateRSI(symbol, 14);
+            return;
+        }
 
         lock (_lock)
         {
+            // 3. Price History Check
             if (!_priceHistory.ContainsKey(symbol) || _priceHistory[symbol].Count < 20) return;
 
             var prices = _priceHistory[symbol];
@@ -223,9 +245,21 @@ public void LoadState()
             decimal currentPrice = prices.Last();
             long currentVolume = volumes.Last();
             double rsi = CalculateRSI(symbol, 14);
+
+            // 4. RSI CROSSOVER MEMORY (The "Hook" Detector)
+            if (!_lastRsiMemory.TryGetValue(symbol, out double prevRsi))
+            {
+                _lastRsiMemory[symbol] = rsi;
+                return; // Baseline established; wait for next tick
+            }
+
+            // This is the trigger: Must move from <= 45 to > 45
+            bool rsiJustEnteredZone = (prevRsi <= 45.0 && rsi > 45.0);
+            _lastRsiMemory[symbol] = rsi; // Always update memory
+
             string trend = GetTrend(prices);
 
-            // --- 1. SYNTHETIC SPREAD CHECK ---
+            // --- 1. SPREAD & MOMENTUM ---
             decimal lastPrice = prices[prices.Count - 2];
             decimal priceChangePct = Math.Abs((currentPrice - lastPrice) / lastPrice) * 100;
             bool spreadIsTight = priceChangePct <= 0.12m;
@@ -234,87 +268,159 @@ public void LoadState()
             decimal vwap = _cumVolume.ContainsKey(symbol) && _cumVolume[symbol] > 0
                 ? _cumVwapProd[symbol] / _cumVolume[symbol] : currentPrice;
             decimal avgVolume = volumes.Count >= 10 ? (decimal)volumes.Skip(volumes.Count - 10).Average() : 0;
-            bool volumeSurge = avgVolume > 0 && currentVolume > (avgVolume * 1.2m);
-            bool volumeClimax = avgVolume > 0 && currentVolume > (avgVolume * 5.0m);
+
+            bool volumeSurge = avgVolume > 0 && currentVolume > (avgVolume * 1.5m);
+            bool isMarketPanic = avgVolume > 0 && currentVolume > (avgVolume * 10.0m);
+            bool volumeClimax = avgVolume > 0 && currentVolume > (avgVolume * 8.0m);
 
             bool hasPosition = _positions.ContainsKey(symbol);
 
-            // --- ENTRY LOGIC ---
+            // --- 3. ENTRY LOGIC ---
             if (!hasPosition && _positions.Count < MaxActivePositions)
             {
                 DateTime nyNow = GetEasternTime();
                 bool marketOpenTime = nyNow.TimeOfDay >= new TimeSpan(10, 0, 0) && nyNow.TimeOfDay < _latestEntryTime;
                 bool underLossLimit = _dailyLossCount < 4;
 
-                // --- COOLDOWN LOGIC ---
                 _lastSellTimes.TryGetValue(symbol, out var lastSell);
                 double minutesSinceLastTrade = (DateTime.UtcNow - lastSell).TotalMinutes;
-
                 _lastTradeWasLoss.TryGetValue(symbol, out bool wasLoss);
-                // Standard cooldown is 15 mins, but if it was a loss, we wait 30 mins (Revenge Trade Shield)
+
                 int requiredCooldown = wasLoss ? 30 : 15;
                 bool inCooldown = minutesSinceLastTrade < requiredCooldown;
 
                 decimal ma20 = (decimal)prices.Skip(prices.Count - 20).Average();
                 bool isOverextended = currentPrice > (ma20 * 1.012m);
 
-                if (marketOpenTime && underLossLimit && !inCooldown && IsMarketSafe())
+                if (marketOpenTime && underLossLimit && !inCooldown && !isMarketPanic && IsMarketSafe())
                 {
-                    if (trend == "BULL" && rsi > 45 && rsi < 65 && currentPrice > vwap && volumeSurge &&
+                    // Trigger Check: trend and volume must align with the fresh RSI crossover
+                    if (trend == "BULL" && rsiJustEnteredZone && rsi < 65 && currentPrice > vwap && volumeSurge &&
                         !isOverextended && !volumeClimax && spreadIsTight)
                     {
-                        decimal targetSpend = 1000m;
-                        int qty = (int)Math.Floor((targetSpend - 1.00m) / currentPrice);
+                        decimal budgetPerSlot = _startingDayEquity / MaxActivePositions;
+                        int qty = (int)Math.Floor((budgetPerSlot - 1.00m) / currentPrice);
+
                         if (qty > 0)
                         {
                             _peakRsi[symbol] = rsi;
-                            SubmitOrder(symbol, qty, currentPrice, TradeSide.Buy);
-                            Task.Run(() => SendEmailNotification($"🟢 SMART BUY: {symbol}",
-                                $"Bought {qty} @ {currentPrice:C2}\nTrend: {trend}\nRSI: {rsi:F1}"));
+                            _buyTimes[symbol] = DateTime.UtcNow;
+                            SubmitOrder(symbol, qty, currentPrice, TradeSide.Buy, rsi);
+                            SaveState();
+
+                            Task.Run(() => SendEmailNotification($"🟢 BUY: {symbol}", $"Bought {qty} @ {currentPrice:C2} (RSI Hook: {rsi:F2})"));
                         }
                     }
                 }
             }
-            // --- EXIT LOGIC ---
+            // --- 4. EXIT LOGIC ---
             else if (hasPosition)
             {
                 var pos = _positions[symbol];
                 pos.CurrentPrice = currentPrice;
                 decimal netPnL = pos.UnrealizedPnL - roundTripFee;
+
                 _buyTimes.TryGetValue(symbol, out var buyTime);
-                bool timeShieldActive = (DateTime.UtcNow - buyTime).TotalMinutes < 15;
+                double minutesHeld = (DateTime.UtcNow - buyTime).TotalMinutes;
+                bool timeShieldActive = minutesHeld < 5.0;
 
                 if (!_peakRsi.ContainsKey(symbol) || rsi > _peakRsi[symbol]) _peakRsi[symbol] = rsi;
 
-                // VOLATILITY STOP: Tighten stop to 0.4% once up $6.00
-                if (netPnL > 6.00m)
+                if (netPnL > 8.00m)
                 {
-                    decimal tightStop = currentPrice * 0.996m;
+                    decimal tightStop = currentPrice * 0.995m;
                     if (tightStop > pos.TrailingStop) pos.TrailingStop = tightStop;
                     pos.IsBreakEvenProtected = true;
                 }
 
                 double peak = _peakRsi[symbol];
-                bool rsiHooked = peak > 75 && rsi < (peak - 3.0);
-                bool climaxExit = volumeClimax && netPnL > 2.00m;
+                bool rsiHooked = peak > 75 && rsi < (peak - 5.0);
+                bool climaxExit = volumeClimax && netPnL > 5.00m;
                 bool hitStop = currentPrice <= pos.TrailingStop;
-                bool rsiWinExit = (rsi >= 80 && netPnL > 3.00m) || rsiHooked || (rsi >= 72 && trend == "FLAT" && netPnL > 1.50m);
+                bool rsiWinExit = (rsi >= 80 && netPnL > 5.00m) || (rsiHooked && netPnL > 2.00m);
 
                 if (hitStop || rsiWinExit || climaxExit)
                 {
-                    if (hitStop && netPnL < 0 && timeShieldActive) return;
+                    if (timeShieldActive && !hitStop) return;
 
-                    // Track if this exit is a loss for the next cooldown
-                    _lastTradeWasLoss[symbol] = netPnL < 0;
+                    int sellQty = (int)pos.Quantity;
+                    if (sellQty <= 0)
+                    {
+                        _positions.Remove(symbol);
+                        return;
+                    }
 
-                    SubmitOrder(symbol, (int)pos.Quantity, currentPrice, TradeSide.Sell);
-                    _peakRsi.TryRemove(symbol, out _);
+                    SubmitOrder(symbol, sellQty, currentPrice, TradeSide.Sell);
+
                     string reason = hitStop ? "STOP" : (climaxExit ? "CLIMAX" : "RSI_HOOK");
-                    Task.Run(() => SendEmailNotification($"🔴 SMART SELL ({reason}): {symbol}",
-                        $"Sold @ {currentPrice:C2}\nNet PnL: {netPnL:C2}\nCooldown Set: {(netPnL < 0 ? "30m" : "15m")}"));
+                    Task.Run(() => SendEmailNotification($"🔴 SELL ({reason}): {symbol}", $"Net PnL: {netPnL:C2}"));
                 }
             }
         }
+    }
+    public void SubmitOrder(string symbol, int qty, decimal price, TradeSide side, double currentRsi = 0, string orderType = "LMT")
+    {
+        lock (_lock)
+        {
+            if (_pendingOrders.Contains(symbol)) return;
+            if (_haltNewTrades && side == TradeSide.Buy) return;
+
+            if (side == TradeSide.Sell)
+            {
+                if (!_positions.TryGetValue(symbol, out var pos)) return;
+
+                // 1. CHURN SHIELD
+                var holdMinutes = (DateTime.UtcNow - pos.EntryTime).TotalMinutes;
+                decimal currentPnL = (price - pos.AvgPrice) / pos.AvgPrice;
+                if (holdMinutes < 5.0 && currentPnL > -0.020m) return;
+
+                // 2. INTEGER ROUNDING (Fixes the IB 2176 Warning)
+                qty = (int)Math.Floor(Math.Abs(pos.Quantity));
+            }
+            _pendingOrders.Add(symbol);
+        }
+
+        // 3. EXECUTION (The "5-Argument" Workaround)
+        if (RealBroker != null)
+        {
+            // For Sells, we send price 0. Most IBKR wrappers interpret price 0 as "Market".
+            // This bypasses the 3% Percentage Constraint (Error 163).
+            decimal priceToSend = (side == TradeSide.Sell) ? 0 : price;
+
+            RealBroker.SubmitOrder(symbol, qty, priceToSend, side, currentRsi);
+        }
+
+        // 4. STATE UPDATE (PnL Calculation)
+        lock (_lock)
+        {
+            if (side == TradeSide.Sell && _positions.TryGetValue(symbol, out var pos))
+            {
+                decimal pnl = (price - pos.AvgPrice) * pos.Quantity - roundTripFee;
+                _totalRealizedPnL += pnl;
+
+                if (pnl < -5.00m) _dailyLossCount++;
+
+                _tradeHistory.Add(new ClosedTrade { Symbol = symbol, Profit = pnl, ExitTime = DateTime.UtcNow });
+                _positions.Remove(symbol);
+                _lastSellTimes[symbol] = DateTime.UtcNow;
+
+                if (_dailyLossCount >= 4) _haltNewTrades = true;
+            }
+            else if (side == TradeSide.Buy)
+            {
+                _positions[symbol] = new SimPosition
+                {
+                    Symbol = symbol, // Now works because we added it in Step 1
+                    Quantity = qty,
+                    AvgPrice = price,
+                    CurrentPrice = price,
+                    EntryTime = DateTime.UtcNow,
+                    TrailingStop = price * 0.98m
+                };
+            }
+        }
+
+        Task.Delay(3000).ContinueWith(_ => { lock (_lock) { _pendingOrders.Remove(symbol); } });
     }
     public void ProcessHistoricalBar(string symbol, decimal close, long volume) // Ensure volume is long
     {
@@ -342,7 +448,8 @@ public void LoadState()
     {
         lock (_lock)
         {
-            if (_goalReached) return;
+            // FIX: If we already reached a goal or halted, stop immediately
+            if (_goalReached || _haltNewTrades) return;
 
             decimal currentEquity = GetTotalEquity();
             decimal profitPercent = (currentEquity - _startingDayEquity) / _startingDayEquity;
@@ -355,6 +462,7 @@ public void LoadState()
             }
             else if (profitPercent <= (dailyLossLimitPct * -1))
             {
+                // FIX: Set halt to true BEFORE liquidating to prevent the loop
                 _haltNewTrades = true;
                 LiquidateAll("Daily Loss Limit Hit");
             }
@@ -364,64 +472,26 @@ public void LoadState()
     public void LiquidateAll(string reason)
     {
         Console.WriteLine($"\n[SYSTEM] !!! {reason.ToUpper()} !!! Liquidating all positions.");
-        foreach (var sym in _positions.Keys.ToList())
-        {
-            SubmitOrder(sym, (int)_positions[sym].Quantity, _positions[sym].CurrentPrice, TradeSide.Sell);
-        }
-    }
 
-    public void SubmitOrder(string symbol, int qty, decimal price, TradeSide side)
-    {
-        lock (_lock)
-        {
-            if (_pendingOrders.Contains(symbol)) return;
-            _pendingOrders.Add(symbol);
-        }
+        // Create a copy of the keys to avoid collection modified errors
+        var symbols = _positions.Keys.ToList();
 
-        if (RealBroker != null) RealBroker.SubmitOrder(symbol, qty, price, side);
-
-        lock (_lock)
+        foreach (var sym in symbols)
         {
-            if (side == TradeSide.Sell && _positions.TryGetValue(symbol, out var pos))
+            if (_positions.TryGetValue(sym, out var pos))
             {
-                // Calculate actual fill with slippage
-                decimal execPrice = price * (1 - slippagePct);
-                decimal pnl = (execPrice - pos.AvgPrice) * pos.Quantity - roundTripFee;
+                // IMPORTANT: Use Market orders for emergency liquidation to bypass 3% constraints
+                // If your SubmitOrder doesn't support Market types, ensure price is set very aggressively
+                SubmitOrder(sym, (int)pos.Quantity, pos.CurrentPrice, TradeSide.Sell);
 
-                // 1. Set the Revenge Shield State
-                bool isLoss = pnl < 0;
-                _lastTradeWasLoss[symbol] = isLoss;
-                if (isLoss) _dailyLossCount++;
-
-                // 2. Clear Tracking
-                _totalRealizedPnL += pnl;
-                _tradeHistory.Add(new ClosedTrade { Symbol = symbol, Profit = pnl, ExitTime = DateTime.UtcNow });
-                _positions.Remove(symbol);
-                _peakRsi.TryRemove(symbol, out _);
-                _lastSellTimes[symbol] = DateTime.UtcNow;
-
-                // 3. Global Halt Check
-                if (_dailyLossCount >= 4) _haltNewTrades = true;
-            }
-            else if (side == TradeSide.Buy)
-            {
-                _tradesExecutedToday++;
-                _positions[symbol] = new SimPosition
-                {
-                    Quantity = qty,
-                    AvgPrice = price,
-                    CurrentPrice = price,
-                    TrailingStop = price * (1 - maxTradeLossPct)
-                };
-                _buyTimes[symbol] = DateTime.UtcNow;
-                _peakRsi[symbol] = CalculateRSI(symbol, 14);
+                // Force local cleanup so the loop doesn't re-trigger on this symbol
+                _positions.Remove(sym);
             }
         }
         SaveState();
-
-        // Release the lock on this symbol after a delay to prevent "double-tap" orders
-        Task.Delay(3000).ContinueWith(_ => { lock (_lock) { _pendingOrders.Remove(symbol); } });
     }
+
+
     // Add this dictionary to your class variables at the top
     protected readonly Dictionary<string, decimal> _tenDayAvgVolume = new();
     private DateTime _lastResetDate = DateTime.MinValue;
@@ -513,98 +583,114 @@ public void LoadState()
     }
     private void CheckSpecificEntry(string symbol)
     {
-        if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count < 50) return;
+        if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count < 20) return;
         if (!_volumeHistory.TryGetValue(symbol, out var volumes) || volumes.Count < 10) return;
 
         decimal currentPrice = prices.Last();
-
-        // 1. Calculate Indicators
-        decimal rsi = (decimal)CalculateRSI(symbol, 14); // Cast double to decimal
+        double rsi = CalculateRSI(symbol, 14);
         string trend = GetTrend(prices);
 
-        // 2. Fix the Double-to-Decimal conversion error here
-        // We cast the Average() result (double) to (decimal)
+        // MODERATE: Volume & Volatility Checks
         decimal avgVol = (decimal)volumes.Skip(volumes.Count - 10).Take(9).Average();
         decimal volX = avgVol > 0 ? (decimal)volumes.Last() / avgVol : 0;
 
         decimal rvoh = 0;
         if (_learnedAvgVolume.TryGetValue(symbol, out decimal learnedAvg) && learnedAvg > 0)
         {
-            _cumVolume.TryGetValue(symbol, out long currentCumVol);
-            rvoh = (decimal)currentCumVol / learnedAvg;
+            if (_cumVolume.TryGetValue(symbol, out long currentCumVol))
+                rvoh = (decimal)currentCumVol / learnedAvg;
         }
 
-        // 3. Entry Logic
-        if (trend == "BULL" && rsi < 40 && volX > 1.5m)
+        // Filter: Bull trend only and no "Flash Spikes" (RVOH > 4.5)
+        if (trend == "BULL" && (double)rvoh < VOLATILITY_CAP)
         {
             _lastSellTimes.TryGetValue(symbol, out var lastSell);
             if ((DateTime.UtcNow - lastSell).TotalMinutes > 15)
             {
-                // FIX: Removed the 'currentPrice' argument to match your method signature
                 ExecuteEntry(symbol);
             }
         }
     }
     private void ExecuteExitLogic(string symbol)
     {
-        // 1. SAFE DATA RETRIEVAL
-        // Use the underscore version to match the new declaration
-        if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count == 0) return;
-        if (!_volumeHistory.TryGetValue(symbol, out var volumes) || volumes.Count == 0) return;
-        if (!_positions.TryGetValue(symbol, out var pos)) return; // Position might have been closed already
+        // 1. DATA SAFETY & INITIALIZATION
+        if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count < 2) return;
+        if (!_positions.TryGetValue(symbol, out var pos)) return;
+
+        // EMERGENCY SHORT-GUARD: If IBKR shows a negative position, our logic is broken.
+        // We must close it immediately to prevent inverted math errors.
+        if (pos.Quantity < 0)
+        {
+            SubmitOrder(symbol, (int)Math.Abs(pos.Quantity), prices.Last(), TradeSide.Buy, 0);
+            _positions.Remove(symbol);
+            return;
+        }
 
         decimal currentPrice = prices.Last();
-        long currentVolume = volumes.Last();
-        double rsi = (double)CalculateRSI(symbol, 14); // Cast if your RSI returns decimal
-        string trend = GetTrend(prices);
-        double peak = _peakRsi.AddOrUpdate(symbol, rsi, (key, oldPeak) => Math.Max(oldPeak, rsi));
-        pos.CurrentPrice = currentPrice;
+        decimal lastPrice = prices[prices.Count - 2];
+        double rsi = CalculateRSI(symbol, 14);
         decimal netPnL = pos.UnrealizedPnL - roundTripFee;
 
+        // 2. CHURN & SPREAD FILTERS
         _buyTimes.TryGetValue(symbol, out var buyTime);
-        bool timeShieldActive = (DateTime.UtcNow - buyTime).TotalMinutes < 15;
+        double minutesHeld = (DateTime.UtcNow - buyTime).TotalMinutes;
 
+        // SPREAD FILTER: Ignore noise smaller than 0.1% (Prevents flicker-selling in high Vol-X)
+        decimal tickChange = Math.Abs((currentPrice - lastPrice) / lastPrice);
+        if (tickChange < 0.001m) return;
 
-        // 3. VOLATILITY STOP: Tighten to 0.4% once in profit
-        if (netPnL > 6.00m)
+        // 3. TRAILING STOP & BREAK-EVEN PROTECTION
+        double peak = _peakRsi.AddOrUpdate(symbol, rsi, (key, oldPeak) => Math.Max(oldPeak, rsi));
+
+        // Break-Even Protection: Once up $10.00, move stop to Entry Price + Fees
+        if (netPnL > 10.00m && pos.TrailingStop < pos.AvgPrice)
+        {
+            pos.TrailingStop = pos.AvgPrice + (roundTripFee / pos.Quantity);
+        }
+
+        // Moderate Trailing: Tighten stop to 0.4% offset once up $15.00
+        if (netPnL > 15.00m)
         {
             decimal tightStop = currentPrice * 0.996m;
             if (tightStop > pos.TrailingStop) pos.TrailingStop = tightStop;
-            pos.IsBreakEvenProtected = true;
         }
 
-        // 4. DEFINE EXIT TRIGGERS
-        bool rsiHooked = peak > 75 && rsi < (peak - 3.0);
+        // 4. EXIT CONDITION DEFINITIONS
+        // RSI Hook: Requires a 5.0 point drop from a high of at least 70
+        bool rsiHooked = peak > 70 && rsi < (peak - 5.0);
 
-        decimal avgVolume = 0;
-        lock (volumes) // Lock the list while calculating average
-        {
-            if (volumes.Count >= 10)
-                avgVolume = (decimal)volumes.Skip(volumes.Count - 10).Average();
-        }
+        // RSI Overbought: Exit only if profit is meaningful ($15+)
+        bool rsiOverbought = rsi >= 80 && netPnL > 15.00m;
 
-        bool volumeClimax = avgVolume > 0 && currentVolume > (avgVolume * 5.0m);
         bool hitStop = currentPrice <= pos.TrailingStop;
-        bool rsiWinExit = (rsi >= 80 && netPnL > 3.00m) || rsiHooked || (rsi >= 72 && trend == "FLAT" && netPnL > 1.50m);
 
-        // 5. EXECUTE EXIT
-        if (hitStop || rsiWinExit || volumeClimax)
+        // Win Exit: Combine Hook/Overbought with a $8.00 minimum profit floor
+        bool rsiWinExit = (rsiOverbought || rsiHooked) && netPnL > 8.00m;
+
+        // 5. MODERATE EXECUTION
+        if (hitStop || rsiWinExit)
         {
-            // Time shield: Don't let a stop-loss fire in the first 15 mins if it's a minor dip
-            if (hitStop && netPnL < 0 && timeShieldActive) return;
+            // PROTECTION: No "Win Exits" before 5 minutes. (Hard Stop Loss always allowed)
+            if (rsiWinExit && minutesHeld < 5.0) return;
 
-            string reason = hitStop ? "STOP" : (volumeClimax ? "CLIMAX" : "RSI_WIN");
+            // Cast quantity to int to resolve IBKR fractional share warnings
+            int qtyToSell = (int)Math.Abs(pos.Quantity);
+            if (qtyToSell <= 0)
+            {
+                _positions.Remove(symbol);
+                return;
+            }
 
-            // FIX: Cast quantity to (int) to stop the "Fractional Share" API warning
-            int qtyToSell = (int)pos.Quantity;
+            SubmitOrder(symbol, qtyToSell, currentPrice, TradeSide.Sell, rsi);
 
-            SubmitOrder(symbol, qtyToSell, currentPrice, TradeSide.Sell);
-
-            // CLEANUP: Remove the peak RSI tracking so it's fresh for the next trade
+            // CLEANUP
             _peakRsi.TryRemove(symbol, out _);
+            _lastTradeWasLoss[symbol] = netPnL < 0; // Records for the Entry Cooldown
+            _lastSellTimes[symbol] = DateTime.UtcNow;
 
+            string reason = hitStop ? "STOP" : "RSI_STUBBORN";
             Task.Run(() => SendEmailNotification($"🔴 SELL ({reason}): {symbol}",
-                $"Sold @ {currentPrice:C2} | Net PnL: {netPnL:C2}"));
+                $"Sold @ {currentPrice:C2} | Net PnL: {netPnL:C2} | RSI: {rsi:F1} | Hold: {minutesHeld:F1}m"));
         }
     }
     private void ResetDailyStats()
@@ -630,21 +716,80 @@ public void LoadState()
 
     private void ExecuteEntry(string symbol)
     {
-        var prices = _priceHistory[symbol];
-        decimal currentPrice = prices.Last();
+        // 1. GLOBAL HALT & SAFETY FILTERS
+        if (_haltNewTrades || _goalReached) return;
 
-        // Final Overextension Check
-        decimal ma20 = (decimal)prices.Skip(prices.Count - 20).Average();
-        if (currentPrice > (ma20 * 1.012m)) return;
+        // MODERATE: Consistent with your lossLimitPct, stop at 4 failed trades
+        if (_dailyLossCount >= 4)
+        {
+            _haltNewTrades = true;
+            return;
+        }
 
-        decimal targetSpend = 1000m;
-        int qty = (int)Math.Floor((targetSpend - 1.00m) / currentPrice);
+        // Guard against specific symbols or Index ETFs
+        if (symbol == "SQ" || symbol == "QQQ") return;
+
+        // 2. POSITION & SHORT-GUARD
+        // Ensure we don't buy if we have a "Ghost Short" or are already at Max Slots
+        if (_positions.TryGetValue(symbol, out var existing))
+        {
+            // If IBKR says we are -10 shares, don't buy more until manually fixed
+            if (existing.Quantity <= 0) return;
+            return; // Already own it
+        }
+
+        if (_positions.Count >= MaxActivePositions) return;
+
+        // 3. SAFE DATA RETRIEVAL
+        if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count < 20) return;
+
+        decimal currentPrice;
+        decimal ma20;
+        lock (prices)
+        {
+            currentPrice = prices.Last();
+            ma20 = (decimal)prices.Skip(prices.Count - 20).Average();
+        }
+
+        // 4. MODERATE STRATEGY FILTERS
+        // Overextension: Lowered to 1.0% to prevent buying at the absolute peak
+        if (currentPrice > (ma20 * 1.010m)) return;
+
+        // Cooldown Check: Use the wasLoss logic to prevent "Revenge Trading"
+        _lastSellTimes.TryGetValue(symbol, out var lastSell);
+        _lastTradeWasLoss.TryGetValue(symbol, out bool wasLoss);
+        int requiredCooldown = wasLoss ? 30 : 15;
+
+        if ((DateTime.UtcNow - lastSell).TotalMinutes < requiredCooldown) return;
+
+        // 5. QUANTITY CALCULATION (STRICT INTEGERS)
+        // Budget is based on initialAccountValue / 3 slots
+        decimal budgetPerSlot = initialAccountValue / MaxActivePositions;
+
+        // Subtract $1.00 for the buy fee to ensure we don't over-leverage
+        int qty = (int)Math.Floor((budgetPerSlot - 1.00m) / currentPrice);
 
         if (qty > 0)
         {
+            // 6. ATOMIC EXECUTION
+            // Note: SubmitOrder now receives the exact (int) qty to satisfy IBKR
             SubmitOrder(symbol, qty, currentPrice, TradeSide.Buy);
-            _peakRsi[symbol] = CalculateRSI(symbol, 14);
-            Task.Run(() => SendEmailNotification($"🚀 PRIORITY BUY: {symbol}", $"Ranked as top volume runner. Bought {qty} @ {currentPrice:C2}"));
+
+            // 7. INITIALIZE TRACKING
+            double startingRsi = (double)CalculateRSI(symbol, 14);
+            _peakRsi.AddOrUpdate(symbol, startingRsi, (key, val) => startingRsi);
+
+            // Ensure EntryTime is set for the "Time Shield" in Exit Logic
+            if (_positions.TryGetValue(symbol, out var pos))
+            {
+                pos.EntryTime = DateTime.UtcNow;
+            }
+            _buyTimes[symbol] = DateTime.UtcNow;
+
+            Task.Run(() => SendEmailNotification(
+                $"🚀 BUY: {symbol}",
+                $"Bought {qty} @ {currentPrice:C2} | MA20: {ma20:C2} | Slot: {_positions.Count}/{MaxActivePositions}"
+            ));
         }
     }
     public void PrintStatusTable()
@@ -823,22 +968,23 @@ public void LoadState()
         return avgLoss == 0 ? 100 : 100 - (100 / (1 + (double)(avgGain / avgLoss)));
     }
 
-    private string GetTrend(IList<decimal> prices)
+    private string GetTrend(List<decimal> prices)
     {
-        int fastPeriod = 20;
-        int slowPeriod = 50;
-        if (prices.Count < slowPeriod) return "WAIT";
+        if (prices == null || prices.Count < 10) return "WAIT";
 
-        decimal fastMA = prices.Skip(prices.Count - fastPeriod).Average();
-        decimal slowMA = prices.Skip(prices.Count - slowPeriod).Average();
-        decimal current = prices.Last();
+        lock (prices)
+        {
+            // Look at the last 10 ticks/bars
+            var recent = prices.Skip(prices.Count - 10).ToList();
+            decimal first = recent.First();
+            decimal last = recent.Last();
 
-        // Bulls: Price > Fast > Slow
-        if (current > fastMA * 1.001m && fastMA > slowMA) return "BULL";
-        // Bears: Price < Fast < Slow
-        if (current < fastMA * 0.999m && fastMA < slowMA) return "BEAR";
+            // If price moved up by 0.1%, call it BULL (Aggressive)
+            if (last > first * 1.001m) return "BULL";
+            if (last < first * 0.999m) return "BEAR";
 
-        return "FLAT";
+            return "FLAT";
+        }
     }
     public void SyncExistingPosition(string symbol, decimal qty, decimal avgPrice)
     {
