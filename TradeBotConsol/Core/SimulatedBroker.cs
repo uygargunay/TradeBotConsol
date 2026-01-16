@@ -357,54 +357,73 @@ public void LoadState()
             }
         }
     }
+    public void UpdateHistory(string symbol, decimal price, long volume)
+    {
+        if (price <= 0) return;
+
+        lock (_lock)
+        {
+            // 1. Data Management
+            ManagePriceData(symbol, price, volume);
+
+            // 2. Main Logic Execution
+            // This now handles both Entry (if no position) and Exit (if has position)
+            ExecuteTradeLogic(symbol);
+
+            // 3. Global Safety Check (PnL and Goal Tracking)
+            CheckDailyGoal();
+
+            // 4. Time-based Liquidation
+            CheckEndOfDayLiquidation();
+        }
+    }
+
     public void SubmitOrder(string symbol, int qty, decimal price, TradeSide side, double currentRsi = 0, string orderType = "LMT")
     {
         lock (_lock)
         {
             if (_pendingOrders.Contains(symbol)) return;
-            if (_haltNewTrades && side == TradeSide.Buy) return;
+
+            // Block new buys if the bot is halted or goal reached
+            if (side == TradeSide.Buy && (_haltNewTrades || _goalReached)) return;
 
             if (side == TradeSide.Sell)
             {
                 if (!_positions.TryGetValue(symbol, out var pos)) return;
 
-                // 1. CHURN SHIELD
+                // Churn Shield: 5-minute minimum hold for non-stop-loss exits
                 var holdMinutes = (DateTime.UtcNow - pos.EntryTime).TotalMinutes;
-                decimal currentPnL = (price - pos.AvgPrice) / pos.AvgPrice;
-                if (holdMinutes < 5.0 && currentPnL > -0.020m) return;
+                decimal currentPnL = pos.AvgPrice > 0 ? (price - pos.AvgPrice) / pos.AvgPrice : 0;
 
-                // 2. INTEGER ROUNDING (Fixes the IB 2176 Warning)
+                // Only bypass hold time if it's a significant loss (Stop Loss)
+                if (holdMinutes < 5.0 && currentPnL > -0.015m && !_haltNewTrades) return;
+
+                // Ensure we use the exact integer quantity held
                 qty = (int)Math.Floor(Math.Abs(pos.Quantity));
             }
+
             _pendingOrders.Add(symbol);
         }
 
-        // 3. EXECUTION (The "5-Argument" Workaround)
         if (RealBroker != null)
         {
-            // If it's a Sell (especially liquidation), send a price of 0 
-            // to signal a Market Order to the RealBroker wrapper.
-            decimal priceToSend = (side == TradeSide.Sell) ? 0 : price;
-
-            // For Buys, ensure we don't send a stale price
-            if (side == TradeSide.Buy) priceToSend = Math.Round(price, 2);
-
+            // Sells send price 0 to indicate a Market Order to avoid 3% price caps
+            decimal priceToSend = (side == TradeSide.Sell) ? 0 : Math.Round(price, 2);
             RealBroker.SubmitOrder(symbol, qty, priceToSend, side, currentRsi);
         }
 
-        // 4. STATE UPDATE (PnL Calculation)
         lock (_lock)
         {
             if (side == TradeSide.Sell && _positions.TryGetValue(symbol, out var pos))
             {
                 decimal pnl = (price - pos.AvgPrice) * pos.Quantity - roundTripFee;
                 _totalRealizedPnL += pnl;
-
                 if (pnl < -5.00m) _dailyLossCount++;
 
                 _tradeHistory.Add(new ClosedTrade { Symbol = symbol, Profit = pnl, ExitTime = DateTime.UtcNow });
                 _positions.Remove(symbol);
                 _lastSellTimes[symbol] = DateTime.UtcNow;
+                _lastTradeWasLoss[symbol] = pnl < 0;
 
                 if (_dailyLossCount >= 4) _haltNewTrades = true;
             }
@@ -412,16 +431,19 @@ public void LoadState()
             {
                 _positions[symbol] = new SimPosition
                 {
-                    Symbol = symbol, // Now works because we added it in Step 1
+                    Symbol = symbol,
                     Quantity = qty,
                     AvgPrice = price,
                     CurrentPrice = price,
                     EntryTime = DateTime.UtcNow,
-                    TrailingStop = price * 0.98m
+                    TrailingStop = price * 0.985m // 1.5% Initial Stop
                 };
+                _buyTimes[symbol] = DateTime.UtcNow;
+                _tradesExecutedToday++;
             }
         }
 
+        // Release the symbol from pending after 3 seconds
         Task.Delay(3000).ContinueWith(_ => { lock (_lock) { _pendingOrders.Remove(symbol); } });
     }
     public void ProcessHistoricalBar(string symbol, decimal close, long volume) // Ensure volume is long
@@ -543,69 +565,7 @@ public void LoadState()
             _cumVwapProd.AddOrUpdate(symbol, (price * volume), (key, oldProd) => oldProd + (price * volume));
         }
     }
-    public void UpdateHistory(string symbol, decimal price, long volume)
-    {
-        if (price <= 0) return;
 
-        lock (_lock)
-        {
-            // 1. Pre-Market Cleanup
-            // If it's before 9:30 AM and we have old flags set, reset for the new day
-            var nyTime = GetEasternTime().TimeOfDay;
-            if (nyTime < new TimeSpan(9, 30, 0) && (_goalReached || _haltNewTrades))
-            {
-                ResetDailyStats();
-            }
-
-            // 2. Data Management
-            // Passes the tick to ManagePriceData to update lists and cumulative volume
-            ManagePriceData(symbol, price, volume);
-
-            // 3. EXIT MANAGEMENT (High Priority - Every Tick)
-            // We check stops/exits immediately so we don't miss a price flush
-            if (_positions.ContainsKey(symbol))
-            {
-                ExecuteExitLogic(symbol);
-            }
-
-            // 4. ENTRY SCANNING (Conditional)
-            // Only scan if we are in the trading window and have room for new positions
-           
-
-            // 5. Global Safety Check
-            CheckDailyGoal();
-        }
-    }
-    private void CheckSpecificEntry(string symbol)
-    {
-        if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count < 20) return;
-        if (!_volumeHistory.TryGetValue(symbol, out var volumes) || volumes.Count < 10) return;
-
-        decimal currentPrice = prices.Last();
-        double rsi = CalculateRSI(symbol, 14);
-        string trend = GetTrend(prices);
-
-        // MODERATE: Volume & Volatility Checks
-        decimal avgVol = (decimal)volumes.Skip(volumes.Count - 10).Take(9).Average();
-        decimal volX = avgVol > 0 ? (decimal)volumes.Last() / avgVol : 0;
-
-        decimal rvoh = 0;
-        if (_learnedAvgVolume.TryGetValue(symbol, out decimal learnedAvg) && learnedAvg > 0)
-        {
-            if (_cumVolume.TryGetValue(symbol, out long currentCumVol))
-                rvoh = (decimal)currentCumVol / learnedAvg;
-        }
-
-        // Filter: Bull trend only and no "Flash Spikes" (RVOH > 4.5)
-        if (trend == "BULL" && (double)rvoh < VOLATILITY_CAP)
-        {
-            _lastSellTimes.TryGetValue(symbol, out var lastSell);
-            if ((DateTime.UtcNow - lastSell).TotalMinutes > 15)
-            {
-                ExecuteEntry(symbol);
-            }
-        }
-    }
     private void ExecuteExitLogic(string symbol)
     {
         // 1. DATA SAFETY & INITIALIZATION
