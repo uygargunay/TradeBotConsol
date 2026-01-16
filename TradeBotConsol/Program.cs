@@ -3,63 +3,88 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
-using System.Threading.Tasks;
 
 class Program
 {
     static void Main(string[] args)
     {
-        // 1. Initialize the shared "Brain" (PositionManager)
+        // 1. Initialize the "Brain"
         var broker = new PositionManager();
+
+        // Load all persistent data from JSON files
+        broker.LoadMarketMemory();
         broker.LoadState();
 
-        // 2. Initialize the "Pipe" (IbClient) and link them
+        // 2. Initialize the "Pipe" and link them
         var ibClient = new IbClient(broker);
         broker.RealBroker = ibClient;
 
-        // 3. Connect to TWS
-        ibClient.Connect();
+        // 3. Emergency Shutdown Hook
+        // Ensures data is saved if the console is closed or crashed
+        AppDomain.CurrentDomain.ProcessExit += (s, e) => {
+            Console.WriteLine("\n[SYSTEM] Emergency shutdown! Saving state and memory...");
+            broker.SaveMarketMemory();
+            broker.SaveState();
+        };
 
-        // 4. Start data requests (Watchlist + QQQ for Market Regime)
-        var watchList = broker._tradeableStars.Concat(new[] { "QQQ" }).Distinct().ToList();
-        ibClient.InitializeUniverse(watchList);
-
-        Console.WriteLine("\n" + new string('=', 60));
-        Console.WriteLine("STRATEGY STARTING... Press [ENTER] to save and exit safely.");
-        Console.WriteLine(new string('=', 60) + "\n");
-
-        int heartBeatCounter = 0;
-
-        // 5. The Execution Loop
-        // 5. The Execution Loop
-        int uiCounter = 0;
-        while (true)
+        try
         {
-            // 1. Run Strategy Logic (FAST - Every 1 second)
-            // This ensures stops and RSI entries are never missed
-            foreach (var symbol in watchList)
+            // 4. Connect to TWS/Gateway
+            ibClient.Connect();
+
+            // 5. Start data requests
+            var watchList = broker._tradeableStars.Concat(new[] { "QQQ" }).Distinct().ToList();
+            ibClient.InitializeUniverse(watchList);
+
+            Console.WriteLine("\n" + new string('=', 60));
+            Console.WriteLine("STRATEGY ACTIVE | Press [ENTER] to save and exit safely.");
+            Console.WriteLine(new string('=', 60) + "\n");
+
+            int uiCounter = 0;
+
+            // 6. The Main Execution Loop
+            while (true)
             {
-                broker.ExecuteTradeLogic(symbol);
+                // A. Execute Trade Logic (Stops, RSI, Entries)
+                foreach (var symbol in watchList)
+                {
+                    broker.ExecuteTradeLogic(symbol);
+                }
+
+                // B. Manage End-of-Day (Liquidation, Learning Save, Email)
+                // This method now internally handles the 4:00 PM SaveMarketMemory()
+                broker.CheckEndOfDayLiquidation();
+
+                // C. Check Profit Goals / Loss Halts
+                broker.CheckDailyGoal();
+
+                // D. Update Dashboard (Every 2 seconds)
+                if (uiCounter >= 2)
+                {
+                    broker.PrintStatusTable();
+                    uiCounter = 0;
+                }
+
+                uiCounter++;
+                Thread.Sleep(1000); // Heartbeat
+
+                // E. Manual Safe Exit
+                if (Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.Enter)
+                    break;
             }
-            broker.CheckDailyGoal();
-
-            // 2. Update the Dashboard (SLOW - Every 2 or 3 seconds)
-            // Frequent updates cause the "flicker" effect in Windows Console
-            if (uiCounter >= 2)
-            {
-                broker.PrintStatusTable();
-                uiCounter = 0;
-            }
-
-            uiCounter++;
-            Thread.Sleep(1000);
-
-            if (Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.Enter)
-                break;
         }
-
-        broker.SaveState(); // Final save before closing
-        ibClient.Disconnect();
-        Console.WriteLine("[EXIT] Disconnected. Goodbye!");
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CRITICAL ERROR] {ex.Message}");
+        }
+        finally
+        {
+            // 7. Graceful Exit
+            Console.WriteLine("[SYSTEM] Shutting down gracefully...");
+            broker.SaveMarketMemory();
+            broker.SaveState();
+            ibClient.Disconnect();
+            Console.WriteLine("[EXIT] Goodbye!");
+        }
     }
 }

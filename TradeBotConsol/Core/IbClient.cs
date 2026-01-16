@@ -99,20 +99,30 @@ public class IbClient : EWrapper, IBroker
                 SecType = "STK",
                 Currency = "USD",
                 Exchange = "SMART",
-                PrimaryExch = "ISLAND"
+                PrimaryExch = "ISLAND" // Using ISLAND (NASDAQ) helps avoid some data routing errors
             };
 
-            int reqId = _currentReqId++;
-            _reqIdToSymbol[reqId] = sym;
+            // ID for History Request
+            int histReqId = _currentReqId++;
+            _reqIdToSymbol[histReqId] = sym;
 
-            // Request 2 hours of history (7200 seconds) to fill the 50-bar warmup
-            _client.reqHistoricalData(reqId, contract, "", "7200 S", "1 min", "TRADES", 1, 1, false, null);
+            // ID for Live Stream (Offset by 10,000 for easy identification)
+            int liveReqId = histReqId + 10000;
+            _reqIdToSymbol[liveReqId] = sym;
+
+            Console.WriteLine($"[DATA] Warmup + Stream request for {sym}...");
+
+            // 1. Request 2 hours of history (7200 seconds)
+            _client.reqHistoricalData(histReqId, contract, "", "7200 S", "1 min", "TRADES", 1, 1, false, null);
+
+            // 2. Start Live Streaming (Ticks)
+            // This ensures that as soon as the bot is done loading history, it has live prices
+            _client.reqMktData(liveReqId, contract, "", false, false, null);
 
             Thread.Sleep(50); // Prevent Pacing Violation
         }
-        Console.WriteLine("[SYSTEM] All data subscriptions initialized.");
+        Console.WriteLine("[SYSTEM] Warmup and Live Subscriptions Initialized.");
     }
-
     // --- IBKR CALLBACKS ---
     public void nextValidId(int orderId)
     {
@@ -123,10 +133,10 @@ public class IbClient : EWrapper, IBroker
 
     public void historicalData(int reqId, Bar bar)
     {
-        if (_reqIdToSymbol.TryGetValue(reqId, out string symbol) && bar.Close > 0)
+        if (_reqIdToSymbol.TryGetValue(reqId, out string symbol))
         {
-            // Push historical bars directly into the shared broker
-            _broker.UpdateHistory(symbol, (decimal)bar.Close, bar.Volume);
+            // Add to history without triggering trade logic (it's in the past!)
+            _broker.ProcessHistoricalBar(symbol, (decimal)bar.Close, bar.Volume);
         }
     }
 
@@ -134,11 +144,7 @@ public class IbClient : EWrapper, IBroker
     {
         if (_reqIdToSymbol.TryGetValue(reqId, out string symbol))
         {
-            Console.WriteLine($"[SYSTEM] Warmup data loaded for {symbol}. Switching to live...");
-            var contract = new Contract { Symbol = symbol, SecType = "STK", Currency = "USD", Exchange = "SMART", PrimaryExch = "ISLAND" };
-
-            // Transition the ID from historical to Live Market Data
-            _client.reqMktData(reqId, contract, "", false, false, null);
+            Console.WriteLine($"[DATA] Warmup complete for {symbol}. Ready for strategy.");
         }
     }
 
