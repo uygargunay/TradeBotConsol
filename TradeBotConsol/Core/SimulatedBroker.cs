@@ -54,38 +54,45 @@ public class PositionManager : SimulatedBroker { }
 
 public class SimulatedBroker : IBroker
 {
-    // MODERATE TUNING CONSTANTS
-    private const double VOLATILITY_CAP = 4.5; // Block entries if RVOH > 4.5x
-    private const int MIN_HOLD_SECONDS = 120;  // 2-minute mandatory hold
+    // 🔴 ORDER FAILURE CALLBACK (from IB client)
+    public Action<int> OnOrderFailed;
+
+
     private const double RSI_HOOK_DROP = 3.0;  // Require 3.0 point drop from peak
 
-    private const decimal dailyProfitGoalPct = 0.01m; // +2.5% Target
+    private const decimal dailyProfitGoalPct = 0.01m; // +1% Target
     private const decimal dailyLossLimitPct = 0.03m;   // -3.0% Stop
-    private const decimal maxTradeLossPct = 0.02m;     // 2% Room for volatility
-    private const int maxTradesGlobal = 15;            // Quality over quantity
+
     private const int MaxActivePositions = 4;          // Focus on 3 slots
 
     private const decimal initialAccountValue = 4000m;
 
     private const decimal roundTripFee = 2.00m;        // Matches $1 buy + $1 sell
     private const decimal slippagePct = 0.0002m;       // Increased to 0.02% for more realistic fills
+    private HashSet<string> _addedToWinners = new();
 
     // Inside SimulatedBroker Class - Added Variable
     protected int _dailyLossCount = 0;
+    private ConcurrentDictionary<string, Queue<double>> _raceScoreHistory = new();
 
-    public readonly string[] _tradeableStars = { 
-    // The Core Momentum Kings
-    "NVDA", "TSLA", "PLTR", "AMD", "META", "AMZN", "NFLX", "GOOGL",
-    
-    // High-Volatility Tech & Crypto Proxies
-    "COIN", "MSTR", "ARM", "SMCI", "SHOP", "SNOW", 
-    
-    // Technical Respect (Clean VWAP/RSI performers)
-    "MU", "AVGO", "PANW", "UBER", "DKNG", "PYPL", "ON",
-    
-    // High-Relative Volume Growth
-    "RKLB", "MARA", "DKNG"
+    public readonly string[] _tradeableStars =
+    {
+    // Institutional momentum
+    "NVDA", "AMD", "META", "AMZN", "GOOGL", "MSFT",
+
+    // High beta leaders
+    "TSLA", "SMCI", "ARM", "COIN", "MSTR",
+
+    // Clean technicals
+    "AVGO", "PANW", "CRWD", "NOW", "ADBE",
+
+    // Intraday runners
+    "NFLX", "PLTR", "SNOW", "SHOP", "UBER",
+
+    // Market regime
+    "QQQ"
 };
+
 
     public ConcurrentDictionary<string, List<decimal>> _priceHistory { get; set; } = new();
     public ConcurrentDictionary<string, List<long>> _volumeHistory { get; set; } = new();
@@ -100,9 +107,8 @@ public class SimulatedBroker : IBroker
     protected readonly Dictionary<string, DateTime> _lastSellTimes = new();
     private readonly ConcurrentDictionary<string, DateTime> _buyTimes = new ConcurrentDictionary<string, DateTime>();
     private readonly DateTime _botStartTime = DateTime.UtcNow;
-    private readonly ConcurrentDictionary<string, byte> _pendingOrders = new();
+    private readonly ConcurrentDictionary<string, int> _pendingOrders = new();
 
-    private readonly TimeSpan _latestEntryTime = new TimeSpan(15, 30, 0);
     private DateTime _lastHeartbeatEmail = DateTime.MinValue;
     private const string SaveFilePath = "bot_state.json";
     protected readonly object _lock = new object();
@@ -119,15 +125,23 @@ public class SimulatedBroker : IBroker
 
     private ConcurrentDictionary<string, double> _raceScores = new();
     private ConcurrentDictionary<string, DateTime> _raceStartTimes = new();
-    private const double MIN_RACE_SCORE = 6.5; // Noise filter
-    private const int PERSISTENCE_SECONDS = 30; // Must lead for 30s
+    private const double RACE_ENTRY_SCORE = 7.6;   // enter only real leaders
+    private const double RACE_STRONG_SCORE = 8.4;  // scale / conviction
+    private const double RACE_EXIT_SCORE = 4.8;    // momentum death
+    private int _chopWarnings = 0;
 
-    // === QUALITY CONTROL ===
-    private const int MaxTradesPerDay = 4;
+    private int GetPersistenceSeconds(double score)
+    {
+        if (score >= 8.5) return 15;
+        if (score >= 7.8) return 25;
+        return 35;
+    }
+
     private static readonly TimeSpan LastEntryTime = new TimeSpan(14, 0, 0); // 2:00 PM NY
     private const decimal BreakEvenTriggerPnL = 8.0m; // $8 per $1000 slot
 
     public IBroker RealBroker { get; set; }
+
 
     public class ClosedTrade
     {
@@ -136,7 +150,35 @@ public class SimulatedBroker : IBroker
         public DateTime ExitTime { get; set; }
     }
 
+    public SimulatedBroker()
+    {
+        OnOrderFailed = orderId =>
+        {
+            lock (_lock)
+            {
+                var symbol = _pendingOrders
+                    .FirstOrDefault(x => x.Value == orderId).Key;
+
+                if (!string.IsNullOrEmpty(symbol))
+                {
+                    _pendingOrders.TryRemove(symbol, out _);
+                    Console.WriteLine($"[ORDER FAIL] Cleared pending flag for {symbol}");
+                }
+            }
+        };
+    }
+
     protected readonly List<ClosedTrade> _tradeHistory = new();
+
+    private double GetRaceSlope(string symbol)
+    {
+        if (!_raceScoreHistory.TryGetValue(symbol, out var q) || q.Count < 5)
+            return 0;
+
+        var arr = q.ToArray();
+        return (arr[^1] - arr[0]) / arr.Length;
+    }
+
 
     private double CalculateRaceScore(string symbol)
     {
@@ -286,12 +328,19 @@ public void LoadState()
         // ─────────────────────────────────────────────
         double rawScore = CalculateRaceScore(symbol);
         double currentScore = rawScore * TimeOfDayMultiplier();
+        double prevScore = _raceScores.TryGetValue(symbol, out var ps) ? ps : 0;
+
         _raceScores[symbol] = currentScore;
-        if (_raceScores.TryGetValue(symbol, out var prevScore))
+        var history = _raceScoreHistory.GetOrAdd(symbol, _ => new Queue<double>());
+        history.Enqueue(currentScore);
+        if (history.Count > 8) history.Dequeue();
+
+        if (prevScore > RACE_ENTRY_SCORE && currentScore < prevScore * 0.6)
         {
-            if (prevScore > MIN_RACE_SCORE && currentScore < prevScore * 0.6)
-                return;
+            _raceStartTimes.TryRemove(symbol, out _);
+            return;
         }
+
         lock (_lock)
         {
             bool hasPosition = _positions.ContainsKey(symbol);
@@ -301,13 +350,15 @@ public void LoadState()
             // ─────────────────────────────────────────────
             if (!hasPosition && _positions.Count < MaxActivePositions)
             {
+
                 if (_tradesToday.TryGetValue(symbol, out int tradeCount) && tradeCount >= 2)
                     return;
                 // A. MARKET REGIME FILTER
                 if (!IsMarketSafe()) return;
 
                 // B. RACE PERSISTENCE CHECK
-                if (currentScore >= MIN_RACE_SCORE)
+                if (currentScore >= RACE_ENTRY_SCORE)
+
                 {
                     if (!_raceStartTimes.TryGetValue(symbol, out var start))
                     {
@@ -315,7 +366,7 @@ public void LoadState()
                         return;
                     }
 
-                    if ((DateTime.UtcNow - start).TotalSeconds < PERSISTENCE_SECONDS)
+                    if ((DateTime.UtcNow - start).TotalSeconds < GetPersistenceSeconds(currentScore))
                         return;
                 }
                 else
@@ -330,7 +381,8 @@ public void LoadState()
 
                 decimal currentPrice = prices.Last();
                 double rsi = CalculateRSI(symbol, 14);
-
+                decimal atr = GetATR(symbol);
+                if (atr / currentPrice < 0.0025m) return; // < 0.25% ATR = dead stock
                 _lastRsiMemory.TryGetValue(symbol, out double prevRsi);
                 bool rsiCross = prevRsi <= 45 && rsi > 45;
                 _lastRsiMemory[symbol] = rsi;
@@ -346,6 +398,13 @@ public void LoadState()
                     if (_pendingOrders.ContainsKey(symbol)) return;
 
                     decimal throttle = GetEntryThrottle();
+
+                    // 🧠 STRONG CONVICTION FILTER
+                    if (currentScore < RACE_STRONG_SCORE)
+                    {
+                        throttle *= 0.75m; // reduce size for weaker leaders
+                    }
+
                     decimal slotBudget = (_startingDayEquity / MaxActivePositions) * throttle;
 
                     int qty = (int)Math.Floor((slotBudget - 1.0m) / currentPrice);
@@ -355,6 +414,8 @@ public void LoadState()
                     _buyTimes[symbol] = DateTime.UtcNow;
                     _pendingOrders.TryAdd(symbol, 0);
 
+                    if (GetRaceSlope(symbol) < 0.12)
+                        return;
                     SubmitOrder(symbol, qty, currentPrice, TradeSide.Buy, rsi);
                     _raceStartTimes.TryRemove(symbol, out _);
                     SaveState();
@@ -365,6 +426,7 @@ public void LoadState()
             // ─────────────────────────────────────────────
             else if (hasPosition)
             {
+
                 var pos = _positions[symbol];
                 pos.CurrentPrice = _priceHistory[symbol].Last();
 
@@ -386,6 +448,20 @@ public void LoadState()
                     pos.AvgPrice > 0
                         ? (pos.CurrentPrice - pos.AvgPrice) / pos.AvgPrice
                         : 0;
+
+                if (!_addedToWinners.Contains(symbol)
+    && currentScore >= 9.0
+    && profitPct >= 0.004m
+    && _positions.Count < MaxActivePositions)
+                {
+                    int addQty = (int)(pos.Quantity * 0.5m);
+                    if (addQty > 0)
+                    {
+                        SubmitOrder(symbol, addQty, pos.CurrentPrice, TradeSide.Buy);
+                        _addedToWinners.Add(symbol);
+                        Console.WriteLine($"[ADD] Winner add-on for {symbol}");
+                    }
+                }
 
                 if (profitPct >= 0.006m)
                 {
@@ -414,7 +490,8 @@ public void LoadState()
 
                 // C. SOFT EXIT CONFIRMATION
                 decimal vwap = _cumVwapProd[symbol] / _cumVolume[symbol];
-                bool momentumDecay = currentScore < (MIN_RACE_SCORE * 0.4);
+                bool momentumDecay = currentScore < RACE_EXIT_SCORE;
+
                 bool vwapLoss = pos.CurrentPrice < vwap;
                 bool softExit = momentumDecay && vwapLoss;
 
@@ -440,6 +517,19 @@ public void LoadState()
             }
         }
     }
+
+    private decimal GetATR(string symbol, int period = 14)
+    {
+        if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count < period + 1)
+            return 0;
+
+        decimal atr = 0;
+        for (int i = prices.Count - period; i < prices.Count; i++)
+            atr += Math.Abs(prices[i] - prices[i - 1]);
+
+        return atr / period;
+    }
+
 
     public void UpdateHistory(string symbol, decimal price, long volume)
     {
@@ -520,7 +610,22 @@ public void LoadState()
                     decimal pnl =
                         (fillPrice - pos.AvgPrice) * pos.Quantity - roundTripFee;
 
+                    // ─────────────────────────────────────────
+                    // 🧯 CHOP DAY DETECTOR (MICRO-LOSS CLUSTER)
+                    // ─────────────────────────────────────────
+                    if (pnl < 0 && Math.Abs(pnl) < 5m)
+                    {
+                        _chopWarnings++;
+
+                        if (_chopWarnings >= 3)
+                        {
+                            _haltNewTrades = true;
+                            Console.WriteLine("[CHOP MODE] Trading halted due to repeated small losses.");
+                        }
+                    }
+
                     _totalRealizedPnL += pnl;
+
                     if (pnl <= GetVolatilityAdjustedLoss(symbol))
                         _dailyLossCount++;
 
@@ -539,6 +644,7 @@ public void LoadState()
                     if (_dailyLossCount >= 4)
                         _haltNewTrades = true;
                 }
+
                 else if (side == TradeSide.Buy)
                 {
                     _positions[symbol] = new SimPosition
@@ -602,7 +708,7 @@ public void LoadState()
             {
                 _goalReached = true;
                 _haltNewTrades = true;
-                LiquidateAll("Daily 3% Goal Met");
+                LiquidateAll("Daily 1% Goal Met");
             }
             else if (profitPercent <= (dailyLossLimitPct * -1))
             {
@@ -638,12 +744,6 @@ public void LoadState()
         }
         SaveState();
     }
-
-
-    // Add this dictionary to your class variables at the top
-    protected readonly Dictionary<string, decimal> _tenDayAvgVolume = new();
-    private DateTime _lastResetDate = DateTime.MinValue;
-    // 1. Add this private variable at the top of your class to track the date
 
 
     private void ManagePriceData(string symbol, decimal price, long volume)
@@ -721,7 +821,7 @@ public void LoadState()
         // --- 1. HEADER SECTION ---
         sb.AppendLine(new string('=', windowWidth - 1));
         sb.AppendLine($"  BOT: {botState} | Market: {marketStatus} | Day PnL: {pnlPct:F2}%".PadRight(windowWidth - 1));
-        sb.AppendLine($"  Losses: {_dailyLossCount}/4 | Active Slots: {_positions.Count}/4 | Goal: +3.0%".PadRight(windowWidth - 1));
+        sb.AppendLine($"  Losses: {_dailyLossCount}/4 | Active Slots: {_positions.Count}/4 | Goal: +1.0%".PadRight(windowWidth - 1));
         sb.AppendLine($"  Local Time: {DateTime.Now:HH:mm:ss} | NYC Time: {nyNow:HH:mm:ss}".PadRight(windowWidth - 1));
         sb.AppendLine(new string('=', windowWidth - 1));
 
