@@ -197,27 +197,41 @@ public class IbClient : EWrapper, IBroker
     {
         if (_currentOrderId < 0) return;
 
-        Contract contract = new Contract { Symbol = symbol, SecType = "STK", Exchange = "SMART", Currency = "USD" };
+        Contract contract = new Contract
+        {
+            Symbol = symbol,
+            SecType = "STK",
+            Exchange = "SMART",
+            Currency = "USD"
+        };
 
-        // Switch to LMT (Limit) to avoid "Flash Crash" fills
-        // For a BUY, we set the limit slightly above current price (e.g., +0.05)
-        // For a SELL, we set the limit slightly below.
-        decimal limitPrice = side == TradeSide.Buy ? price * 1.002m : price * 0.998m;
+        // LOGIC: Use Market for Sells (Exit) and Limit for Buys (Entry)
+        string finalOrderType = (side == TradeSide.Sell) ? "MKT" : "LMT";
 
         Order order = new Order
         {
             Action = side == TradeSide.Buy ? "BUY" : "SELL",
-            OrderType = "LMT", // Changed from MKT to LMT
-            LmtPrice = (double)Math.Round(limitPrice, 2),
+            OrderType = finalOrderType,
             TotalQuantity = (double)qty,
             Tif = "DAY",
-            OutsideRth = false // Ensure we don't trade in pre-market by accident
+            OutsideRth = false // Safety: Do not trade in pre-market/after-hours
         };
 
-        Console.WriteLine($"[API] Placing {order.Action} Limit Order for {symbol} at {limitPrice:F2}. OrderID: {_currentOrderId}");
+        if (finalOrderType == "LMT")
+        {
+            // For Buys, set limit 0.2% above current to ensure fill but prevent slippage
+            decimal limitPrice = price * 1.002m;
+            order.LmtPrice = (double)Math.Round(limitPrice, 2);
+            Console.WriteLine($"[API] Placing BUY Limit Order for {symbol} at {order.LmtPrice:F2}. ID: {_currentOrderId}");
+        }
+        else
+        {
+            // For Sells, Market orders do not use a price field
+            Console.WriteLine($"[API] Placing SELL Market Order for {symbol}. ID: {_currentOrderId}");
+        }
+
         _client.placeOrder(_currentOrderId++, contract, order);
     }
-
     #region Error Handling
     public void error(int id, int errorCode, string errorMsg)
     {
