@@ -126,7 +126,7 @@ public class IbClient : EWrapper, IBroker
     // --- IBKR CALLBACKS ---
     public void nextValidId(int orderId)
     {
-        _currentOrderId = orderId;
+        _currentOrderId = Math.Max(_currentOrderId, orderId);
         _client.reqMarketDataType(1); // 1 = Live, 3 = Delayed (if you don't have paid data)
         Console.WriteLine($"[SYSTEM] Handshake Complete. Next Valid Order ID: {_currentOrderId}");
     }
@@ -157,9 +157,6 @@ public class IbClient : EWrapper, IBroker
             {
                 decimal decPrice = (decimal)price;
                 _currentPriceBatch[symbol] = decPrice;
-
-                // Update the shared broker's history with the newest live tick
-                _broker.UpdateHistory(symbol, decPrice, 0);
                 OnPrice?.Invoke(symbol, decPrice);
             }
         }
