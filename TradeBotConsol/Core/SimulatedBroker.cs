@@ -107,7 +107,8 @@ public class SimulatedBroker : IBroker
     protected readonly Dictionary<string, DateTime> _lastSellTimes = new();
     private readonly ConcurrentDictionary<string, DateTime> _buyTimes = new ConcurrentDictionary<string, DateTime>();
     private readonly DateTime _botStartTime = DateTime.UtcNow;
-    private readonly ConcurrentDictionary<string, int> _pendingOrders = new();
+    private readonly ConcurrentDictionary<string, bool> _pendingOrders = new();
+
 
     private DateTime _lastHeartbeatEmail = DateTime.MinValue;
     private const string SaveFilePath = "bot_state.json";
@@ -125,7 +126,7 @@ public class SimulatedBroker : IBroker
 
     private ConcurrentDictionary<string, double> _raceScores = new();
     private ConcurrentDictionary<string, DateTime> _raceStartTimes = new();
-    private const double RACE_ENTRY_SCORE = 7.6;   // enter only real leaders
+    private const double RACE_ENTRY_SCORE = 7.4;   // enter only real leaders
     private const double RACE_STRONG_SCORE = 8.4;  // scale / conviction
     private const double RACE_EXIT_SCORE = 4.8;    // momentum death
     private int _chopWarnings = 0;
@@ -152,21 +153,31 @@ public class SimulatedBroker : IBroker
 
     public SimulatedBroker()
     {
-        OnOrderFailed = orderId =>
-        {
-            lock (_lock)
-            {
-                var symbol = _pendingOrders
-                    .FirstOrDefault(x => x.Value == orderId).Key;
-
-                if (!string.IsNullOrEmpty(symbol))
-                {
-                    _pendingOrders.TryRemove(symbol, out _);
-                    Console.WriteLine($"[ORDER FAIL] Cleared pending flag for {symbol}");
-                }
-            }
-        };
+        OnOrderFailed = HandleOrderFailure;
     }
+
+    private void HandleOrderFailure(int orderId)
+    {
+        List<string> symbolsToClear;
+
+        lock (_lock)
+        {
+            // Clear ALL pending flags — IB does not reliably map failures to symbols
+            symbolsToClear = _pendingOrders.Keys.ToList();
+            _pendingOrders.Clear();
+        }
+
+        foreach (var symbol in symbolsToClear)
+        {
+            Console.WriteLine($"[ORDER FAIL] Pending flag cleared for {symbol} (OrderId={orderId})");
+        }
+
+        if (symbolsToClear.Count == 0)
+        {
+            Console.WriteLine($"[ORDER FAIL] OrderId={orderId} but no pending symbols found");
+        }
+    }
+
 
     protected readonly List<ClosedTrade> _tradeHistory = new();
 
@@ -309,7 +320,8 @@ public void LoadState()
         if (_haltNewTrades || _goalReached) return;
         if (_dailyLossCount >= 4)
             return;
-
+        if (_pendingOrders.ContainsKey(symbol))
+            return;
         var nyNow = GetEasternTime();
         if (nyNow.TimeOfDay > LastEntryTime) return;
 
@@ -335,13 +347,14 @@ public void LoadState()
         history.Enqueue(currentScore);
         if (history.Count > 8) history.Dequeue();
 
-        if (prevScore > RACE_ENTRY_SCORE && currentScore < prevScore * 0.6)
+        if (prevScore > RACE_ENTRY_SCORE && currentScore < Math.Max(RACE_EXIT_SCORE, prevScore * 0.6))
         {
             _raceStartTimes.TryRemove(symbol, out _);
             return;
         }
 
-        lock (_lock)
+
+      
         {
             bool hasPosition = _positions.ContainsKey(symbol);
 
@@ -412,7 +425,7 @@ public void LoadState()
 
                     _peakRsi[symbol] = rsi;
                     _buyTimes[symbol] = DateTime.UtcNow;
-                    _pendingOrders.TryAdd(symbol, 0);
+                    
 
                     if (GetRaceSlope(symbol) < 0.12)
                         return;
@@ -454,9 +467,17 @@ public void LoadState()
     && profitPct >= 0.004m
     && _positions.Count < MaxActivePositions)
                 {
-                    int addQty = (int)(pos.Quantity * 0.5m);
+                    int addQty = Math.Max(1, (int)Math.Floor(pos.Quantity * 0.5m));
                     if (addQty > 0)
                     {
+                        if (_lastTradeWasLoss.TryGetValue(symbol, out bool wasLoss) && wasLoss)
+                        {
+                            if (_lastSellTimes.TryGetValue(symbol, out var lastSell))
+                            {
+                                if ((DateTime.UtcNow - lastSell).TotalMinutes < 30)
+                                    return;
+                            }
+                        }
                         SubmitOrder(symbol, addQty, pos.CurrentPrice, TradeSide.Buy);
                         _addedToWinners.Add(symbol);
                         Console.WriteLine($"[ADD] Winner add-on for {symbol}");
@@ -489,7 +510,10 @@ public void LoadState()
                     (_peakRsi[symbol] - rsi) >= RSI_HOOK_DROP;
 
                 // C. SOFT EXIT CONFIRMATION
-                decimal vwap = _cumVwapProd[symbol] / _cumVolume[symbol];
+                decimal vwap =
+    _cumVolume.TryGetValue(symbol, out var vol) && vol > 0
+        ? _cumVwapProd[symbol] / vol
+        : pos.CurrentPrice;
                 bool momentumDecay = currentScore < RACE_EXIT_SCORE;
 
                 bool vwapLoss = pos.CurrentPrice < vwap;
@@ -535,8 +559,7 @@ public void LoadState()
     {
         if (price <= 0) return;
 
-        lock (_lock)
-        {
+     
             // 1. Data Management
             ManagePriceData(symbol, price, volume);
 
@@ -549,7 +572,7 @@ public void LoadState()
 
             // 4. Time-based Liquidation
             CheckEndOfDayLiquidation();
-        }
+        
     }
 
     public void SubmitOrder(
@@ -561,7 +584,7 @@ public void LoadState()
       string orderType = "LMT")
     {
         // 1️⃣ ATOMIC PENDING CHECK
-        if (!_pendingOrders.TryAdd(symbol, 0))
+        if (!_pendingOrders.TryAdd(symbol, true))
             return;
 
         try
@@ -587,6 +610,7 @@ public void LoadState()
                 qty = (int)Math.Abs(pos.Quantity);
                 if (qty <= 0) return;
             }
+            qty = Math.Max(1, qty);
 
             // 4️⃣ APPLY SLIPPAGE (SIMULATION ONLY)
             decimal fillPrice = side == TradeSide.Buy
@@ -596,6 +620,7 @@ public void LoadState()
             // 5️⃣ SEND ORDER TO REAL BROKER (NO SLIPPAGE HERE)
             if (RealBroker != null)
             {
+
                 decimal priceToSend =
                     side == TradeSide.Sell ? 0 : Math.Round(price, 2);
 
@@ -609,7 +634,10 @@ public void LoadState()
                 {
                     decimal pnl =
                         (fillPrice - pos.AvgPrice) * pos.Quantity - roundTripFee;
-
+                    if (pnl >= 10m) // meaningful win threshold
+                    {
+                        _chopWarnings = 0;
+                    }
                     // ─────────────────────────────────────────
                     // 🧯 CHOP DAY DETECTOR (MICRO-LOSS CLUSTER)
                     // ─────────────────────────────────────────
@@ -765,8 +793,7 @@ public void LoadState()
         }
 
         // 3. Update Lists (List is NOT thread-safe, so we lock just the list update)
-        lock (prices)
-        {
+   
             prices.Add(price);
             volumes.Add(volume);
 
@@ -775,7 +802,7 @@ public void LoadState()
                 prices.RemoveAt(0);
                 volumes.RemoveAt(0);
             }
-        }
+        
 
         // 4. Update Cumulative Metrics (Thread-safe addition)
         if (isMarketHours)
@@ -985,8 +1012,7 @@ public void LoadState()
     {
         if (prices == null || prices.Count < 10) return "WAIT";
 
-        lock (prices)
-        {
+       
             // Look at the last 10 ticks/bars
             var recent = prices.Skip(prices.Count - 10).ToList();
             decimal first = recent.First();
@@ -997,7 +1023,7 @@ public void LoadState()
             if (last < first * 0.999m) return "BEAR";
 
             return "FLAT";
-        }
+        
     }
     public void SyncExistingPosition(string symbol, decimal qty, decimal avgPrice)
     {
@@ -1075,6 +1101,10 @@ public void LoadState()
         // 1. Liquidation at 3:45 PM (Close all active trades)
         if (nyNow.TimeOfDay > new TimeSpan(15, 45, 0) && nyNow.TimeOfDay < new TimeSpan(16, 0, 0))
         {
+            if (nyNow.TimeOfDay < new TimeSpan(9, 0, 0))
+            {
+                _chopWarnings = 0;
+            }
             if (_positions.Count > 0) LiquidateAll("End of Day Liquidation");
         }
 
