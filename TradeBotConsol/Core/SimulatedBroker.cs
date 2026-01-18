@@ -110,7 +110,27 @@ public class SimulatedBroker : IBroker
     private readonly ConcurrentDictionary<string, bool> _pendingOrders = new();
 
 
-    private DateTime _lastHeartbeatEmail = DateTime.MinValue;
+    private enum OrderLifeState
+    {
+        Submitted,
+        Filled,
+        Rejected,
+        Cancelled
+    }
+
+    private class TrackedOrder
+    {
+        public string Symbol;
+        public TradeSide Side;
+        public int Qty;
+        public DateTime Time;
+        public OrderLifeState State;
+    }
+
+    private ConcurrentDictionary<string, TrackedOrder> _liveOrders = new();
+
+
+    private const decimal MAX_DAILY_DOLLAR_LOSS = 120m;
     private const string SaveFilePath = "bot_state.json";
     protected readonly object _lock = new object();
     private const int MinHoldMinutes = 5; // Bot must wait 5 minutes before it can sell
@@ -119,6 +139,8 @@ public class SimulatedBroker : IBroker
     private int _tradesExecutedToday = 0;
     private bool _haltNewTrades = false;
     private bool _goalReached = false;
+    private volatile bool _killSwitchEngaged = false;
+    private volatile bool _emergencyExit = false;
 
     private Dictionary<string, decimal> _learnedAvgVolume = new();
     private const string MemoryFilePath = "market_memory.json";
@@ -158,24 +180,41 @@ public class SimulatedBroker : IBroker
 
     private void HandleOrderFailure(int orderId)
     {
-        List<string> symbolsToClear;
-
-        lock (_lock)
+        foreach (var kv in _liveOrders.ToList())
         {
-            // Clear ALL pending flags — IB does not reliably map failures to symbols
-            symbolsToClear = _pendingOrders.Keys.ToList();
-            _pendingOrders.Clear();
+            kv.Value.State = OrderLifeState.Rejected;
+            _liveOrders.TryRemove(kv.Key, out _);
         }
 
-        foreach (var symbol in symbolsToClear)
+        TriggerKillSwitch("Order rejected by broker");
+    }
+    private void CheckForStuckOrders()
+    {
+        foreach (var kv in _liveOrders)
         {
-            Console.WriteLine($"[ORDER FAIL] Pending flag cleared for {symbol} (OrderId={orderId})");
-        }
+            var o = kv.Value;
 
-        if (symbolsToClear.Count == 0)
-        {
-            Console.WriteLine($"[ORDER FAIL] OrderId={orderId} but no pending symbols found");
+            if (o.State == OrderLifeState.Submitted &&
+                (DateTime.UtcNow - o.Time).TotalSeconds > 20)
+            {
+                TriggerKillSwitch($"Order timeout: {o.Symbol}");
+                return;
+            }
         }
+    }
+
+
+    private void TriggerKillSwitch(string reason)
+    {
+        if (_killSwitchEngaged) return;
+
+        _killSwitchEngaged = true;
+        _haltNewTrades = true;
+        _emergencyExit = true;
+
+        Console.WriteLine($"🚨 KILL SWITCH ENGAGED: {reason}");
+
+        Task.Run(() => LiquidateAll($"KILL SWITCH: {reason}"));
     }
 
 
@@ -316,6 +355,9 @@ public void LoadState()
         // ─────────────────────────────────────────────
         // 1️⃣ GLOBAL SAFETY
         // ─────────────────────────────────────────────
+        if (_killSwitchEngaged)
+            return;
+
         if (symbol == "QQQ") return;
         if (_haltNewTrades || _goalReached) return;
         if (_dailyLossCount >= 4)
@@ -572,7 +614,8 @@ public void LoadState()
 
             // 4. Time-based Liquidation
             CheckEndOfDayLiquidation();
-        
+        CheckForStuckOrders();
+
     }
 
     public void SubmitOrder(
@@ -583,9 +626,20 @@ public void LoadState()
       double currentRsi = 0,
       string orderType = "LMT")
     {
+        if (_killSwitchEngaged && side == TradeSide.Buy)
+            return;
+
         // 1️⃣ ATOMIC PENDING CHECK
         if (!_pendingOrders.TryAdd(symbol, true))
             return;
+        _liveOrders[symbol] = new TrackedOrder
+        {
+            Symbol = symbol,
+            Side = side,
+            Qty = qty,
+            Time = DateTime.UtcNow,
+            State = OrderLifeState.Submitted
+        };
 
         try
         {
@@ -670,7 +724,10 @@ public void LoadState()
                     _tradesToday[symbol] = _tradesToday.GetValueOrDefault(symbol) + 1;
 
                     if (_dailyLossCount >= 4)
-                        _haltNewTrades = true;
+                    {
+                        TriggerKillSwitch("Max Daily Loss Count");
+                    }
+
                 }
 
                 else if (side == TradeSide.Buy)
@@ -726,6 +783,12 @@ public void LoadState()
     {
         lock (_lock)
         {
+            if (_totalRealizedPnL <= -MAX_DAILY_DOLLAR_LOSS)
+            {
+                TriggerKillSwitch("Hard Dollar Loss Limit Hit");
+                return;
+            }
+
             // FIX: If we already reached a goal or halted, stop immediately
             if (_goalReached || _haltNewTrades) return;
 
@@ -765,7 +828,9 @@ public void LoadState()
             {
                 // IMPORTANT: Use Market orders for emergency liquidation to bypass 3% constraints
                 // If your SubmitOrder doesn't support Market types, ensure price is set very aggressively
-                SubmitOrder(sym, (int)pos.Quantity, pos.CurrentPrice, TradeSide.Sell);
+                string orderType = _emergencyExit ? "MKT" : "LMT";
+
+                SubmitOrder(sym, (int)pos.Quantity, pos.CurrentPrice, TradeSide.Sell,orderType:orderType);
 
  
             }
