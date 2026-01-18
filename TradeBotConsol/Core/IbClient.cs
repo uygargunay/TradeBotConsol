@@ -1,9 +1,10 @@
 ﻿using IBApi;
 using System;
-using System.Collections.Generic;
-using System.Threading;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
+using static SimulatedBroker;
 
 public class IbClient : EWrapper, IBroker
 {
@@ -151,9 +152,17 @@ public class IbClient : EWrapper, IBroker
     public void positionEnd() => Console.WriteLine("[SYSTEM] Portfolio synced.");
 
     // ─────────────── ORDER EXECUTION ───────────────
-    public void SubmitOrder(string symbol, int qty, decimal price, TradeSide side, double currentRsi = 0, string orderType = "LMT")
+    public void SubmitOrder(
+        string symbol,
+        int qty,
+        decimal price,
+        TradeSide side,
+        double currentRsi = 0,
+        string orderType = "LMT")
     {
         if (_currentOrderId < 0) return;
+
+        qty = Math.Max(1, qty);
 
         var contract = new Contract
         {
@@ -166,30 +175,70 @@ public class IbClient : EWrapper, IBroker
         var order = new Order
         {
             Action = side == TradeSide.Buy ? "BUY" : "SELL",
-            OrderType = side == TradeSide.Sell ? "MKT" : "LMT",
+            OrderType = orderType,
             TotalQuantity = qty,
             Tif = "DAY",
             OutsideRth = false
         };
 
+        // 🔒 force market sell on halt / liquidation
+        if (side == TradeSide.Sell && (_broker._haltNewTrades || _broker._goalReached))
+            order.OrderType = "MKT";
+
         if (order.OrderType == "LMT")
-            order.LmtPrice = (double)Math.Round(price * 1.002m, 2);
+            order.LmtPrice = (double)Math.Round(price, 2);
 
-        Console.WriteLine($"[ORDER] {order.Action} {symbol} x{qty} ({order.OrderType}) ID={_currentOrderId}");
-        _client.placeOrder(_currentOrderId++, contract, order);
+        int orderId = Interlocked.Increment(ref _currentOrderId);
+
+        Console.WriteLine($"[ORDER] {order.Action} {symbol} x{qty} ({order.OrderType}) ID={orderId}");
+
+        // 🔑 register FIRST
+        _broker.RegisterLiveOrder(orderId, symbol, side, qty);
+
+        // 🚀 send to IB
+        _client.placeOrder(orderId, contract, order);
     }
-
-    // ─────────────── ORDER SAFETY ───────────────
-    public void orderStatus(int orderId, string status, double filled, double remaining,
-                            double avgFillPrice, int permId, int parentId,
-                            double lastFillPrice, int clientId, string whyHeld, double mktCapPrice)
+    public int GetNextOrderId()
     {
-        if (status == "Rejected" || status == "Cancelled")
-        {
-            Console.WriteLine($"[ORDER ERROR] {orderId} {status}");
-            _broker.OnOrderFailed?.Invoke(orderId);
-        }
+        return Interlocked.Increment(ref _currentOrderId);
     }
+    // ─────────────── ORDER SAFETY ───────────────
+    public void orderStatus(
+        int orderId,
+        string status,
+        double filled,
+        double remaining,
+        double avgFillPrice,
+        int permId,
+        int parentId,
+        double lastFillPrice,
+        int clientId,
+        string whyHeld,
+        double mktCapPrice)
+    {
+        if (_broker.TryGetTrackedOrder(orderId, out var order))
+        {
+            if (status == "Filled")
+                order.State = OrderLifeState.Filled;
+            else if (filled > 0)
+                order.State = OrderLifeState.PartiallyFilled;
+            else if (status == "Cancelled")
+                order.State = OrderLifeState.Cancelled;
+            else if (status == "Rejected")
+                order.State = OrderLifeState.Rejected;
+        }
+
+        if (filled > 0 && remaining == 0)
+        {
+            _broker.OnOrderFilled(orderId, (int)filled, (decimal)avgFillPrice);
+        }
+        else if (status == "Rejected" || status == "Cancelled")
+        {
+            _broker.NotifyOrderFailed(orderId, status);
+        }
+
+    }
+
 
     #region Errors
     public void error(int id, int errorCode, string errorMsg)
