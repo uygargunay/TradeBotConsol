@@ -1,4 +1,5 @@
-﻿using System;
+﻿using IBApi;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -62,7 +63,8 @@ public class TrackedOrder
     public int OrderId;
     public string Symbol;
     public TradeSide Side;
-    public int Qty;   // ✅ already exists
+    public int Qty;            // total requested
+    public int FilledQty;      // cumulative filled
     public DateTime Time;
     public OrderLifeState State;
 }
@@ -81,6 +83,10 @@ public class SimulatedBroker : IBroker
     private const decimal initialAccountValue = 4000m;
     private const decimal roundTripFee = 2.00m;        // Matches $1 buy + $1 sell
     private HashSet<string> _addedToWinners = new();
+    public bool IsHalted => _haltNewTrades;
+    public bool GoalReached => _goalReached;
+    public int FilledQty;
+
     // Inside SimulatedBroker Class - Added Variable
     protected int _dailyLossCount = 0;
     private ConcurrentDictionary<string, Queue<double>> _raceScoreHistory = new();
@@ -116,7 +122,6 @@ public class SimulatedBroker : IBroker
     private readonly ConcurrentDictionary<string, DateTime> _buyTimes = new ConcurrentDictionary<string, DateTime>();
     private readonly DateTime _botStartTime = DateTime.UtcNow;
     private readonly ConcurrentDictionary<string, bool> _pendingOrders = new();
-    private ConcurrentDictionary<string, TrackedOrder> _liveOrders = new();
     private ConcurrentDictionary<string, double> _peakRsi = new ConcurrentDictionary<string, double>();
     private Dictionary<string, bool> _lastTradeWasLoss = new(); // NEW: Track loss state
     private static readonly TimeSpan LastEntryTime = new TimeSpan(14, 0, 0); // 2:00 PM NY
@@ -127,8 +132,8 @@ public class SimulatedBroker : IBroker
     private decimal _startingDayEquity = initialAccountValue;
     private decimal _totalRealizedPnL = 0m;
     private int _tradesExecutedToday = 0;
-    public bool _haltNewTrades = false;
-    public bool _goalReached = false;
+    private bool _haltNewTrades = false;
+    private bool _goalReached = false;
     private volatile bool _killSwitchEngaged = false;
     private volatile bool _emergencyExit = false;
     private Dictionary<string, decimal> _learnedAvgVolume = new();
@@ -178,16 +183,16 @@ public class SimulatedBroker : IBroker
 
     private void CheckForStuckOrders()
     {
+
         foreach (var kv in _ordersById)
         {
             var o = kv.Value;
-
-            if (o.State == OrderLifeState.Submitted &&
-                (DateTime.UtcNow - o.Time).TotalSeconds > 20)
-            {
-                TriggerKillSwitch($"Order timeout: {o.Symbol}");
-                return;
-            }
+  if (o.State == OrderLifeState.Submitted &&
+    (DateTime.UtcNow - o.Time).TotalSeconds > 20)
+{
+    Console.WriteLine($"[WARN] Order stuck: {o.Symbol} ({o.OrderId})");
+    // optional: cancel & retry instead of kill
+}
         }
     }
 
@@ -201,7 +206,7 @@ public class SimulatedBroker : IBroker
 
         Console.WriteLine($"🚨 KILL SWITCH ENGAGED: {reason}");
 
-        Task.Run(() => LiquidateAll($"KILL SWITCH: {reason}"));
+        Task.Run(() => LiquidateAll());
     }
 
     private double GetRaceSlope(string symbol)
@@ -584,6 +589,8 @@ public class SimulatedBroker : IBroker
             Time = DateTime.UtcNow,
             State = OrderLifeState.Submitted
         };
+        _symbolToOrderId[symbol] = orderId;
+
     }
 
     public void UpdateHistory(string symbol, decimal price, long volume)
@@ -623,28 +630,28 @@ public class SimulatedBroker : IBroker
 
         qty = Math.Max(1, qty);
 
-        int orderId = RealBroker is IbClient ib
-            ? ib.GetNextOrderId()
-            : Environment.TickCount;
-
-        _ordersById[orderId] = new TrackedOrder
-        {
-            OrderId = orderId,
-            Symbol = symbol,
-            Side = side,
-            Qty = qty,
-            Time = DateTime.UtcNow
-        };
-
-        _symbolToOrderId[symbol] = orderId;
-
-        RealBroker?.SubmitOrder(symbol, qty, price, side, currentRsi);
+        // ❗ DO NOT generate orderId here
+        RealBroker?.SubmitOrder(symbol, qty, price, side, currentRsi, orderType);
     }
+
     public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
     {
-        if (!_ordersById.TryRemove(orderId, out var order))
+        if (!_ordersById.TryGetValue(orderId, out var order))
             return;
 
+        // accumulate partial fills
+        order.FilledQty += filledQty;
+        order.State = OrderLifeState.PartiallyFilled;
+
+        // still not fully filled → keep waiting
+        if (order.FilledQty < order.Qty)
+        {
+            _ordersById[orderId] = order;
+            return;
+        }
+
+        // ✅ FULL FILL CONFIRMED
+        _ordersById.TryRemove(orderId, out _);
         _symbolToOrderId.TryRemove(order.Symbol, out _);
         _pendingOrders.TryRemove(order.Symbol, out _);
 
@@ -655,7 +662,7 @@ public class SimulatedBroker : IBroker
                 _positions[order.Symbol] = new SimPosition
                 {
                     Symbol = order.Symbol,
-                    Quantity = filledQty,
+                    Quantity = order.FilledQty,
                     AvgPrice = avgFillPrice,
                     CurrentPrice = avgFillPrice,
                     EntryTime = DateTime.UtcNow,
@@ -664,7 +671,7 @@ public class SimulatedBroker : IBroker
 
                 _tradesExecutedToday++;
             }
-            else
+            else // SELL
             {
                 if (_positions.TryGetValue(order.Symbol, out var pos))
                 {
@@ -672,6 +679,8 @@ public class SimulatedBroker : IBroker
                         (avgFillPrice - pos.AvgPrice) * pos.Quantity - roundTripFee;
 
                     _totalRealizedPnL += pnl;
+                    if (pnl > 0)
+                        _chopWarnings = 0;
                     _positions.Remove(order.Symbol);
 
                     _lastSellTimes[order.Symbol] = DateTime.UtcNow;
@@ -696,9 +705,15 @@ public class SimulatedBroker : IBroker
 
     public void NotifyOrderFailed(int orderId, string reason)
     {
-        HandleOrderFailure(orderId);
+        if (_ordersById.TryRemove(orderId, out var order))
+        {
+            _symbolToOrderId.TryRemove(order.Symbol, out _);
+            _pendingOrders.TryRemove(order.Symbol, out _);
+        }
+
         TriggerKillSwitch($"Order failure: {reason}");
     }
+
 
     public void ProcessHistoricalBar(string symbol, decimal close, long volume) // Ensure volume is long
     {
@@ -742,43 +757,42 @@ public class SimulatedBroker : IBroker
             {
                 _goalReached = true;
                 _haltNewTrades = true;
-                LiquidateAll("Daily 1% Goal Met");
+                LiquidateAll();
             }
             else if (profitPercent <= (dailyLossLimitPct * -1))
             {
                 // FIX: Set halt to true BEFORE liquidating to prevent the loop
                 _haltNewTrades = true;
-                LiquidateAll("Daily Loss Limit Hit");
+                LiquidateAll();
             }
         }
     }
 
-    public void LiquidateAll(string reason)
+    private void LiquidateAll()
     {
-        lock (_lock)
+        if (_emergencyExit)
+            return;
+
+        _emergencyExit = true;
+        foreach (var kv in _positions.ToList())
         {
-            _haltNewTrades = true; // STOP THE BOT FROM BUYING AGAIN IMMEDIATELY
+            var symbol = kv.Key;
+            var pos = kv.Value;
+
+            // 🔥 OVERRIDE all safety guards
+            _pendingOrders.TryRemove(symbol, out _);
+
+            Console.WriteLine($"[EMERGENCY EXIT] Liquidating {symbol}");
+
+            RealBroker?.SubmitOrder(
+                symbol,
+                (int)Math.Abs(pos.Quantity),
+                pos.CurrentPrice,
+                TradeSide.Sell,
+                currentRsi: 0,
+                orderType: "MKT"
+            );
         }
-
-        Console.WriteLine($"\n[SYSTEM] !!! {reason.ToUpper()} !!! Liquidating all positions.");
-
-        // Create a copy of the keys to avoid collection modified errors
-        var symbols = _positions.Keys.ToList();
-
-        foreach (var sym in symbols)
-        {
-            if (_positions.TryGetValue(sym, out var pos))
-            {
-                // IMPORTANT: Use Market orders for emergency liquidation to bypass 3% constraints
-                // If your SubmitOrder doesn't support Market types, ensure price is set very aggressively
-                string orderType = _emergencyExit ? "MKT" : "LMT";
-
-                SubmitOrder(sym, (int)pos.Quantity, pos.CurrentPrice, TradeSide.Sell, orderType: orderType);
-
-
-            }
-        }
-        SaveState();
     }
 
     private void ManagePriceData(string symbol, decimal price, long volume)
@@ -1111,7 +1125,7 @@ public class SimulatedBroker : IBroker
             {
                 _chopWarnings = 0;
             }
-            if (_positions.Count > 0) LiquidateAll("End of Day Liquidation");
+            if (_positions.Count > 0) LiquidateAll();
         }
 
         // 2. Learning Mode Save at 4:00 PM (Market Close)

@@ -182,7 +182,7 @@ public class IbClient : EWrapper, IBroker
         };
 
         // 🔒 force market sell on halt / liquidation
-        if (side == TradeSide.Sell && (_broker._haltNewTrades || _broker._goalReached))
+        if (side == TradeSide.Sell && (_broker.IsHalted || _broker.GoalReached))
             order.OrderType = "MKT";
 
         if (order.OrderType == "LMT")
@@ -198,10 +198,7 @@ public class IbClient : EWrapper, IBroker
         // 🚀 send to IB
         _client.placeOrder(orderId, contract, order);
     }
-    public int GetNextOrderId()
-    {
-        return Interlocked.Increment(ref _currentOrderId);
-    }
+
     // ─────────────── ORDER SAFETY ───────────────
     public void orderStatus(
         int orderId,
