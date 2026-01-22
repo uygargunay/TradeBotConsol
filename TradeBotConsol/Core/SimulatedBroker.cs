@@ -89,7 +89,8 @@ public class SimulatedBroker : IBroker
 
     // Inside SimulatedBroker Class - Added Variable
     protected int _dailyLossCount = 0;
-    private ConcurrentDictionary<string, Queue<double>> _raceScoreHistory = new();
+    private ConcurrentDictionary<string, Queue<(double score, DateTime time)>> _raceScoreHistory = new();
+
     public readonly string[] _tradeableStars =
     {
     // Institutional momentum
@@ -140,7 +141,7 @@ public class SimulatedBroker : IBroker
     private const string MemoryFilePath = "market_memory.json";
     private ConcurrentDictionary<string, double> _raceScores = new();
     private ConcurrentDictionary<string, DateTime> _raceStartTimes = new();
-    private const double RACE_ENTRY_SCORE = 7.4;   // enter only real leaders
+    private const double RACE_ENTRY_SCORE = 7.0;   // enter only real leaders
     private const double RACE_STRONG_SCORE = 8.4;  // scale / conviction
     private const double RACE_EXIT_SCORE = 4.8;    // momentum death
     private int _chopWarnings = 0;
@@ -187,12 +188,19 @@ public class SimulatedBroker : IBroker
         foreach (var kv in _ordersById)
         {
             var o = kv.Value;
-  if (o.State == OrderLifeState.Submitted &&
-    (DateTime.UtcNow - o.Time).TotalSeconds > 20)
-{
-    Console.WriteLine($"[WARN] Order stuck: {o.Symbol} ({o.OrderId})");
-    // optional: cancel & retry instead of kill
-}
+            if (o.State == OrderLifeState.Submitted &&
+              (DateTime.UtcNow - o.Time).TotalSeconds > 20)
+            {
+                TriggerKillSwitch($"Order timeout: {o.Symbol}");
+
+                // optional: cancel & retry instead of kill
+            }
+            if (o.State == OrderLifeState.PartiallyFilled &&
+    (DateTime.UtcNow - o.Time).TotalSeconds > 60)
+            {
+                _pendingOrders.TryRemove(o.Symbol, out _);
+                _ordersById.TryRemove(o.OrderId, out _);
+            }
         }
     }
 
@@ -215,8 +223,16 @@ public class SimulatedBroker : IBroker
             return 0;
 
         var arr = q.ToArray();
-        return (arr[^1] - arr[0]) / arr.Length;
+
+        var first = arr[0];
+        var last = arr[^1];
+
+        double dt = (last.time - first.time).TotalSeconds;
+        if (dt <= 0) return 0;
+
+        return (last.score - first.score) / dt; // score change per second
     }
+
 
     private double CalculateRaceScore(string symbol)
     {
@@ -367,9 +383,10 @@ public class SimulatedBroker : IBroker
         double prevScore = _raceScores.TryGetValue(symbol, out var ps) ? ps : 0;
 
         _raceScores[symbol] = currentScore;
-        var history = _raceScoreHistory.GetOrAdd(symbol, _ => new Queue<double>());
-        history.Enqueue(currentScore);
+        var history = _raceScoreHistory.GetOrAdd(symbol, _ => new Queue<(double, DateTime)>());
+        history.Enqueue((currentScore, DateTime.UtcNow));
         if (history.Count > 8) history.Dequeue();
+
 
         if (prevScore > RACE_ENTRY_SCORE && currentScore < Math.Max(RACE_EXIT_SCORE, prevScore * 0.6))
         {
@@ -430,7 +447,7 @@ public class SimulatedBroker : IBroker
                     : currentPrice;
 
                 // D. FINAL ENTRY CONFIRMATION
-                if (GetTrend(prices) == "BULL" && rsiCross && currentPrice > vwap)
+                if (GetTrend(prices) != "BEAR" && rsiCross && currentPrice > vwap)
                 {
                     if (_pendingOrders.ContainsKey(symbol)) return;
 
@@ -451,7 +468,7 @@ public class SimulatedBroker : IBroker
                     _buyTimes[symbol] = DateTime.UtcNow;
 
 
-                    if (GetRaceSlope(symbol) < 0.12)
+                    if (GetRaceSlope(symbol) < 0.02)
                         return;
                     SubmitOrder(symbol, qty, currentPrice, TradeSide.Buy, rsi);
                     _raceStartTimes.TryRemove(symbol, out _);
@@ -668,19 +685,27 @@ public class SimulatedBroker : IBroker
                     EntryTime = DateTime.UtcNow,
                     TrailingStop = avgFillPrice * 0.985m
                 };
-
+                _tradesToday[order.Symbol] =_tradesToday.TryGetValue(order.Symbol, out var c) ? c + 1 : 1;
                 _tradesExecutedToday++;
             }
             else // SELL
             {
+
                 if (_positions.TryGetValue(order.Symbol, out var pos))
                 {
                     decimal pnl =
                         (avgFillPrice - pos.AvgPrice) * pos.Quantity - roundTripFee;
 
                     _totalRealizedPnL += pnl;
-                    if (pnl > 0)
+                    if (pnl < 0 && Math.Abs(pnl) < 8m)
+                    {
+                        _chopWarnings++;
+                        Console.WriteLine($"[CHOP] Small loss detected. Chop warnings = {_chopWarnings}");
+                    }
+                    else if (pnl > 0)
                         _chopWarnings = 0;
+                    if (pnl < 0)
+                        _dailyLossCount++;
                     _positions.Remove(order.Symbol);
 
                     _lastSellTimes[order.Symbol] = DateTime.UtcNow;
@@ -770,7 +795,7 @@ public class SimulatedBroker : IBroker
 
     private void LiquidateAll()
     {
-        if (_emergencyExit)
+        if (_emergencyExit && !_killSwitchEngaged)
             return;
 
         _emergencyExit = true;
@@ -784,14 +809,8 @@ public class SimulatedBroker : IBroker
 
             Console.WriteLine($"[EMERGENCY EXIT] Liquidating {symbol}");
 
-            RealBroker?.SubmitOrder(
-                symbol,
-                (int)Math.Abs(pos.Quantity),
-                pos.CurrentPrice,
-                TradeSide.Sell,
-                currentRsi: 0,
-                orderType: "MKT"
-            );
+            SubmitOrder(symbol, (int)Math.Abs(pos.Quantity), pos.CurrentPrice, TradeSide.Sell, 0, "MKT");
+
         }
     }
 
@@ -1252,6 +1271,8 @@ public class SimulatedBroker : IBroker
 
         if (pct > 0.007m) return 0.5m;   // half size
         if (pct > 0.009m) return 0.25m;  // quarter size
+        if (_chopWarnings >= 2) return 0.5m;
+        if (_chopWarnings >= 3) return 0.25m;
         return 1.0m;
     }
 
