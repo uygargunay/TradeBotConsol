@@ -86,6 +86,7 @@ public class SimulatedBroker : IBroker
     public bool IsHalted => _haltNewTrades;
     public bool GoalReached => _goalReached;
     public int FilledQty;
+    private bool _softTradeUsed = false;
 
     // Inside SimulatedBroker Class - Added Variable
     protected int _dailyLossCount = 0;
@@ -362,6 +363,9 @@ public class SimulatedBroker : IBroker
         if (_haltNewTrades || _goalReached) return;
         if (_dailyLossCount >= 4)
             return;
+        if (_softTradeUsed && _positions.Count == 0)
+            return;
+
         if (_pendingOrders.ContainsKey(symbol))
             return;
         var nyNow = GetEasternTime();
@@ -414,8 +418,24 @@ public class SimulatedBroker : IBroker
                 if (!IsMarketSafe()) return;
 
                 // B. RACE PERSISTENCE CHECK
-                if (currentScore >= RACE_ENTRY_SCORE)
+                bool hardPass = currentScore >= RACE_ENTRY_SCORE;
 
+                bool softMode =
+                    !_softTradeUsed &&
+                    IsMarketSafe() &&
+                    GetTrend(_priceHistory[symbol]) == "BULL" &&
+                    currentScore >= (RACE_ENTRY_SCORE * 0.65) &&
+                    GetRaceSlope(symbol) > 0.01 &&
+                    CalculateRSI(symbol, 14) > 55;
+
+                if (!hardPass && !softMode)
+                {
+                    _raceStartTimes.TryRemove(symbol, out _);
+                    return;
+                }
+
+                // persistence only for hard entries
+                if (hardPass)
                 {
                     if (!_raceStartTimes.TryGetValue(symbol, out var start))
                     {
@@ -426,11 +446,7 @@ public class SimulatedBroker : IBroker
                     if ((DateTime.UtcNow - start).TotalSeconds < GetPersistenceSeconds(currentScore))
                         return;
                 }
-                else
-                {
-                    _raceStartTimes.TryRemove(symbol, out _);
-                    return;
-                }
+
 
                 // C. DATA SUFFICIENCY
                 if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count < 20)
@@ -480,6 +496,8 @@ public class SimulatedBroker : IBroker
                         return;
 
                     SubmitOrder(symbol, qty, currentPrice, TradeSide.Buy, rsi);
+                    if (softMode)
+                        _softTradeUsed = true;
                     _raceStartTimes.TryRemove(symbol, out _);
                     SaveState();
                 }
@@ -1220,6 +1238,7 @@ public class SimulatedBroker : IBroker
             _haltNewTrades = false;
             _dailyLossCount = 0;
             _chopWarnings = 0;   // <-- MOVE reset here
+            _softTradeUsed = false;
         }
     }
 
