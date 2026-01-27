@@ -20,9 +20,15 @@ public class IbClient : EWrapper, IBroker
     private readonly PositionManager _broker; // Shared brain
     private readonly ConcurrentDictionary<int, string> _reqIdToSymbol = new();
     private readonly ConcurrentDictionary<string, decimal> _currentPriceBatch = new();
+    private readonly ConcurrentQueue<string> _ibLogBuffer = new();
 
     public event Action<string, decimal> OnPrice;
     public PositionManager Broker => _broker;
+    private readonly ConcurrentQueue<string> _ibLogs = new();
+    public bool TryDequeueIbLog(out string log)
+    {
+        return _ibLogs.TryDequeue(out log);
+    }
 
     public IbClient(PositionManager brokerInstance)
     {
@@ -238,14 +244,26 @@ public class IbClient : EWrapper, IBroker
 
 
     #region Errors
+    #region Errors
+    #region Errors
     public void error(int id, int errorCode, string errorMsg)
     {
         if (errorCode != 2104 && errorCode != 2106 && errorCode != 2158)
-            Console.WriteLine($"IB {errorCode}: {errorMsg}");
+            _ibLogs.Enqueue($"IB {errorCode}: {errorMsg}");
     }
-    public void error(Exception e) => Console.WriteLine(e.Message);
-    public void error(string str) => Console.WriteLine(str);
-    public void connectionClosed() => Console.WriteLine("[IB] Connection closed.");
+
+    public void error(Exception e) =>
+        _ibLogBuffer.Enqueue($"IB EX: {e.Message}");
+
+    public void error(string str) =>
+        _ibLogBuffer.Enqueue($"IB: {str}");
+
+    public void connectionClosed() =>
+        _ibLogBuffer.Enqueue("[IB] Connection closed.");
+    #endregion
+
+    #endregion
+
     #endregion
 
     #region Unused
