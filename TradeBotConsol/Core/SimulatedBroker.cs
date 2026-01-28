@@ -78,10 +78,10 @@ public class SimulatedBroker : IBroker
     public IBroker RealBroker { get; set; }
     // 🔴 ORDER FAILURE CALLBACK (from IB client)
     public Action<int> OnOrderFailed;
-    private const double RSI_HOOK_DROP = 3.0;  // Require 3.0 point drop from peak
+    private const double RSI_HOOK_DROP = 5.0;  // Require 3.0 point drop from peak
     private const decimal dailyProfitGoalPct = 0.01m; // +1% Target
     private const decimal dailyLossLimitPct = 0.03m;   // -3.0% Stop
-    private const int MaxActivePositions = 4;          // Focus on 4 slots
+    private const int MaxActivePositions = 2;          // Focus on 4 slots
     private const decimal initialAccountValue = 4000m;
     private const decimal roundTripFee = 2.00m;        // Matches $1 buy + $1 sell
     private HashSet<string> _addedToWinners = new();
@@ -108,7 +108,14 @@ public class SimulatedBroker : IBroker
 
     // Intraday runners
     "NFLX", "PLTR", "SNOW", "SHOP", "UBER",
-
+    //semiconductors
+    "MU","SOXL",
+    //crypto
+    "MARA","RIOT",
+    //china
+    "BABA","PDD",
+    //financial
+    "JPM","GS",
     // Market regime
     "QQQ"
 };
@@ -127,11 +134,13 @@ public class SimulatedBroker : IBroker
     private readonly ConcurrentDictionary<string, DateTime> _buyTimes = new ConcurrentDictionary<string, DateTime>();
     private readonly DateTime _botStartTime = DateTime.UtcNow;
     private readonly ConcurrentDictionary<string, bool> _pendingOrders = new();
-    private ConcurrentDictionary<string, double> _peakRsi = new ConcurrentDictionary<string, double>();
-    private Dictionary<string, bool> _lastTradeWasLoss = new(); // NEW: Track loss state
-    private static readonly TimeSpan LastEntryTime = new TimeSpan(14, 0, 0); // 2:00 PM NY
-    private const decimal BreakEvenTriggerPnL = 8.0m; // $8 per $1000 slot
-    private const decimal MAX_DAILY_DOLLAR_LOSS = 120m;
+    private ConcurrentDictionary<string, DateTime> _ignoreSyncUntil = new();
+    private ConcurrentDictionary<string, DateTime> _lastPriceAdd = new();
+
+    private decimal _rollingPnL = 0m;
+    private int _rollingTrades = 0;
+
+
     private const string SaveFilePath = "bot_state.json";
     protected readonly object _lock = new object();
     private decimal _startingDayEquity = initialAccountValue;
@@ -145,9 +154,9 @@ public class SimulatedBroker : IBroker
     private const string MemoryFilePath = "market_memory.json";
     private ConcurrentDictionary<string, double> _raceScores = new();
     private ConcurrentDictionary<string, DateTime> _raceStartTimes = new();
-    private const double RACE_ENTRY_SCORE = 7.0;   // enter only real leaders
-    private const double RACE_STRONG_SCORE = 8.4;  // scale / conviction
-    private const double RACE_EXIT_SCORE = 4.8;    // momentum death
+    private const double RACE_ENTRY_SCORE = 6.5;   // enter only real leaders
+    private const double RACE_STRONG_SCORE = 7.8;  // scale / conviction
+    private const double RACE_EXIT_SCORE = 4.5;    // momentum death
     private int _chopWarnings = 0;
     protected readonly List<ClosedTrade> _tradeHistory = new();
     private bool _hasSavedToday = false;
@@ -155,6 +164,11 @@ public class SimulatedBroker : IBroker
     private ConcurrentDictionary<string, double> _lastRaceScores = new();
     private static readonly object _memoryFileLock = new object();
     private volatile bool _isSavingMemory = false;
+    private static readonly TimeSpan ObservationEnd = new TimeSpan(10, 30, 0);
+    // Ensure all these have '= new ...'
+    private HashSet<string> _syncedSymbols = new HashSet<string>();
+    private ConcurrentDictionary<string, double> _peakRsi = new ConcurrentDictionary<string, double>();
+    private Dictionary<string, bool> _lastTradeWasLoss = new Dictionary<string, bool>();
     private int GetPersistenceSeconds(double score)
     {
         if (score >= 8.5) return 15;
@@ -184,6 +198,8 @@ public class SimulatedBroker : IBroker
         {
             _symbolToOrderId.TryRemove(order.Symbol, out _);
             _pendingOrders.TryRemove(order.Symbol, out _);
+            _softTradeUsed = false;
+
         }
     }
 
@@ -211,6 +227,12 @@ public class SimulatedBroker : IBroker
                 _pendingOrders.TryRemove(o.Symbol, out _);
                 _ordersById.TryRemove(o.OrderId, out _);
             }
+            if (_pendingOrders.ContainsKey(o.Symbol) &&
+    (DateTime.UtcNow - o.Time).TotalSeconds > 90)
+            {
+                _pendingOrders.TryRemove(o.Symbol, out _);
+            }
+
         }
     }
 
@@ -226,23 +248,30 @@ public class SimulatedBroker : IBroker
 
         Task.Run(() => LiquidateAll());
     }
+    private double RegimeBias()
+    {
+        if (!_priceHistory.TryGetValue("QQQ", out var qqq) || qqq.Count < 20) return 1;
+
+        string trend = GetTrend(qqq);
+        return trend == "BULL" ? 1.15 : trend == "BEAR" ? 0.75 : 1.0;
+    }
 
     private double GetRaceSlope(string symbol)
     {
-        if (!_raceScoreHistory.TryGetValue(symbol, out var q) || q.Count < 5)
+        if (!_raceScoreHistory.TryGetValue(symbol, out var q) || q.Count < 6)
             return 0;
 
-        var arr = q.ToArray();
+        lock (q)
+        {
+            var arr = q.ToArray();
+            double sum = 0;
+            for (int i = 1; i < arr.Length; i++)
+                sum += (arr[i].score - arr[i - 1].score);
 
-        var first = arr[0];
-        var last = arr[^1];
-
-        double dt = Math.Max((last.time - first.time).TotalSeconds, 0.5);
-
-        if (dt <= 0) return 0;
-
-        return (last.score - first.score) / dt; // score change per second
+            return sum / (arr.Length - 1);
+        }
     }
+
 
 
     private double CalculateRaceScore(string symbol)
@@ -267,7 +296,7 @@ public class SimulatedBroker : IBroker
         double rawScore =
             (double)(priceROC * 10m) +
             (double)(volExpansion * 2m);
-        range = Math.Max(range, prices.Last() * 0.001m);
+        range = Math.Max(range, prices.Last() * 0.002m);
 
         return Math.Max(0, rawScore / (double)range);
     }
@@ -282,7 +311,7 @@ public class SimulatedBroker : IBroker
 
     public decimal GetTotalEquity()
     {
-        decimal equity = initialAccountValue + _totalRealizedPnL;
+        decimal equity = _startingDayEquity + _totalRealizedPnL;
 
         foreach (var pos in _positions.Values)
             equity += pos.UnrealizedPnL;
@@ -378,201 +407,134 @@ public class SimulatedBroker : IBroker
         catch { }
     }
     // Ensure these are at the top of your SimulatedBroker class
-
     public void ExecuteTradeLogic(string symbol)
     {
         if (!_priceHistory.ContainsKey(symbol)) return;
-
-        if (_killSwitchEngaged || symbol == "QQQ" || _haltNewTrades || _goalReached)
-            return;
-
-        if (_dailyLossCount >= 4 || (_softTradeUsed && _positions.Count == 0))
-            return;
-
-        if (_pendingOrders.ContainsKey(symbol))
-            return;
-
-        // Leaderboard filter
-        var topLeaders = _raceScores.OrderByDescending(x => x.Value).Take(3).Select(x => x.Key).ToHashSet();
-        if (!topLeaders.Contains(symbol))
-            return;
-
         var nyNow = GetEasternTime();
-        if (nyNow.TimeOfDay > LastEntryTime)
-            return;
 
-        // Startup shield
+        if (nyNow.TimeOfDay < ObservationEnd) return;
+
+        // 1. GLOBAL SAFETY FILTERS
+        if (_tradesExecutedToday >= 3) return;
+        if (_killSwitchEngaged || symbol == "QQQ" || _haltNewTrades || _goalReached) return;
+        if (_dailyLossCount >= 4 || (_softTradeUsed && _positions.Count == 0)) return;
+        if (_pendingOrders.ContainsKey(symbol)) return;
+
+        var topLeaders = _raceScores.OrderByDescending(x => x.Value).Take(3).Select(x => x.Key).ToHashSet();
+        if (!topLeaders.Contains(symbol)) return;
+
+        // YOUR STARTUP SHIELD
         if ((DateTime.UtcNow - _botStartTime).TotalMinutes < 1.0)
         {
             _lastRsiMemory[symbol] = CalculateRSI(symbol, 14);
             return;
         }
 
-        // Race score
         double currentScore = _raceScores.TryGetValue(symbol, out var sc) ? sc : 0;
-        double prevScore = _lastRaceScores.TryGetValue(symbol, out var ps) ? ps : currentScore;
-
-        if (prevScore > RACE_ENTRY_SCORE && currentScore < Math.Max(RACE_EXIT_SCORE, prevScore * 0.6))
-        {
-            _raceStartTimes.TryRemove(symbol, out _);
-            return;
-        }
-
         bool hasPosition = _positions.ContainsKey(symbol);
 
-        // ENTRY LOGIC
+        // ==========================================
+        // ENTRY LOGIC (RESTORED YOUR FULL LOGIC)
+        // ==========================================
         if (!hasPosition && _positions.Count < MaxActivePositions)
         {
-            if (_tradesToday.TryGetValue(symbol, out int tradeCount) && tradeCount >= 2)
-                return;
+            if (_tradesToday.TryGetValue(symbol, out int tradeCount) && tradeCount >= 2) return;
+            if (!IsMarketSafe()) return;
 
-            if (!IsMarketSafe())
-                return;
-
-            bool hardPass = currentScore >= RACE_ENTRY_SCORE;
-
+            bool hardPass = currentScore >= 7.0;
             string symTrend = GetTrend(_priceHistory[symbol]);
             string marketTrend = GetTrend(_priceHistory["QQQ"]);
 
-            bool softMode =
-                !_softTradeUsed &&
-                IsMarketSafe() &&
-                (symTrend == "BULL" || (symTrend == "FLAT" && marketTrend == "FLAT")) &&
-                currentScore >= (RACE_ENTRY_SCORE * 0.65) &&
-                GetRaceSlope(symbol) > 0.008 &&
-                CalculateRSI(symbol, 14) > 50;
+            bool softMode = !_softTradeUsed && IsMarketSafe() &&
+                            (symTrend == "BULL" || (symTrend == "FLAT" && marketTrend == "FLAT")) &&
+                            currentScore >= 6.0 && GetRaceSlope(symbol) > 0.008;
 
+            if (!hardPass && !softMode) return;
 
-            if (!hardPass && !softMode)
-            {
-                _raceStartTimes.TryRemove(symbol, out _);
-                return;
-            }
-
-            if (hardPass)
-            {
-                if (!_raceStartTimes.TryGetValue(symbol, out var start))
-                {
-                    _raceStartTimes[symbol] = DateTime.UtcNow;
-                    return;
-                }
-
-                if ((DateTime.UtcNow - start).TotalSeconds < GetPersistenceSeconds(currentScore))
-                    return;
-            }
-
-            if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count < 20)
-                return;
-
-            decimal currentPrice = prices.Last();
-            decimal atr = GetATR(symbol);
-            if (atr / currentPrice < 0.0025m) return;
-
+            decimal currentPrice = _priceHistory[symbol].Last();
             double rsi = CalculateRSI(symbol, 14);
-            if (!_lastRsiMemory.ContainsKey(symbol))
-            {
-                _lastRsiMemory[symbol] = rsi;
-                return;
-            }
-
-            double prevRsi = _lastRsiMemory[symbol];
+            double prevRsi = _lastRsiMemory.ContainsKey(symbol) ? _lastRsiMemory[symbol] : rsi;
             _lastRsiMemory[symbol] = rsi;
-            bool rsiCross = prevRsi <= 45 && rsi > 45;
 
-            decimal vwap = (_cumVolume.TryGetValue(symbol, out var vol) &&
-                            vol > 0 &&
-                            _cumVwapProd.TryGetValue(symbol, out var prod))
-                            ? prod / vol
-                            : currentPrice;
+            bool rsiCross = rsi > 50 && (rsi - prevRsi) > 2.5;
 
-            if (GetTrend(prices) != "BEAR" && rsiCross && currentPrice > vwap)
+            decimal vwap = (_cumVolume.TryGetValue(symbol, out var vol) && vol > 0) ? _cumVwapProd[symbol] / vol : currentPrice;
+
+            if (GetTrend(_priceHistory[symbol]) != "BEAR" && rsiCross && currentPrice > vwap)
             {
-                decimal throttle = GetEntryThrottle();
-                if (currentScore < RACE_STRONG_SCORE)
-                    throttle *= 0.75m;
-
-                decimal slotBudget = (_startingDayEquity / MaxActivePositions) * throttle;
-                int qty = (int)Math.Floor((slotBudget - 1.0m) / currentPrice);
-                if (qty <= 0) return;
-
-                _peakRsi[symbol] = rsi;
-                _buyTimes[symbol] = DateTime.UtcNow;
-
                 double slope = GetRaceSlope(symbol);
                 double slopeGate = nyNow.TimeOfDay < new TimeSpan(11, 30, 0) ? 0.02 : 0.035;
-                if (slope < slopeGate) return;
+                if (!softMode && slope < slopeGate) return;
+                decimal throttle = GetEntryThrottle();
+                decimal slotBudget = (_startingDayEquity / MaxActivePositions) * throttle;
+                decimal atr = GetATR(symbol);
+                decimal riskPerShare = Math.Max(atr, currentPrice * 0.006m);
+                int qty = (int)Math.Floor(slotBudget / riskPerShare);
+
+
+                if (qty <= 0) return;
+
+                _buyTimes[symbol] = DateTime.UtcNow;
+                if (GetATR(symbol) > currentPrice * 0.01m) return;
 
                 SubmitOrder(symbol, qty, currentPrice, TradeSide.Buy, rsi);
                 if (softMode) _softTradeUsed = true;
-
-                _raceStartTimes.TryRemove(symbol, out _);
                 SaveState();
             }
         }
-        // EXIT LOGIC
+        // ==========================================
+        // EXIT LOGIC (YOUR LOGIC + SAFETY TIMERS)
+        // ==========================================
         else if (hasPosition)
         {
             var pos = _positions[symbol];
             pos.CurrentPrice = _priceHistory[symbol].Last();
 
-            decimal netPnL = pos.UnrealizedPnL - roundTripFee;
-            double rsi = CalculateRSI(symbol, 14);
+            DateTime entryTime = _buyTimes.TryGetValue(symbol, out var bt) ? bt : pos.EntryTime;
+            double secondsHeld = (DateTime.UtcNow - entryTime).TotalSeconds;
 
-            if (!pos.IsBreakEvenProtected && netPnL >= BreakEvenTriggerPnL)
-            {
-                pos.TrailingStop = Math.Max(pos.TrailingStop, pos.AvgPrice * 1.001m);
-                pos.IsBreakEvenProtected = true;
-            }
+            // 🛑 STOP: If we haven't held for 15 seconds, don't even look at the indicators.
+            if (secondsHeld < 15) return;
 
-            decimal profitPct = pos.AvgPrice > 0 ? (pos.CurrentPrice - pos.AvgPrice) / pos.AvgPrice : 0;
+            // 1. Logic Variables
+            bool minHoldMet = secondsHeld >= 180;
+            decimal pnlPct = (pos.CurrentPrice - pos.AvgPrice) / pos.AvgPrice;
 
-            if (!_addedToWinners.Contains(symbol) &&
-                currentScore >= 9.0 &&
-                profitPct >= 0.004m &&
-                _positions.Count < MaxActivePositions)
-            {
-                int addQty = Math.Max(1, (int)Math.Floor(pos.Quantity * 0.5m));
-                if (addQty > 0)
-                {
-                    if (_lastTradeWasLoss.TryGetValue(symbol, out bool wasLoss) && wasLoss)
-                    {
-                        if (_lastSellTimes.TryGetValue(symbol, out var lastSell) &&
-                            (DateTime.UtcNow - lastSell).TotalMinutes < 30)
-                            return;
-                    }
-                    SubmitOrder(symbol, addQty, pos.CurrentPrice, TradeSide.Buy);
-                    _addedToWinners.Add(symbol);
-                }
-            }
-
-            if (profitPct >= 0.006m) pos.TrailingStop = Math.Max(pos.TrailingStop, pos.CurrentPrice * 0.997m);
-            else if (profitPct >= 0.004m) pos.TrailingStop = Math.Max(pos.TrailingStop, pos.CurrentPrice * 0.995m);
-
-            _peakRsi[symbol] = Math.Max(_peakRsi.TryGetValue(symbol, out var peak) ? peak : rsi, rsi);
-            bool rsiHook = _peakRsi[symbol] >= 65 &&
-                           (_peakRsi[symbol] - rsi) >= RSI_HOOK_DROP &&
-                           (DateTime.UtcNow - _buyTimes[symbol]).TotalSeconds > 30;
-
-            decimal vwapExit = (_cumVolume.TryGetValue(symbol, out var volExit) &&
-                                volExit > 0 &&
-                                _cumVwapProd.TryGetValue(symbol, out var prodExit))
-                                ? prodExit / volExit
-                                : pos.CurrentPrice;
-
-            bool softExit = currentScore < RACE_EXIT_SCORE && pos.CurrentPrice < vwapExit;
-            bool hitStop = pos.CurrentPrice <= pos.TrailingStop;
-
-            if (hitStop || softExit || rsiHook)
+            // 2. HARD STOP (Absolute Safety - no timer required)
+            decimal atr = GetATR(symbol);
+            decimal loss = pos.CurrentPrice - pos.AvgPrice;
+            if (atr > 0 && loss <= -atr)
             {
                 SubmitOrder(symbol, (int)pos.Quantity, pos.CurrentPrice, TradeSide.Sell);
-                _raceStartTimes.TryRemove(symbol, out _);
+                SaveState();
+                return; // Exit the method immediately
+            }
 
-                string reason = hitStop ? "STOP" : rsiHook ? "RSI_HOOK" : "MOM_DECAY";
-                Task.Run(() => SendEmailNotification($"🔴 SELL ({reason}): {symbol}", $"PnL: {netPnL:C2}"));
+            // 3. ALL OTHER EXITS (Locked behind the 3-minute wall)
+            if (minHoldMet)
+            {
+                decimal atrTrail = atr * 1.4m;
+                decimal newStop = pos.CurrentPrice - atrTrail;
+
+                if (newStop > pos.TrailingStop)
+                    pos.TrailingStop = Math.Max(pos.TrailingStop, pos.CurrentPrice - atrTrail);
+                bool hitTrailingStop = pos.CurrentPrice <= pos.TrailingStop;
+                bool rsiHook = (_peakRsi.ContainsKey(symbol) && (_peakRsi[symbol] - CalculateRSI(symbol, 14)) >= 4.0);
+
+                bool shouldExit = false;
+                if (hitTrailingStop) shouldExit = true;
+                if (atr > 0 && (pos.CurrentPrice - pos.AvgPrice) >= atr * 1.2m && rsiHook)
+                    shouldExit = true;
+
+
+                if (shouldExit)
+                {
+                    SubmitOrder(symbol, (int)pos.Quantity, pos.CurrentPrice, TradeSide.Sell);
+                    SaveState();
+                }
             }
         }
     }
-
 
     private decimal GetATR(string symbol, int period = 14)
     {
@@ -603,37 +565,39 @@ public class SimulatedBroker : IBroker
 
     public void UpdateHistory(string symbol, decimal price, long volume)
     {
-        if (price <= 0) return;
-        // 1. Data Management
         ManagePriceData(symbol, price, volume);
+        double rsi = CalculateRSI(symbol, 14);
+        _peakRsi.AddOrUpdate(symbol, rsi, (_, old) => Math.Max(old, rsi));
+        // 🔥 score FIRST
+        double raw = CalculateRaceScore(symbol) * TimeOfDayMultiplier() * RegimeBias();
 
-        // 2. Main Logic Execution
-        // This now handles both Entry (if no position) and Exit (if has position)
-        lock (_lock)
-        {
-            ExecuteTradeLogic(symbol);
-        }
+        double smooth = raw;
+        if (_lastRaceScores.TryGetValue(symbol, out var prev))
+            smooth = (raw * 0.7) + (prev * 0.3);
 
-
-        // 3. Global Safety Check (PnL and Goal Tracking)
-        CheckDailyGoal();
-
-        // 4. Time-based Liquidation
-        CheckEndOfDayLiquidation();
-        CheckForStuckOrders();
-
-        // 🔥 ALWAYS refresh leaderboard score
-        double score = CalculateRaceScore(symbol) * TimeOfDayMultiplier();
-        _raceScores[symbol] = score;
+        _raceScores[symbol] = smooth;
 
         var history = _raceScoreHistory.GetOrAdd(symbol, _ => new Queue<(double, DateTime)>());
         lock (history)
         {
-            history.Enqueue((score, DateTime.UtcNow));
+            history.Enqueue((smooth, DateTime.UtcNow));
             if (history.Count > 8) history.Dequeue();
         }
-        _lastRaceScores[symbol] = _raceScores.TryGetValue(symbol, out var old) ? old : 0;
-        _raceScores[symbol] = score;
+
+        _lastRaceScores[symbol] = smooth;
+
+
+        lock (_lock)
+        {
+            ExecuteTradeLogic(symbol);
+        }
+        if (_positions.Count > 0)
+        {
+            CheckDailyGoal();
+            CheckEndOfDayLiquidation();
+        }
+
+        CheckForStuckOrders();
 
 
     }
@@ -654,84 +618,121 @@ public class SimulatedBroker : IBroker
 
         qty = Math.Max(1, qty);
 
-        // ❗ DO NOT generate orderId here
+        // Only submit to broker
         RealBroker?.SubmitOrder(symbol, qty, price, side, currentRsi, orderType);
 
+        // OPTIONAL: debug email only
+        /*
         Task.Run(() =>
             SendEmailNotification(
-                $"🔴 ({side}): {symbol}",
-                $"Quantity: {qty:C2}"+
-                $"Price: { price:C2}"+$"RSI:{currentRsi}"
+                $"ORDER SENT ({side}): {symbol}",
+                $"Qty: {qty}\nPrice: {price:C2}\nRSI: {currentRsi}"
             )
         );
+        */
     }
 
-public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
-{
-    if (!_ordersById.TryGetValue(orderId, out var order)) return;
 
-    // Update partial fill
-    order.FilledQty += filledQty;
-    order.State = order.FilledQty < order.Qty ? OrderLifeState.PartiallyFilled : OrderLifeState.Filled;
-
-    if (order.FilledQty < order.Qty) return; // still waiting
-
-    // Remove from tracking
-    _ordersById.TryRemove(orderId, out _);
-    _symbolToOrderId.TryRemove(order.Symbol, out _);
-    _pendingOrders.TryRemove(order.Symbol, out _);
-
-    lock (_lock)
+    public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
     {
-        if (order.Side == TradeSide.Buy)
+        if (!_ordersById.TryGetValue(orderId, out var order)) return;
+
+        order.FilledQty += filledQty;
+       
+
+        _ordersById.TryRemove(orderId, out _);
+        _symbolToOrderId.TryRemove(order.Symbol, out _);
+        _pendingOrders.TryRemove(order.Symbol, out _);
+        Task.Run(() =>
+      SendEmailNotification(
+          $"{(order.Side == TradeSide.Buy ? "🟢 BUY FILLED" : "🔴 SELL FILLED")}: {order.Symbol}",
+          $"Qty: {filledQty}\nPrice: {avgFillPrice:C2}"
+      )
+  );
+        lock (_lock)
         {
-            if (_positions.TryGetValue(order.Symbol, out var pos))
+            if (order.Side == TradeSide.Buy)
             {
-                decimal totalQty = pos.Quantity + order.FilledQty;
-                pos.AvgPrice = ((pos.AvgPrice * pos.Quantity) + (avgFillPrice * order.FilledQty)) / totalQty;
-                pos.Quantity = totalQty;
-                pos.CurrentPrice = avgFillPrice;
-            }
-            else
-            {
-                _positions[order.Symbol] = new SimPosition
+                if (_positions.TryGetValue(order.Symbol, out var existing))
                 {
-                    Symbol = order.Symbol,
-                    Quantity = order.FilledQty,
-                    AvgPrice = avgFillPrice,
-                    CurrentPrice = avgFillPrice,
-                    EntryTime = DateTime.UtcNow,
-                    TrailingStop = avgFillPrice * 0.985m
-                };
+                    decimal totalQty = existing.Quantity + order.FilledQty;
+                    existing.AvgPrice = ((existing.AvgPrice * existing.Quantity) + (avgFillPrice * order.FilledQty)) / totalQty;
+                    existing.Quantity = totalQty;
+                }
+                // FIXED OnOrderFilled logic
+                else
+                {
+                    // Pull the original buy time if available, otherwise default to now
+                    DateTime originalEntry = _buyTimes.TryGetValue(order.Symbol, out var t) ? t : DateTime.UtcNow;
+                    _buyTimes.TryRemove(order.Symbol, out _);
+                    decimal atr = GetATR(order.Symbol);
+                    
+
+                    _positions[order.Symbol] = new SimPosition
+                    {
+                        Symbol = order.Symbol,
+                        Quantity = order.FilledQty,
+                        AvgPrice = avgFillPrice,
+                        CurrentPrice = avgFillPrice,
+                        EntryTime = originalEntry, // ✅ USE ORIGINAL TIME
+                        TrailingStop = avgFillPrice - Math.Max(atr * 1.4m, avgFillPrice * 0.006m)
+
+                    };
+                }
+            }
+            else // SELL FILL
+            {
+                if (_positions.TryGetValue(order.Symbol, out var pos))
+                {
+                    decimal pnl = (avgFillPrice - pos.AvgPrice) * order.FilledQty - roundTripFee;
+                    _rollingPnL += pnl;
+                    _rollingTrades++;
+
+                    if (_rollingTrades >= 10)
+                    {
+                        if ((_rollingPnL / _rollingTrades) < -30)
+                            TriggerKillSwitch("Negative expectancy detected");
+                        _rollingPnL = 0;
+                        _rollingTrades = 0;
+                    }
+
+                    _totalRealizedPnL += pnl;
+                    _tradesExecutedToday++;
+                    _lastTradeWasLoss[order.Symbol] = pnl < 0;
+
+                    // ✅ FIX: Explicitly remove from local memory to prevent "Ghosting"
+                    _positions.Remove(order.Symbol);
+                    _ignoreSyncUntil[order.Symbol] = DateTime.UtcNow.AddSeconds(5);
+                    _syncedSymbols.Remove(order.Symbol);
+
+                    _lastSellTimes[order.Symbol] = DateTime.UtcNow;
+                    _tradeHistory.Add(new ClosedTrade { Symbol = order.Symbol, Profit = pnl, ExitTime = DateTime.UtcNow });
+
+                    // ✅ FIX: Log the trade to CSV for your records
+                    double rsi = _lastRsiMemory.ContainsKey(order.Symbol) ? _lastRsiMemory[order.Symbol] : 50;
+                    LogTradeToCSV(order.Symbol, "SELL", avgFillPrice, pnl, rsi, false);
+
+                    if (pnl < 0)
+                        _dailyLossCount += pnl <= GetVolatilityAdjustedLoss(order.Symbol) ? 2 : 1;
+
+                    if (_dailyLossCount >= 4) TriggerKillSwitch("Max daily losses reached");
+
+                    if (!_tradesToday.ContainsKey(order.Symbol))
+                        _tradesToday[order.Symbol] = 0;
+                    _tradesToday[order.Symbol]++;
+                    _buyTimes.TryRemove(order.Symbol, out _);
+                    _peakRsi.TryRemove(order.Symbol, out _);
+                    _softTradeUsed = false;
+                    SaveState();
+                }
             }
         }
-        else // SELL
-        {
-            if (_positions.TryGetValue(order.Symbol, out var pos))
-            {
-                decimal pnl = (avgFillPrice - pos.AvgPrice) * order.FilledQty - roundTripFee;
-                _totalRealizedPnL += pnl;
-
-                _positions.Remove(order.Symbol);
-                _lastSellTimes[order.Symbol] = DateTime.UtcNow;
-                _lastTradeWasLoss[order.Symbol] = pnl < 0;
-
-                _tradeHistory.Add(new ClosedTrade
-                {
-                    Symbol = order.Symbol,
-                    Profit = pnl,
-                    ExitTime = DateTime.UtcNow
-                });
-
-                if (pnl < 0)
-                    _dailyLossCount += pnl <= GetVolatilityAdjustedLoss(order.Symbol) ? 2 : 1;
-
-                if (_dailyLossCount >= 4)
-                    TriggerKillSwitch("Max daily losses reached");
-            }
-        }
+        SaveState(); 
     }
-}
+    public void OnBrokerPosition(string symbol, decimal qty, decimal avgPrice)
+    {
+        SyncExistingPosition(symbol, qty, avgPrice);
+    }
 
     public void NotifyOrderFailed(int orderId, string reason)
     {
@@ -743,6 +744,8 @@ public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
 
         Console.WriteLine($"[ORDER FAIL] {reason}");
         _haltNewTrades = true;   // pause
+        _softTradeUsed = false;
+
     }
 
 
@@ -761,7 +764,7 @@ public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
             _priceHistory[symbol].Add(close);
             _volumeHistory[symbol].Add(volume);
 
-            if (_priceHistory[symbol].Count > 200)
+            if (_priceHistory[symbol].Count > 300)
             {
                 _priceHistory[symbol].RemoveAt(0);
                 _volumeHistory[symbol].RemoveAt(0);
@@ -772,11 +775,6 @@ public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
     {
         lock (_lock)
         {
-            if (_totalRealizedPnL <= -MAX_DAILY_DOLLAR_LOSS)
-            {
-                TriggerKillSwitch("Hard Dollar Loss Limit Hit");
-                return;
-            }
 
             // FIX: If we already reached a goal or halted, stop immediately
             if (_goalReached || _haltNewTrades) return;
@@ -801,35 +799,24 @@ public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
 
     private void LiquidateAll()
     {
-        if (_positions.Count == 0)
-            return;
-        if (_emergencyExit) return;
+        if (_positions.Count == 0 || _emergencyExit) return;
         _emergencyExit = true;
+
         foreach (var kv in _positions.ToList())
         {
             var symbol = kv.Key;
             var pos = kv.Value;
 
-            // 🔥 OVERRIDE all safety guards
-          
-
-            Console.WriteLine($"[EMERGENCY EXIT] Liquidating {symbol}");
-
             _pendingOrders.TryRemove(symbol, out _);
 
-            // Direct broker fire (bypass safety)
-            RealBroker?.SubmitOrder(
-                symbol,
-                (int)Math.Abs(pos.Quantity),
-                pos.CurrentPrice,
-                TradeSide.Sell,
-                0,
-                "MKT"
-            );
+            int orderId = ((IbClient)RealBroker)
+                .SubmitEmergencyMarketSell(symbol, (int)pos.Quantity);
 
-
+            RegisterLiveOrder(orderId, symbol, TradeSide.Sell, (int)pos.Quantity);
         }
     }
+
+
 
     private void ManagePriceData(string symbol, decimal price, long volume)
     {
@@ -843,13 +830,14 @@ public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
 
         lock (prices)
         {
-            prices.Add(price);
-            volumes.Add(volume);
-
-            if (prices.Count > 300)
+            var lastTime = _lastPriceAdd.GetOrAdd(symbol, DateTime.MinValue);
+            if ((DateTime.UtcNow - lastTime).TotalSeconds >= 5)
             {
-                prices.RemoveAt(0);
-                volumes.RemoveAt(0);
+                prices.Add(price);
+                volumes.Add(volume);
+                _lastPriceAdd[symbol] = DateTime.UtcNow;
+
+                if (prices.Count > 300) { prices.RemoveAt(0); volumes.RemoveAt(0); }
             }
         }
 
@@ -920,7 +908,7 @@ public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
         // --- 1. HEADER SECTION ---
         sb.AppendLine(new string('=', windowWidth - 1));
         sb.AppendLine($"  BOT: {botState} | Market: {marketStatus} | Day PnL: {pnlPct:F2}%".PadRight(windowWidth - 1));
-        sb.AppendLine($"  Losses: {_dailyLossCount}/4 | Active Slots: {_positions.Count}/4 | Goal: +1.0%".PadRight(windowWidth - 1));
+        sb.AppendLine($"  Losses: {_dailyLossCount}/4 | Active Slots: {_positions.Count}/2 | Goal: +1.0%".PadRight(windowWidth - 1));
         sb.AppendLine($"  Local Time: {DateTime.Now:HH:mm:ss} | NYC Time: {nyNow:HH:mm:ss}".PadRight(windowWidth - 1));
         sb.AppendLine(new string('=', windowWidth - 1));
 
@@ -1084,42 +1072,8 @@ public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
         return "FLAT";
 
     }
-    public void SyncExistingPosition(string symbol, decimal qty, decimal avgPrice)
-    {
-        lock (_lock)
-        {
-            // 1. Only sync if it's a long position (qty > 0) and not already tracked
-            if (qty > 0 && !_positions.ContainsKey(symbol))
-            {
-                _positions[symbol] = new SimPosition
-                {
-                    Symbol = symbol,      
-                    Quantity = qty,
-                    AvgPrice = avgPrice,
-                    CurrentPrice = avgPrice,
-
-                    // 2. SET PROTECTIVE STOP
-                    // We set a 1.5% stop based on the current price or avg price
-                    TrailingStop = avgPrice * 0.985m,
-                    EntryTime = DateTime.UtcNow.AddMinutes(-5) // 3. Fake a 5-min history
-                };
-
-                // 4. PREVENT INSTANT INDICATOR EXITS
-                // We initialize the Peak RSI at a neutral level (50) 
-                // so the 'RSI Hook' logic doesn't trigger until the bot sees a new peak.
-                _peakRsi[symbol] = 50.0;
-                _buyTimes[symbol] = DateTime.UtcNow.AddMinutes(-5);
-
-                Console.WriteLine($"[SYNC] Found {symbol} in TWS. Quantity: {qty} | Avg: {avgPrice:C2} | Stop: {avgPrice * 0.985m:C2}");
-            }
-            else if (qty == 0 && _positions.ContainsKey(symbol))
-            {
-                // 5. CLEANUP: If TWS says 0 but we have it, remove it.
-                _positions.Remove(symbol);
-                Console.WriteLine($"[SYNC] Cleanup: {symbol} is no longer held in TWS.");
-            }
-        }
-    }
+    // Inside SimulatedBroker.cs
+   
     private DateTime GetEasternTime()
     {
         string tzId = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "Eastern Standard Time" : "America/New_York";
@@ -1153,6 +1107,53 @@ public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
         }
     }
 
+    public void ResetPositionSync()
+    {
+        _syncedSymbols.Clear();
+    }
+
+    public void SyncExistingPosition(string symbol, decimal qty, decimal avgPrice)
+    {
+        if (_ignoreSyncUntil.TryGetValue(symbol, out var until) && DateTime.UtcNow < until)
+        {
+            return; // Ignore IBKR update for a few seconds after we sell
+        }
+
+        _syncedSymbols.Add(symbol);
+
+        // If IB says we have 0, but bot thinks we have some, DELETE IT.
+        if (qty == 0)
+        {
+            _positions.Remove(symbol);
+            return;
+        }
+
+        if (_positions.TryGetValue(symbol, out var pos))
+        {
+            pos.Quantity = qty;
+            pos.AvgPrice = avgPrice;
+        }
+        else
+        {
+            _positions[symbol] = new SimPosition
+            {
+                Symbol = symbol,
+                Quantity = qty,
+                AvgPrice = avgPrice,
+                EntryTime = DateTime.UtcNow // Assumption for synced positions
+            };
+        }
+    }
+
+    public void FinalizePositionSync()
+    {
+        // Remove any position the bot has that IBKR didn't mention at all
+        var toRemove = _positions.Keys.Where(k => !_syncedSymbols.Contains(k)).ToList();
+        foreach (var sym in toRemove)
+        {
+            _positions.Remove(sym);
+        }
+    }
     public void CheckEndOfDayLiquidation()
     {
         var nyNow = GetEasternTime();
@@ -1165,6 +1166,8 @@ public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
             if (_positions.Count > 0)
                 LiquidateAll();
         }
+
+
 
 
         // 2. Learning Mode Save at 4:00 PM (Market Close)
@@ -1185,19 +1188,29 @@ public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
 
         // 4. Reset flags for next day (Runs during pre-market)
         if (nyNow.TimeOfDay < new TimeSpan(9, 0, 0) &&
-          _symbolLastResetDate.Values.All(d => d.Date != nyNow.Date))
+       (!_symbolLastResetDate.ContainsKey("QQQ") ||
+        _symbolLastResetDate["QQQ"].Date != nyNow.Date))
+
         {
+            // 🔥 Reset daily performance baseline
+            _startingDayEquity = GetTotalEquity();
+            _totalRealizedPnL = 0m;
+            _tradeHistory.Clear();
+
             _eodEmailSent = false;
             _hasSavedToday = false;
             _killSwitchEngaged = false;
             _haltNewTrades = false;
             _dailyLossCount = 0;
-            _chopWarnings = 0;   // <-- MOVE reset here
+            _chopWarnings = 0;
             _softTradeUsed = false;
+            _tradesToday.Clear();
+
         }
+
     }
 
-    public void SendEmailNotification(string subject, string messageBody)
+    public async Task SendEmailNotification(string subject, string messageBody)
     {
         try
         {
@@ -1219,7 +1232,7 @@ public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
 
             using (var message = new MailMessage(fromAddress, toAddress) { Subject = subject, Body = messageBody })
             {
-                smtp.Send(message);
+                await smtp.SendMailAsync(message); // Use Async method
             }
             Console.WriteLine($"[EMAIL] Sent: {subject}");
         }
@@ -1261,8 +1274,11 @@ public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
             int losses = _tradeHistory.Count(t => t.Profit <= 0);
             decimal winRate = totalTrades > 0 ? (decimal)wins / totalTrades * 100 : 0;
 
+            // REPLACE your current PnL calculation with this:
+            decimal reportPnL = _tradeHistory.Sum(t => t.Profit);
+
             string report = $"--- DAILY PERFORMANCE REPORT ---\n\n" +
-                            $"Final PnL: {_totalRealizedPnL:C2}\n" +
+                            $"Final PnL: {reportPnL:C2}\n" + // Use the calculated value
                             $"Total Trades: {totalTrades}\n" +
                             $"Wins: {wins} | Losses: {losses}\n" +
                             $"Win Rate: {winRate:F1}%\n" +
@@ -1273,8 +1289,9 @@ public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
             {
                 report += $"[{t.ExitTime:HH:mm}] {t.Symbol}: {t.Profit:C2}\n";
             }
-
-            Task.Run(() => SendEmailNotification($"📊 EOD REPORT: {_totalRealizedPnL:C2}", report));
+            var emailTask = SendEmailNotification($"📊 EOD REPORT: {reportPnL:C2}", report);
+            emailTask.Wait(); // Force wait so program doesn't exit before sending
+      
         }
 
     }

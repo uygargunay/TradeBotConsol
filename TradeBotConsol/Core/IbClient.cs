@@ -70,6 +70,7 @@ public class IbClient : EWrapper, IBroker
         { IsBackground = true }.Start();
 
         _broker.LoadState();
+        _broker.ResetPositionSync();
         _client.reqPositions();
 
         var liquidationTimer = new System.Timers.Timer(30000);
@@ -151,12 +152,19 @@ public class IbClient : EWrapper, IBroker
 
     public void position(string account, Contract contract, double pos, double avgCost)
     {
-        if (pos != 0)
-            _broker.SyncExistingPosition(contract.Symbol, (decimal)pos, (decimal)avgCost);
+        // Ensure this calls the broker's sync logic
+        _broker.SyncExistingPosition(contract.Symbol, (decimal)pos, (decimal)avgCost);
+
+        // Log for your visibility
+        Console.WriteLine($"[IB SYNC] {contract.Symbol}: {pos} @ {avgCost}");
     }
 
-    public void positionEnd() => Console.WriteLine("[SYSTEM] Portfolio synced.");
-
+    public void positionEnd()
+    {
+        // END SYNC: Delete anything IBKR didn't report
+        _broker.FinalizePositionSync();
+        Console.WriteLine("[SYSTEM] Portfolio synced and ghosts removed.");
+    }
     // ─────────────── ORDER EXECUTION ───────────────
     public void SubmitOrder(
         string symbol,
@@ -205,6 +213,29 @@ public class IbClient : EWrapper, IBroker
         _client.placeOrder(orderId, contract, order);
     }
 
+    public int SubmitEmergencyMarketSell(string symbol, int qty)
+    {
+        var contract = new Contract
+        {
+            Symbol = symbol,
+            SecType = "STK",
+            Exchange = "SMART",
+            Currency = "USD"
+        };
+
+        var order = new Order
+        {
+            Action = "SELL",
+            OrderType = "MKT",
+            TotalQuantity = qty
+        };
+
+        int id = Interlocked.Increment(ref _currentOrderId);
+        _client.placeOrder(id, contract, order);
+        return id;
+    }
+
+
     // ─────────────── ORDER SAFETY ───────────────
     public void orderStatus(
         int orderId,
@@ -231,14 +262,16 @@ public class IbClient : EWrapper, IBroker
                 order.State = OrderLifeState.Rejected;
         }
 
-        if (filled > 0 && remaining == 0)
+        if (filled > 0)
         {
             _broker.OnOrderFilled(orderId, (int)filled, (decimal)avgFillPrice);
         }
         else if (status == "Rejected" || status == "Cancelled")
         {
             _broker.NotifyOrderFailed(orderId, status);
+
         }
+
 
     }
 

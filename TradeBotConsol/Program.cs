@@ -46,10 +46,6 @@ class Program
             while (true)
             {
                 // A. Execute Trade Logic (Stops, RSI, Entries)
-                foreach (var symbol in watchList)
-                {
-                    broker.ExecuteTradeLogic(symbol);
-                }
 
                 // B. Manage End-of-Day (Liquidation, Learning Save, Email)
                 // This method now internally handles the 4:00 PM SaveMarketMemory()
