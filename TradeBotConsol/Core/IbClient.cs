@@ -4,41 +4,41 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
-using static SimulatedBroker;
 
 public class IbClient : EWrapper, IBroker
 {
     private readonly EClientSocket _client;
     private readonly EReaderSignal _signal;
-
-    // IDs for TWS tracking
     private int _currentOrderId = -1;
+    private int _histReqId = 1000;    // FIX 3
+    private int _liveReqId = 20000;   // FIX 3
+
+    private readonly ConcurrentDictionary<int, int> _lastFilled = new(); // FIX 1
+    private readonly ConcurrentDictionary<int, string> _reqIdToSymbol = new();
+    private readonly SimulatedBroker _broker;
+
+    public IbClient(SimulatedBroker broker)
+    {
+        _signal = new EReaderMonitorSignal();
+        _client = new EClientSocket(this, _signal);
+        _broker = broker;
+    }
+
+
+ 
     private int _currentReqId = 1000;
 
-    // Local data caches
     private readonly Dictionary<string, long> _currentVolumeBatch = new();
-    private readonly PositionManager _broker; // Shared brain
-    private readonly ConcurrentDictionary<int, string> _reqIdToSymbol = new();
+
     private readonly ConcurrentDictionary<string, decimal> _currentPriceBatch = new();
     private readonly ConcurrentQueue<string> _ibLogBuffer = new();
 
     public event Action<string, decimal> OnPrice;
-    public PositionManager Broker => _broker;
     private readonly ConcurrentQueue<string> _ibLogs = new();
-    public bool TryDequeueIbLog(out string log)
-    {
-        return _ibLogs.TryDequeue(out log);
-    }
 
-    public IbClient(PositionManager brokerInstance)
-    {
-        _signal = new EReaderMonitorSignal();
-        _client = new EClientSocket(this, _signal);
-        _broker = brokerInstance;
-        _broker.RealBroker = this;
-    }
+    public bool TryDequeueIbLog(out string log) => _ibLogs.TryDequeue(out log);
 
-    // ───────────────── CONNECTION ─────────────────
+
     public void Connect(string host = "127.0.0.1", int port = 7497, int clientId = 1)
     {
         while (!_client.IsConnected())
@@ -47,12 +47,9 @@ public class IbClient : EWrapper, IBroker
             {
                 Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Connecting to TWS...");
                 _client.eConnect(host, port, clientId);
-                if (!_client.IsConnected()) Thread.Sleep(10000);
+                if (!_client.IsConnected()) Thread.Sleep(2000);
             }
-            catch
-            {
-                Thread.Sleep(10000);
-            }
+            catch { Thread.Sleep(2000); }
         }
 
         var reader = new EReader(_client, _signal);
@@ -69,23 +66,18 @@ public class IbClient : EWrapper, IBroker
         })
         { IsBackground = true }.Start();
 
+        Thread.Sleep(1000);
         _broker.LoadState();
         _broker.ResetPositionSync();
         _client.reqPositions();
-
-        var liquidationTimer = new System.Timers.Timer(30000);
-        liquidationTimer.Elapsed += (_, _) => _broker.CheckEndOfDayLiquidation();
-        liquidationTimer.Start();
     }
 
     public bool IsConnected() => _client.IsConnected();
     public void Disconnect() => _client.eDisconnect();
 
-    // ─────────────── UNIVERSE INIT ───────────────
     public void InitializeUniverse(IEnumerable<string> symbols)
     {
         _reqIdToSymbol.Clear();
-
         foreach (var sym in symbols)
         {
             var contract = new Contract
@@ -93,30 +85,22 @@ public class IbClient : EWrapper, IBroker
                 Symbol = sym,
                 SecType = "STK",
                 Currency = "USD",
-                Exchange = "SMART",
-                PrimaryExch = "ISLAND"
+                Exchange = "SMART"
             };
 
-            int histReqId = _currentReqId++;
-            int liveReqId = histReqId + 10000;
+            int histReqId = _histReqId++;
+            int liveReqId = _liveReqId++;
 
             _reqIdToSymbol[histReqId] = sym;
             _reqIdToSymbol[liveReqId] = sym;
 
             _client.reqHistoricalData(histReqId, contract, "", "7200 S", "1 min", "TRADES", 1, 1, false, null);
             _client.reqMktData(liveReqId, contract, "", false, false, null);
-
-            Thread.Sleep(75); // pacing safety
+            Thread.Sleep(50);
         }
     }
 
-    // ─────────────── IB CALLBACKS ───────────────
-    public void nextValidId(int orderId)
-    {
-        _currentOrderId = Math.Max(_currentOrderId, orderId);
-        _client.reqMarketDataType(1);
-        Console.WriteLine($"[SYSTEM] IB Ready. OrderID: {_currentOrderId}");
-    }
+    public void nextValidId(int orderId) => _currentOrderId = orderId; // FIX 7
 
     public void historicalData(int reqId, Bar bar)
     {
@@ -124,512 +108,171 @@ public class IbClient : EWrapper, IBroker
             _broker.ProcessHistoricalBar(symbol, (decimal)bar.Close, bar.Volume);
     }
 
+    // FIX: tickPrice now only stores the latest price; it does NOT trigger the strategy
     public void tickPrice(int tickerId, int field, double price, TickAttrib attribs)
     {
-        if ((field == 4 || field == 68 || field == 9) && price > 0 &&
-            _reqIdToSymbol.TryGetValue(tickerId, out var symbol))
+        // field 4 = Last, 1 = Bid, 2 = Ask, 68 = Delayed Last, 9 = Close
+        if ((field == 4 || field == 1 || field == 2 || field == 68 || field == 9) && price > 0)
         {
-            _currentPriceBatch[symbol] = (decimal)price;
-            OnPrice?.Invoke(symbol, (decimal)price);
+            if (_reqIdToSymbol.TryGetValue(tickerId, out var symbol))
+            {
+                _currentPriceBatch[symbol] = (decimal)price;
+                // No UpdateHistory call here!
+            }
         }
     }
 
-    // ✅ FIXED: UpdateHistory is called ONLY here
+    // FIX: tickSize is now the SOLE entry point for trade data
     public void tickSize(int tickerId, int field, int size)
     {
-        if (field != 8 || !_reqIdToSymbol.TryGetValue(tickerId, out var symbol))
-            return;
-
-        long newTotal = size;
-        _currentVolumeBatch.TryGetValue(symbol, out long lastTotal);
-        long tickVol = newTotal - lastTotal;
-
-        if (tickVol > 0 && _currentPriceBatch.TryGetValue(symbol, out var price))
-            _broker.UpdateHistory(symbol, price, tickVol);
-
-        _currentVolumeBatch[symbol] = newTotal;
-    }
-
-    public void position(string account, Contract contract, double pos, double avgCost)
-    {
-        // Ensure this calls the broker's sync logic
-        _broker.SyncExistingPosition(contract.Symbol, (decimal)pos, (decimal)avgCost);
-
-        // Log for your visibility
-        Console.WriteLine($"[IB SYNC] {contract.Symbol}: {pos} @ {avgCost}");
-    }
-
-    public void positionEnd()
-    {
-        // END SYNC: Delete anything IBKR didn't report
-        _broker.FinalizePositionSync();
-        Console.WriteLine("[SYSTEM] Portfolio synced and ghosts removed.");
-    }
-    // ─────────────── ORDER EXECUTION ───────────────
-    public void SubmitOrder(
-        string symbol,
-        int qty,
-        decimal price,
-        TradeSide side,
-        double currentRsi = 0,
-        string orderType = "LMT")
-    {
-        if (_currentOrderId < 0) return;
-
-        qty = Math.Max(1, qty);
-
-        var contract = new Contract
+        // field 8 = Volume (Cumulative), field 5 = Last Size (Individual trade)
+        if (field == 5 && _reqIdToSymbol.TryGetValue(tickerId, out var symbol))
         {
-            Symbol = symbol,
-            SecType = "STK",
-            Exchange = "SMART",
-            Currency = "USD"
-        };
+            if (_currentPriceBatch.TryGetValue(symbol, out var lastPrice))
+            {
+                // This is the ONLY place that should push data to the broker
+                _broker.UpdateHistory(symbol, lastPrice, (long)size);
+            }
+        }
+    }
 
+    // FIX: Centralize Order ID generation to prevent ID conflicts
+    private int GetNextOrderId()
+    {
+        return Interlocked.Increment(ref _currentOrderId);
+    }
+
+    public void SubmitOrder(string symbol, int qty, decimal price, TradeSide side, double rsi = 0, string type = "LMT")
+    {
+        var contract = new Contract { Symbol = symbol, SecType = "STK", Exchange = "SMART", Currency = "USD" };
         var order = new Order
         {
             Action = side == TradeSide.Buy ? "BUY" : "SELL",
-            OrderType = orderType,
+            OrderType = type,
             TotalQuantity = qty,
-            Tif = "DAY",
-            OutsideRth = false
+            LmtPrice = (double)Math.Round(price, 2),
+            Tif = "GTC" // Recommended: Add Good-Til-Cancelled
         };
 
-        // 🔒 force market sell on halt / liquidation
-        if (side == TradeSide.Sell && (_broker.IsHalted || _broker.GoalReached))
-            order.OrderType = "MKT";
-
-        if (order.OrderType == "LMT")
-            order.LmtPrice = (double)Math.Round(price, 2);
-
-        int orderId = Interlocked.Increment(ref _currentOrderId);
-
-        Console.WriteLine($"[ORDER] {order.Action} {symbol} x{qty} ({order.OrderType}) ID={orderId}");
-
-        // 🔑 register FIRST
-        _broker.RegisterLiveOrder(orderId, symbol, side, qty);
-
-        // 🚀 send to IB
-        _client.placeOrder(orderId, contract, order);
+        int id = GetNextOrderId(); // Use the central generator
+        _broker.RegisterLiveOrder(id, symbol, side, qty);
+        _client.placeOrder(id, contract, order);
     }
 
     public int SubmitEmergencyMarketSell(string symbol, int qty)
     {
-        var contract = new Contract
-        {
-            Symbol = symbol,
-            SecType = "STK",
-            Exchange = "SMART",
-            Currency = "USD"
-        };
+        var contract = new Contract { Symbol = symbol, SecType = "STK", Exchange = "SMART", Currency = "USD" };
+        var order = new Order { Action = "SELL", OrderType = "MKT", TotalQuantity = qty };
 
-        var order = new Order
-        {
-            Action = "SELL",
-            OrderType = "MKT",
-            TotalQuantity = qty
-        };
-
-        int id = Interlocked.Increment(ref _currentOrderId);
+        int id = GetNextOrderId(); // Use the central generator
+        _broker.RegisterLiveOrder(id, symbol, TradeSide.Sell, qty);
         _client.placeOrder(id, contract, order);
         return id;
     }
-
-
-    // ─────────────── ORDER SAFETY ───────────────
-    public void orderStatus(
-        int orderId,
-        string status,
-        double filled,
-        double remaining,
-        double avgFillPrice,
-        int permId,
-        int parentId,
-        double lastFillPrice,
-        int clientId,
-        string whyHeld,
-        double mktCapPrice)
+    public void position(string account, Contract contract, double pos, double avgCost)
     {
-        if (_broker.TryGetTrackedOrder(orderId, out var order))
-        {
-            if (status == "Filled")
-                order.State = OrderLifeState.Filled;
-            else if (filled > 0)
-                order.State = OrderLifeState.PartiallyFilled;
-            else if (status == "Cancelled")
-                order.State = OrderLifeState.Cancelled;
-            else if (status == "Rejected")
-                order.State = OrderLifeState.Rejected;
-        }
-
-        if (filled > 0)
-        {
-            _broker.OnOrderFilled(orderId, (int)filled, (decimal)avgFillPrice);
-        }
-        else if (status == "Rejected" || status == "Cancelled")
-        {
-            _broker.NotifyOrderFailed(orderId, status);
-
-        }
-
-
+        _broker.SyncFromIB(contract.Symbol, (int)pos, (decimal)avgCost); // FIX 5
     }
 
+    public void positionEnd() => _broker.FinalizePositionSync();
 
-    #region Errors
-    #region Errors
-    #region Errors
+  
+    public void orderStatus(int orderId, string status, double filled, double remaining, double avgFillPrice, int permId, int parentId, double lastFillPrice, int clientId, string whyHeld, double mktCapPrice)
+    {
+        // FIX 1: Monotonic Fill Logic
+        int filledInt = (int)filled;
+        int last = _lastFilled.GetOrAdd(orderId, 0);
+        int delta = filledInt - last;
+
+        if (delta > 0)
+        {
+            _lastFilled[orderId] = filledInt;
+            _broker.OnOrderFilled(orderId, delta, (decimal)avgFillPrice);
+        }
+    }
+
     public void error(int id, int errorCode, string errorMsg)
     {
         if (errorCode != 2104 && errorCode != 2106 && errorCode != 2158)
-            _ibLogs.Enqueue($"IB {errorCode}: {errorMsg}");
+        {
+            _ibLogs.Enqueue($"IB Err {errorCode}: {errorMsg}");
+            if (id != -1) _broker.NotifyOrderFailed(id, $"IB Error {errorCode}");
+        }
     }
 
-    public void error(Exception e) =>
-        _ibLogBuffer.Enqueue($"IB EX: {e.Message}");
-
-    public void error(string str) =>
-        _ibLogBuffer.Enqueue($"IB: {str}");
-
-    public void connectionClosed() =>
-        _ibLogBuffer.Enqueue("[IB] Connection closed.");
-    #endregion
-
-    #endregion
-
-    #endregion
-
-    #region Unused
+    // Unused overrides
+    public void error(Exception e) { }
+    public void error(string str) { }
     public void connectAck() { }
+    public void connectionClosed() { }
     public void tickString(int a, int b, string c) { }
     public void tickGeneric(int a, int b, double c) { }
     public void openOrder(int a, Contract b, Order c, OrderState d) { }
     public void openOrderEnd() { }
     public void currentTime(long t) { }
-
-    void EWrapper.tickEFP(int tickerId, int tickType, double basisPoints, string formattedBasisPoints, double impliedFuture, int holdDays, string futureLastTradeDate, double dividendImpact, double dividendsToLastTradeDate)
-    {
-        
-    }
-
-    void EWrapper.deltaNeutralValidation(int reqId, UnderComp underComp)
-    {
-        
-    }
-
-    void EWrapper.tickOptionComputation(int tickerId, int field, double impliedVolatility, double delta, double optPrice, double pvDividend, double gamma, double vega, double theta, double undPrice)
-    {
-        
-    }
-
-    void EWrapper.tickSnapshotEnd(int tickerId)
-    {
-        
-    }
-
-    void EWrapper.managedAccounts(string accountsList)
-    {
-      
-    }
-
-    void EWrapper.accountSummary(int reqId, string account, string tag, string value, string currency)
-    {
-        
-    }
-
-    void EWrapper.accountSummaryEnd(int reqId)
-    {
-        
-    }
-
-    void EWrapper.bondContractDetails(int reqId, ContractDetails contract)
-    {
-        
-    }
-
-    void EWrapper.updateAccountValue(string key, string value, string currency, string accountName)
-    {
-        
-    }
-
-    void EWrapper.updatePortfolio(Contract contract, double position, double marketPrice, double marketValue, double averageCost, double unrealizedPNL, double realizedPNL, string accountName)
-    {
-        
-    }
-
-    void EWrapper.updateAccountTime(string timestamp)
-    {
-        
-    }
-
-    void EWrapper.accountDownloadEnd(string account)
-    {
-        
-    }
-
-    void EWrapper.contractDetails(int reqId, ContractDetails contractDetails)
-    {
-        
-    }
-
-    void EWrapper.contractDetailsEnd(int reqId)
-    {
-        
-    }
-
-    void EWrapper.execDetails(int reqId, Contract contract, Execution execution)
-    {
-        
-    }
-
-    void EWrapper.execDetailsEnd(int reqId)
-    {
-        
-    }
-
-    void EWrapper.commissionReport(CommissionReport commissionReport)
-    {
-        
-    }
-
-    void EWrapper.fundamentalData(int reqId, string data)
-    {
-        
-    }
-
-    void EWrapper.historicalDataUpdate(int reqId, Bar bar)
-    {
-        
-    }
-
-    void EWrapper.historicalDataEnd(int reqId, string start, string end)
-    {
-        
-    }
-
-    void EWrapper.marketDataType(int reqId, int marketDataType)
-    {
-        
-    }
-
-    void EWrapper.updateMktDepth(int tickerId, int position, int operation, int side, double price, int size)
-    {
-        
-    }
-
-    void EWrapper.updateMktDepthL2(int tickerId, int position, string marketMaker, int operation, int side, double price, int size)
-    {
-        
-    }
-
-    void EWrapper.updateNewsBulletin(int msgId, int msgType, string message, string origExchange)
-    {
-        
-    }
-
-    void EWrapper.realtimeBar(int reqId, long time, double open, double high, double low, double close, long volume, double WAP, int count)
-    {
-        
-    }
-
-    void EWrapper.scannerParameters(string xml)
-    {
-        
-    }
-
-    void EWrapper.scannerData(int reqId, int rank, ContractDetails contractDetails, string distance, string benchmark, string projection, string legsStr)
-    {
-        
-    }
-
-    void EWrapper.scannerDataEnd(int reqId)
-    {
-        
-    }
-
-    void EWrapper.receiveFA(int faDataType, string faXmlData)
-    {
-        
-    }
-
-    void EWrapper.verifyMessageAPI(string apiData)
-    {
-        
-    }
-
-    void EWrapper.verifyCompleted(bool isSuccessful, string errorText)
-    {
-        
-    }
-
-    void EWrapper.verifyAndAuthMessageAPI(string apiData, string xyzChallenge)
-    {
-        
-    }
-
-    void EWrapper.verifyAndAuthCompleted(bool isSuccessful, string errorText)
-    {
-        
-    }
-
-    void EWrapper.displayGroupList(int reqId, string groups)
-    {
-        
-    }
-
-    void EWrapper.displayGroupUpdated(int reqId, string contractInfo)
-    {
-        
-    }
-
-    void EWrapper.positionMulti(int requestId, string account, string modelCode, Contract contract, double pos, double avgCost)
-    {
-        
-    }
-
-    void EWrapper.positionMultiEnd(int requestId)
-    {
-        
-    }
-
-    void EWrapper.accountUpdateMulti(int requestId, string account, string modelCode, string key, string value, string currency)
-    {
-        
-    }
-
-    void EWrapper.accountUpdateMultiEnd(int requestId)
-    {
-        
-    }
-
-    void EWrapper.securityDefinitionOptionParameter(int reqId, string exchange, int underlyingConId, string tradingClass, string multiplier, HashSet<string> expirations, HashSet<double> strikes)
-    {
-        
-    }
-
-    void EWrapper.securityDefinitionOptionParameterEnd(int reqId)
-    {
-        
-    }
-
-    void EWrapper.softDollarTiers(int reqId, SoftDollarTier[] tiers)
-    {
-        
-    }
-
-    void EWrapper.familyCodes(FamilyCode[] familyCodes)
-    {
-        
-    }
-
-    void EWrapper.symbolSamples(int reqId, ContractDescription[] contractDescriptions)
-    {
-        
-    }
-
-    void EWrapper.mktDepthExchanges(DepthMktDataDescription[] depthMktDataDescriptions)
-    {
-        
-    }
-
-    void EWrapper.tickNews(int tickerId, long timeStamp, string providerCode, string articleId, string headline, string extraData)
-    {
-        
-    }
-
-    void EWrapper.smartComponents(int reqId, Dictionary<int, KeyValuePair<string, char>> theMap)
-    {
-        
-    }
-
-    void EWrapper.tickReqParams(int tickerId, double minTick, string bboExchange, int snapshotPermissions)
-    {
-      
-    }
-
-    void EWrapper.newsProviders(NewsProvider[] newsProviders)
-    {
-        
-    }
-
-    void EWrapper.newsArticle(int requestId, int articleType, string articleText)
-    {
-        
-    }
-
-    void EWrapper.historicalNews(int requestId, string time, string providerCode, string articleId, string headline)
-    {
-        
-    }
-
-    void EWrapper.historicalNewsEnd(int requestId, bool hasMore)
-    {
-        
-    }
-
-    void EWrapper.headTimestamp(int reqId, string headTimestamp)
-    {
-        
-    }
-
-    void EWrapper.histogramData(int reqId, HistogramEntry[] data)
-    {
-        
-    }
-
-    void EWrapper.rerouteMktDataReq(int reqId, int conId, string exchange)
-    {
-        
-    }
-
-    void EWrapper.rerouteMktDepthReq(int reqId, int conId, string exchange)
-    {
-        
-    }
-
-    void EWrapper.marketRule(int marketRuleId, PriceIncrement[] priceIncrements)
-    {
-        
-    }
-
-    void EWrapper.pnl(int reqId, double dailyPnL, double unrealizedPnL, double realizedPnL)
-    {
-        
-    }
-
-    void EWrapper.pnlSingle(int reqId, int pos, double dailyPnL, double unrealizedPnL, double realizedPnL, double value)
-    {
-        
-    }
-
-    void EWrapper.historicalTicks(int reqId, HistoricalTick[] ticks, bool done)
-    {
-        
-    }
-
-    void EWrapper.historicalTicksBidAsk(int reqId, HistoricalTickBidAsk[] ticks, bool done)
-    {
-        
-    }
-
-    void EWrapper.historicalTicksLast(int reqId, HistoricalTickLast[] ticks, bool done)
-    {
-        
-    }
-
-    void EWrapper.tickByTickAllLast(int reqId, int tickType, long time, double price, int size, TickAttrib attribs, string exchange, string specialConditions)
-    {
-        
-    }
-
-    void EWrapper.tickByTickBidAsk(int reqId, long time, double bidPrice, double askPrice, int bidSize, int askSize, TickAttrib attribs)
-    {
-        
-    }
-
-    void EWrapper.tickByTickMidPoint(int reqId, long time, double midPoint)
-    {
-        
-    }
-    #endregion
+    public void tickEFP(int tickerId, int tickType, double basisPoints, string formattedBasisPoints, double impliedFuture, int holdDays, string futureLastTradeDate, double dividendImpact, double dividendsToLastTradeDate) { }
+    public void deltaNeutralValidation(int reqId, UnderComp underComp) { }
+    public void tickOptionComputation(int tickerId, int field, double impliedVolatility, double delta, double optPrice, double pvDividend, double gamma, double vega, double theta, double undPrice) { }
+    public void tickSnapshotEnd(int tickerId) { }
+    public void managedAccounts(string accountsList) { }
+    public void accountSummary(int reqId, string account, string tag, string value, string currency) { }
+    public void accountSummaryEnd(int reqId) { }
+    public void bondContractDetails(int reqId, ContractDetails contract) { }
+    public void updateAccountValue(string key, string value, string currency, string accountName) { }
+    public void updatePortfolio(Contract contract, double position, double marketPrice, double marketValue, double averageCost, double unrealizedPNL, double realizedPNL, string accountName) { }
+    public void updateAccountTime(string timestamp) { }
+    public void accountDownloadEnd(string account) { }
+    public void contractDetails(int reqId, ContractDetails contractDetails) { }
+    public void contractDetailsEnd(int reqId) { }
+    public void execDetails(int reqId, Contract contract, Execution execution) { }
+    public void execDetailsEnd(int reqId) { }
+    public void commissionReport(CommissionReport commissionReport) { }
+    public void fundamentalData(int reqId, string data) { }
+    public void historicalDataUpdate(int reqId, Bar bar) { }
+    public void historicalDataEnd(int reqId, string start, string end) { }
+    public void marketDataType(int reqId, int marketDataType) { }
+    public void updateMktDepth(int tickerId, int position, int operation, int side, double price, int size) { }
+    public void updateMktDepthL2(int tickerId, int position, string marketMaker, int operation, int side, double price, int size) { }
+    public void updateNewsBulletin(int msgId, int msgType, string message, string origExchange) { }
+    public void realtimeBar(int reqId, long time, double open, double high, double low, double close, long volume, double WAP, int count) { }
+    public void scannerParameters(string xml) { }
+    public void scannerData(int reqId, int rank, ContractDetails contractDetails, string distance, string benchmark, string projection, string legsStr) { }
+    public void scannerDataEnd(int reqId) { }
+    public void receiveFA(int faDataType, string faXmlData) { }
+    public void verifyMessageAPI(string apiData) { }
+    public void verifyCompleted(bool isSuccessful, string errorText) { }
+    public void verifyAndAuthMessageAPI(string apiData, string xyzChallenge) { }
+    public void verifyAndAuthCompleted(bool isSuccessful, string errorText) { }
+    public void displayGroupList(int reqId, string groups) { }
+    public void displayGroupUpdated(int reqId, string contractInfo) { }
+    public void positionMulti(int requestId, string account, string modelCode, Contract contract, double pos, double avgCost) { }
+    public void positionMultiEnd(int requestId) { }
+    public void accountUpdateMulti(int requestId, string account, string modelCode, string key, string value, string currency) { }
+    public void accountUpdateMultiEnd(int requestId) { }
+    public void securityDefinitionOptionParameter(int reqId, string exchange, int underlyingConId, string tradingClass, string multiplier, HashSet<string> expirations, HashSet<double> strikes) { }
+    public void securityDefinitionOptionParameterEnd(int reqId) { }
+    public void softDollarTiers(int reqId, SoftDollarTier[] tiers) { }
+    public void familyCodes(FamilyCode[] familyCodes) { }
+    public void symbolSamples(int reqId, ContractDescription[] contractDescriptions) { }
+    public void mktDepthExchanges(DepthMktDataDescription[] depthMktDataDescriptions) { }
+    public void tickNews(int tickerId, long timeStamp, string providerCode, string articleId, string headline, string extraData) { }
+    public void smartComponents(int reqId, Dictionary<int, KeyValuePair<string, char>> theMap) { }
+    public void tickReqParams(int tickerId, double minTick, string bboExchange, int snapshotPermissions) { }
+    public void newsProviders(NewsProvider[] newsProviders) { }
+    public void newsArticle(int requestId, int articleType, string articleText) { }
+    public void historicalNews(int requestId, string time, string providerCode, string articleId, string headline) { }
+    public void historicalNewsEnd(int requestId, bool hasMore) { }
+    public void headTimestamp(int reqId, string headTimestamp) { }
+    public void histogramData(int reqId, HistogramEntry[] data) { }
+    public void rerouteMktDataReq(int reqId, int conId, string exchange) { }
+    public void rerouteMktDepthReq(int reqId, int conId, string exchange) { }
+    public void marketRule(int marketRuleId, PriceIncrement[] priceIncrements) { }
+    public void pnl(int reqId, double dailyPnL, double unrealizedPnL, double realizedPnL) { }
+    public void pnlSingle(int reqId, int pos, double dailyPnL, double unrealizedPnL, double realizedPnL, double value) { }
+    public void historicalTicks(int reqId, HistoricalTick[] ticks, bool done) { }
+    public void historicalTicksBidAsk(int reqId, HistoricalTickBidAsk[] ticks, bool done) { }
+    public void historicalTicksLast(int reqId, HistoricalTickLast[] ticks, bool done) { }
+    public void tickByTickAllLast(int reqId, int tickType, long time, double price, int size, TickAttrib attribs, string exchange, string specialConditions) { }
+    public void tickByTickBidAsk(int reqId, long time, double bidPrice, double askPrice, int bidSize, int askSize, TickAttrib attribs) { }
+    public void tickByTickMidPoint(int reqId, long time, double midPoint) { }
 }

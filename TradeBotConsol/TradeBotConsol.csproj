@@ -12,6 +12,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <None Remove="Core\simback.txt" />
     <None Remove="watchlist.json" />
   </ItemGroup>
 
