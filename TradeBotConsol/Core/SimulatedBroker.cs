@@ -71,9 +71,9 @@ public class SimulatedBroker : IBroker
     public Action<int> OnOrderFailed;
 
     private const double RSI_HOOK_DROP = 5.0;
-    private const decimal dailyProfitGoalPct = 0.01m;
-    private const decimal dailyLossLimitPct = 0.03m;
-    private const int MaxActivePositions = 2;
+    private const decimal dailyProfitGoalPct = 0.025m;
+    private const decimal dailyLossLimitPct = 0.05m;
+    private const int MaxActivePositions = 3;
    
     private const decimal roundTripFee = 2.00m;
 
@@ -141,7 +141,7 @@ public class SimulatedBroker : IBroker
     private bool _eodEmailSent = false;
     private static readonly object _memoryFileLock = new object();
     private volatile bool _isSavingMemory = false;
-    private static readonly TimeSpan ObservationEnd = new TimeSpan(10, 30, 0);
+    private static readonly TimeSpan ObservationEnd = new TimeSpan(10, 00, 0);
     private HashSet<string> _syncedSymbols = new HashSet<string>();
     private Dictionary<string, bool> _lastTradeWasLoss = new Dictionary<string, bool>();
     private int _chopWarnings = 0;
@@ -529,12 +529,12 @@ public class SimulatedBroker : IBroker
         // Check if we already have a position or an order in-flight for this symbol
         if (!hasPosition && !_pendingOrders.ContainsKey(symbol))
         {
-            if (_positions.Count < 2 && _tradesExecutedToday < 3 && !_goalReached)
+            if (_positions.Count < 3 && _tradesExecutedToday < 10 && !_goalReached)
             {
                 var topLeaders = _raceScores.OrderByDescending(x => x.Value).Take(3).Select(x => x.Key).ToHashSet();
 
                 // Requirements: Top 3 Leader, Score >= 6.0, and Slope > 0.008
-                if (topLeaders.Contains(symbol) && currentScore >= 6.0 && slope > 0.008)
+                if (topLeaders.Contains(symbol) && currentScore >= 5.0 && slope > 0.006)
                 {
                     if (IsMarketSafe() && GetTrend(_priceHistory[symbol]) != "BEAR")
                     {
@@ -553,23 +553,26 @@ public class SimulatedBroker : IBroker
             var pos = _positions[symbol];
             pos.CurrentPrice = _priceHistory[symbol].Last();
 
-            double secondsHeld = (DateTime.UtcNow - pos.EntryTime).TotalSeconds;
-            if (secondsHeld < 15) return; // Prevent immediate "micro-flips"
-
-            double rsi = CalculateRSI(symbol);
+            // 1. Hard Stop Loss (MUST be checked before any timers)
             decimal atr = GetATR(symbol);
-
-            // A. Hard Stop Loss (1.5x ATR)
             if (pos.CurrentPrice < pos.AvgPrice - (atr * 1.5m))
             {
-                SubmitOrder(symbol, pos.Quantity, pos.CurrentPrice, TradeSide.Sell, rsi);
+                // Use "MKT" for emergency stops to ensure immediate fill
+                SubmitOrder(symbol, pos.Quantity, pos.CurrentPrice, TradeSide.Sell, CalculateRSI(symbol), "MKT");
+                return;
             }
-            // B. Dynamic Exit (RSI Hook or Trailing Stop after 3 minutes)
-            else if (secondsHeld > 180)
+
+            // 2. Minimum Holding Time (Now only applies to "Smart" exits)
+            double secondsHeld = (DateTime.UtcNow - pos.EntryTime).TotalSeconds;
+            if (secondsHeld < 15) return;
+
+            // 3. Dynamic Exit (RSI Hook or Trailing Stop)
+            double rsi = CalculateRSI(symbol);
+            if (secondsHeld > 180) // After 3 minutes, enable tighter exit rules
             {
                 if (rsi < 45 || pos.CurrentPrice < pos.TrailingStop)
                 {
-                    SubmitOrder(symbol, pos.Quantity, pos.CurrentPrice, TradeSide.Sell, rsi);
+                    SubmitOrder(symbol, pos.Quantity, pos.CurrentPrice, TradeSide.Sell, rsi, "LMT");
                 }
             }
         }
@@ -680,7 +683,24 @@ public class SimulatedBroker : IBroker
             ExecuteTradeLogic(symbol);
         }
     }
+    public void CheckImmediateStops(string symbol, decimal currentPrice)
+    {
+        lock (_lock)
+        {
+            if (_positions.TryGetValue(symbol, out var pos))
+            {
+                pos.CurrentPrice = currentPrice;
+                decimal atr = GetATR(symbol);
 
+                // Instant Hard Stop - No 5-second waiting
+                if (currentPrice < pos.AvgPrice - (atr * 1.5m))
+                {
+                    Console.WriteLine($"[EMERGENCY] ATR Stop Hit for {symbol} at {currentPrice}");
+                    SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, 0, "MKT");
+                }
+            }
+        }
+    }
     public void PrintStatusTable()
     {
         var sb = new System.Text.StringBuilder();

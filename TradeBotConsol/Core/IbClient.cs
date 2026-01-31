@@ -27,7 +27,7 @@ public class IbClient : EWrapper, IBroker
 
  
     private int _currentReqId = 1000;
-
+    public bool _isReady = false; // Add this field
     private readonly Dictionary<string, long> _currentVolumeBatch = new();
 
     private readonly ConcurrentDictionary<string, decimal> _currentPriceBatch = new();
@@ -100,50 +100,16 @@ public class IbClient : EWrapper, IBroker
         }
     }
 
-    public void nextValidId(int orderId) => _currentOrderId = orderId; // FIX 7
-
-    public void historicalData(int reqId, Bar bar)
-    {
-        if (_reqIdToSymbol.TryGetValue(reqId, out var symbol))
-            _broker.ProcessHistoricalBar(symbol, (decimal)bar.Close, bar.Volume);
-    }
-
-    // FIX: tickPrice now only stores the latest price; it does NOT trigger the strategy
-    public void tickPrice(int tickerId, int field, double price, TickAttrib attribs)
-    {
-        // field 4 = Last, 1 = Bid, 2 = Ask, 68 = Delayed Last, 9 = Close
-        if ((field == 4 || field == 1 || field == 2 || field == 68 || field == 9) && price > 0)
-        {
-            if (_reqIdToSymbol.TryGetValue(tickerId, out var symbol))
-            {
-                _currentPriceBatch[symbol] = (decimal)price;
-                // No UpdateHistory call here!
-            }
-        }
-    }
-
-    // FIX: tickSize is now the SOLE entry point for trade data
-    public void tickSize(int tickerId, int field, int size)
-    {
-        // field 8 = Volume (Cumulative), field 5 = Last Size (Individual trade)
-        if (field == 5 && _reqIdToSymbol.TryGetValue(tickerId, out var symbol))
-        {
-            if (_currentPriceBatch.TryGetValue(symbol, out var lastPrice))
-            {
-                // This is the ONLY place that should push data to the broker
-                _broker.UpdateHistory(symbol, lastPrice, (long)size);
-            }
-        }
-    }
-
-    // FIX: Centralize Order ID generation to prevent ID conflicts
-    private int GetNextOrderId()
-    {
-        return Interlocked.Increment(ref _currentOrderId);
-    }
-
+    // 1. Update SubmitOrder to return the ID so the Broker knows it immediately
     public void SubmitOrder(string symbol, int qty, decimal price, TradeSide side, double rsi = 0, string type = "LMT")
     {
+        // FIX: Check if the bot has received nextValidId from IBKR
+        if (!_isReady)
+        {
+            Console.WriteLine($"[REJECTED] Cannot trade {symbol}. Bot not synced with IBKR.");
+            return ; // Return -1 instead of void return
+        }
+
         var contract = new Contract { Symbol = symbol, SecType = "STK", Exchange = "SMART", Currency = "USD" };
         var order = new Order
         {
@@ -151,13 +117,61 @@ public class IbClient : EWrapper, IBroker
             OrderType = type,
             TotalQuantity = qty,
             LmtPrice = (double)Math.Round(price, 2),
-            Tif = "GTC" // Recommended: Add Good-Til-Cancelled
+            Tif = "GTC"
         };
 
-        int id = GetNextOrderId(); // Use the central generator
+        int id = GetNextOrderId();
         _broker.RegisterLiveOrder(id, symbol, side, qty);
         _client.placeOrder(id, contract, order);
     }
+
+    // 2. Ensure nextValidId actually initializes the counter correctly
+    public void nextValidId(int orderId)
+    {
+        // If the server's ID is higher than our -1, sync it.
+        Interlocked.Exchange(ref _currentOrderId, orderId);
+    }
+    public void historicalData(int reqId, Bar bar)
+    {
+        if (_reqIdToSymbol.TryGetValue(reqId, out var symbol))
+            _broker.ProcessHistoricalBar(symbol, (decimal)bar.Close, bar.Volume);
+    }
+
+    // FIX: tickPrice now only stores the latest price; it does NOT trigger the strategy
+    // 1. tickSize now ONLY updates the volume batch
+    public void tickSize(int tickerId, int field, int size)
+    {
+        if (field == 5 && _reqIdToSymbol.TryGetValue(tickerId, out var symbol))
+        {
+            // Store the size so the next price tick can use it
+            _currentVolumeBatch[symbol] = (long)size;
+        }
+    }
+
+    // 2. tickPrice now carries the weight of triggering the strategy
+    public void tickPrice(int tickerId, int field, double price, TickAttrib attribs)
+    {
+        if (field == 4 && price > 0) // Field 4 is LAST PRICE
+        {
+            if (_reqIdToSymbol.TryGetValue(tickerId, out var symbol))
+            {
+                _currentPriceBatch[symbol] = (decimal)price;
+
+                // Get the volume we just stored in tickSize (or 0 if none)
+                _currentVolumeBatch.TryGetValue(symbol, out long lastSize);
+
+                // Trigger the broker logic using the latest price AND the latest size
+                _broker.UpdateHistory(symbol, (decimal)price, lastSize);
+            }
+        }
+    }
+    // FIX: Centralize Order ID generation to prevent ID conflicts
+    private int GetNextOrderId()
+    {
+        return Interlocked.Increment(ref _currentOrderId);
+    }
+
+
 
     public int SubmitEmergencyMarketSell(string symbol, int qty)
     {
