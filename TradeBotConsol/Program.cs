@@ -2,109 +2,111 @@
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Runtime.InteropServices;
 
 class Program
 {
     static void Main(string[] args)
     {
-        // 1. Initialize the "Brain" (PositionManager / SimulatedBroker)
         var broker = new SimulatedBroker();
-
-        // Load all persistent data from JSON files to prevent starting from zero
         broker.LoadMarketMemory();
         broker.LoadState();
 
-        // 2. Initialize the "Pipe" (IbClient) and link them
         var ibClient = new IbClient(broker);
         broker.RealBroker = ibClient;
 
-        // 3. Emergency Shutdown Hook
-        // Ensures your trade history and memory are saved even if the window is closed
-        AppDomain.CurrentDomain.ProcessExit += (s, e) => {
-            Console.WriteLine("\n[SYSTEM] Emergency shutdown! Saving state and memory...");
-            broker.SaveMarketMemory();
+        // Watchlist (NO QQQ duplication)
+        var watchList = broker._tradeableStars.Distinct().ToList();
+        broker.PreInitializeSymbols(watchList);
+
+        AppDomain.CurrentDomain.ProcessExit += (s, e) =>
+        {
+            Console.WriteLine("\n[SYSTEM] Saving state...");
             broker.SaveState();
         };
 
         try
         {
-            // 4. Connect to TWS/Gateway
-            Console.WriteLine("[SYSTEM] Connecting to IBKR TWS...");
+            Console.WriteLine("[SYSTEM] Connecting to IBKR...");
             ibClient.Connect();
 
-            // 5. Synchronization Wait
-            // We wait here to ensure we have the next valid Order ID before starting
+            // Wait for real IB handshake
             int timeout = 0;
             while (!ibClient._isReady && timeout < 50)
             {
-                Console.WriteLine("[SYSTEM] Waiting for IBKR synchronization...");
+                Console.WriteLine("[SYSTEM] Waiting for IBKR sync...");
                 Thread.Sleep(200);
                 timeout++;
             }
 
             if (!ibClient._isReady)
             {
-                Console.WriteLine("[CRITICAL] Could not sync with IBKR. Check if TWS is open.");
+                Console.WriteLine("[CRITICAL] Could not sync with IBKR. Is TWS / Gateway running?");
                 return;
             }
 
-            // 6. Start data requests
-            var watchList = broker._tradeableStars.Concat(new[] { "QQQ" }).Distinct().ToList();
+            Console.WriteLine("[SYSTEM] IBKR connected.");
+
+            // Request market data
             ibClient.InitializeUniverse(watchList);
 
-            Console.WriteLine("\n" + new string('=', 60));
-            Console.WriteLine("STRATEGY ACTIVE | Dashboard Running | Press [ENTER] to Exit.");
-            Console.WriteLine(new string('=', 60) + "\n");
+            // Allow data to seed before dashboard
+            Thread.Sleep(5000);
+            Console.Clear();
 
-            // 7. Decoupled Dashboard Task
-            // This runs on a separate thread so UI updates don't slow down trade execution
             CancellationTokenSource cts = new CancellationTokenSource();
-            Task.Run(async () => {
+
+            // Dashboard thread
+            Task.Run(async () =>
+            {
                 while (!cts.Token.IsCancellationRequested)
                 {
                     try
                     {
                         broker.PrintStatusTable();
                     }
-                    catch { /* Suppress UI-only errors */ }
-                    await Task.Delay(1000); // UI Refresh Rate
+                    catch { }
+
+                    await Task.Delay(1000);
                 }
             });
 
-            // 8. The Main Execution Loop (Lifecycle Management)
+            // Main control loop
             while (true)
             {
-                // A. Manage End-of-Day (Liquidation, Learning Save, Email)
+                if (!ibClient.IsConnected())
+                    break;
+
+                broker.CheckDailyGoal();
                 broker.CheckEndOfDayLiquidation();
 
-                // B. Check Profit Goals / Loss Halts
-                broker.CheckDailyGoal();
-
-                // NOTE: Trading logic (Entries/Stops) is NOT called here.
-                // It is now event-driven inside IbClient.tickPrice to ensure zero-latency.
-
-                // C. Manual Safe Exit
                 if (Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.Enter)
-                {
-                    cts.Cancel();
                     break;
-                }
 
-                Thread.Sleep(100); // High-resolution heartbeat
+                Thread.Sleep(500);
             }
+
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[CRITICAL ERROR] {ex.Message}\n{ex.StackTrace}");
+            Console.WriteLine($"[CRITICAL] {ex.Message}");
         }
         finally
         {
-            // 9. Graceful Exit
-            Console.WriteLine("[SYSTEM] Shutting down gracefully...");
-            broker.SaveMarketMemory();
-            broker.SaveState();
+            Console.WriteLine("[SYSTEM] Disconnecting...");
             ibClient.Disconnect();
-            Console.WriteLine("[EXIT] Connection closed. Data saved. Goodbye!");
         }
+    }
+
+    private static DateTime GetEasternTime()
+    {
+        string tzId = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? "Eastern Standard Time"
+            : "America/New_York";
+
+        return TimeZoneInfo.ConvertTimeFromUtc(
+            DateTime.UtcNow,
+            TimeZoneInfo.FindSystemTimeZoneById(tzId)
+        );
     }
 }
