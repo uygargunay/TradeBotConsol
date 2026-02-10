@@ -6,53 +6,39 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Mail;
-using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
+
+// --- DATA STRUCTURES ---
+public class Candle
+{
+    public DateTime Time { get; set; }
+    public decimal Open { get; set; }
+    public decimal High { get; set; }
+    public decimal Low { get; set; }
+    public decimal Close { get; set; }
+    public long Volume { get; set; }
+}
 
 public interface IBroker
 {
     void SubmitOrder(string symbol, int qty, decimal price, TradeSide side, double currentRsi = 0, string orderType = "LMT");
-    bool TryDequeueIbLog(out string log);
+    void RequestHistoricalData(string symbol);
 }
 
 public enum TradeSide { Buy, Sell }
-public enum OrderLifeState
-{
-    Submitted,
-    PartiallyFilled,
-    Filled,
-    Cancelled,
-    Rejected
-}
 
 public class SimPosition
 {
     public string Symbol { get; set; }
-    public int Quantity { get; set; } // CHANGED TO INT
+    public int Quantity { get; set; }
     public decimal AvgPrice { get; set; }
     public decimal TrailingStop { get; set; }
+    public decimal HighWaterMark { get; set; }
     public decimal CurrentPrice { get; set; }
-    public decimal RealizedPnL { get; set; }
-    public decimal UnrealizedPnL => Quantity * (CurrentPrice - AvgPrice);
-    public bool IsBreakEvenProtected { get; set; }
     public DateTime EntryTime { get; set; } = DateTime.UtcNow;
-}
-
-public class BotPersistData
-{
-    public Dictionary<string, SimPosition> Positions { get; set; } = new();
-    public int TradesExecutedToday { get; set; }
-    public int DailyLossCount { get; set; }
-    public decimal RealizedPnLTotal { get; set; }
-    public decimal StartingDayEquity { get; set; }
-    public Dictionary<string, int> TradesPerSymbol { get; set; } = new();
-    public ConcurrentDictionary<string, DateTime> BuyTimes = new ConcurrentDictionary<string, DateTime>();
-
-    public ConcurrentDictionary<string, List<decimal>> PriceHistory { get; set; } = new();
-    public ConcurrentDictionary<string, List<long>> VolumeHistory { get; set; } = new();
-    public Dictionary<string, DateTime> LastSellTimes { get; set; } = new();
-    public Dictionary<string, bool> LastTradeWasLoss { get; set; } = new();
+    public decimal UnrealizedPnL(decimal price) => Quantity * (price - AvgPrice);
 }
 
 public class TrackedOrder
@@ -61,224 +47,286 @@ public class TrackedOrder
     public string Symbol;
     public TradeSide Side;
     public int Qty;
-    public int FilledQty;
-    public DateTime Time;
-    public OrderLifeState State;
 }
 
-public class SimulatedBroker : IBroker
+public class BotPersistData
+{
+    public Dictionary<string, SimPosition> Positions { get; set; } = new();
+    public decimal TotalPnL { get; set; }
+}
+
+public class SimulatedBroker
 {
     public IBroker RealBroker { get; set; }
-    public Action<int> OnOrderFailed;
+    private readonly object _lock = new object();
 
-    private const double RSI_HOOK_DROP = 5.0;
-    private const decimal dailyProfitGoalPct = 0.025m;
-    private const decimal dailyLossLimitPct = 0.05m;
-    private const int MaxActivePositions = 3;
-   
-    private const decimal roundTripFee = 2.00m;
+    // --- YOUR PREDEFINED RULES ---
+    private const decimal TOTAL_BUDGET = 4000m;    // Total Capital
+    private const int MAX_POSITIONS = 2;           // Max 2 stocks at once
+    private const decimal POSITION_SIZE = 2000m;   // $2,000 per trade
+    private const int MIN_HOLD_SECONDS = 300;      // 5-minute minimum hold (No flip-flopping)
+    private const decimal DAILY_PROFIT_GOAL = 300m;
+    private const decimal MAX_DAILY_LOSS = -150m;
+    private const int COOLDOWN_SECONDS = 600;      // 10 mins before re-entering same symbol
 
-    public bool IsHalted => _haltNewTrades;
-    public bool GoalReached => _goalReached;
-
-    private readonly ConcurrentDictionary<string, List<decimal>> _priceHistory = new();
-    private readonly ConcurrentDictionary<string, List<long>> _volumeHistory = new();
-    private readonly Dictionary<string, SimPosition> _positions = new();
-    private readonly ConcurrentDictionary<string, bool> _pendingOrders = new();
+    // --- STATE ---
+    public readonly ConcurrentDictionary<string, List<Candle>> _marketData = new();
+    private Dictionary<string, SimPosition> _positions = new();
     private readonly ConcurrentDictionary<int, TrackedOrder> _ordersById = new();
+    private readonly List<string> _tradeHistoryLog = new();
+    private readonly Dictionary<string, DateTime> _lastTradeTime = new();
 
-    private bool _softTradeUsed = false;
-    private readonly ConcurrentQueue<string> _ibLogs = new();
-    protected int _dailyLossCount = 0;
-    private ConcurrentDictionary<string, Queue<(double score, DateTime time)>> _raceScoreHistory = new();
-    private decimal _startingDayEquity = 4000m;
     private decimal _totalRealizedPnL = 0m;
-    public readonly string[] _tradeableStars =
+    private int _tradesToday = 0;
+    private bool _haltTrading = false;
+    private bool _eodSent = false;
+    private readonly ConcurrentDictionary<string, decimal> _latestTick = new();
+
+    // --- EMAIL SETTINGS (FILL THESE IN) ---
+    private const string EmailFrom = "uygargunay@gmail.com";
+    private const string EmailTo = "uygargunay@gmail.com";
+    private const string EmailPassword = "sznd kafk nhec skqh";
+
+    public readonly string[] _watchlist =
     {
-        "NVDA", "AMD", "META", "AMZN", "GOOGL", "MSFT",
-        "TSLA", "SMCI", "ARM", "COIN", "MSTR",
-        "AVGO", "PANW", "CRWD", "NOW", "ADBE",
-        "NFLX", "PLTR", "SNOW", "SHOP", "UBER",
-        "MU","SOXL",
-        "MARA","RIOT",
-        "BABA","PDD",
-        "JPM","GS",
-        "QQQ"
-    };
+    "SPY",
+    "NVDA", "TSLA", "AMD", "META", "AMZN", "MSFT", "AAPL",
+    "NFLX", "COIN", "MARA", "ARM", "PLTR", "TSM", "MSTR", "SMCI"
+};
 
- 
-    private ConcurrentDictionary<string, double> _lastRsiMemory = new ConcurrentDictionary<string, double>();
-    private ConcurrentDictionary<string, long> _cumVolume = new();
-    private ConcurrentDictionary<string, decimal> _cumVwapProd = new();
-    private ConcurrentDictionary<string, DateTime> _symbolLastResetDate = new();
-
-    private ConcurrentDictionary<string, int> _symbolToOrderId = new();
-    protected readonly Dictionary<string, int> _tradesToday = new();
-    protected readonly Dictionary<string, DateTime> _lastSellTimes = new();
-    private readonly ConcurrentDictionary<string, DateTime> _buyTimes = new ConcurrentDictionary<string, DateTime>();
-    private readonly DateTime _botStartTime = DateTime.UtcNow;
-
-    private ConcurrentDictionary<string, DateTime> _ignoreSyncUntil = new();
-    private ConcurrentDictionary<string, DateTime> _lastPriceAdd = new();
-
-    private decimal _rollingPnL = 0m;
-    private int _rollingTrades = 0;
-    private const string SaveFilePath = "bot_state.json";
-    protected readonly object _lock = new object();
-
-    private int _tradesExecutedToday = 0;
-    private bool _haltNewTrades = false;
-    private bool _goalReached = false;
-    private volatile bool _killSwitchEngaged = false;
-    private volatile bool _emergencyExit = false;
-    private Dictionary<string, decimal> _learnedAvgVolume = new();
-    private const string MemoryFilePath = "market_memory.json";
-    private ConcurrentDictionary<string, double> _raceScores = new();
-    private ConcurrentDictionary<string, double> _lastRaceScores = new();
-    private ConcurrentDictionary<string, double> _peakRsi = new ConcurrentDictionary<string, double>();
-    private readonly ConcurrentDictionary<string, DateTime> _lastPriceUpdate = new();
-    protected readonly List<ClosedTrade> _tradeHistory = new();
-    private bool _hasSavedToday = false;
-    private bool _eodEmailSent = false;
-    private static readonly object _memoryFileLock = new object();
-    private volatile bool _isSavingMemory = false;
-    private static readonly TimeSpan ObservationEnd = new TimeSpan(10, 00, 0);
-    private HashSet<string> _syncedSymbols = new HashSet<string>();
-    private Dictionary<string, bool> _lastTradeWasLoss = new Dictionary<string, bool>();
-    private int _chopWarnings = 0;
-
-    public bool TryDequeueIbLog(out string log) => _ibLogs.TryDequeue(out log);
-
-    public class ClosedTrade
+    // --- MARKET DATA INGESTION ---
+    public void UpdateLiveTick(string symbol, decimal price, long size)
     {
-        public string Symbol { get; set; }
-        public decimal Profit { get; set; }
-        public DateTime ExitTime { get; set; }
-    }
-
-    public SimulatedBroker()
-    {
-        OnOrderFailed = HandleOrderFailure;
-    }
-
-    private void HandleOrderFailure(int orderId)
-    {
-        if (_ordersById.TryRemove(orderId, out var order))
+        try
         {
-            _symbolToOrderId.TryRemove(order.Symbol, out _);
-            _pendingOrders.TryRemove(order.Symbol, out _);
-            _softTradeUsed = false;
+            if (_haltTrading) return;
+
+            lock (_lock)
+            {
+                if (_positions.TryGetValue(symbol, out var pos))
+                    pos.CurrentPrice = price;
+            }
+
+            ManageCandles(symbol, price, size);
+            CheckExits(symbol, price);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[UpdateLiveTick ERROR] {symbol} -> {ex.Message}");
         }
     }
 
-    public bool TryGetTrackedOrder(int orderId, out TrackedOrder order)
+
+    public void AddCandle(string symbol, Candle candle)
     {
-        return _ordersById.TryGetValue(orderId, out order);
+        if (!_marketData.ContainsKey(symbol))
+            _marketData[symbol] = new List<Candle>();
+
+        var candles = _marketData[symbol];
+
+        // Avoid duplicates (same timestamp)
+        if (candles.Count == 0 || candles.Last().Time != candle.Time)
+            candles.Add(candle);
+
+        // Optional: keep last N candles to limit memory
+        if (candles.Count > 500)
+            candles.RemoveAt(0);
     }
 
-    private void CheckForStuckOrders()
+    private void ManageCandles(string symbol, decimal price, long size)
     {
-        foreach (var kv in _ordersById)
+        var candles = _marketData.GetOrAdd(symbol, _ => new List<Candle>());
+        var now = DateTime.UtcNow;
+        var barTime = new DateTime(now.Year, now.Month, now.Day, now.Hour, now.Minute / 5 * 5, 0);
+
+        lock (candles)
         {
-            var o = kv.Value;
-            if (o.State == OrderLifeState.Submitted && (DateTime.UtcNow - o.Time).TotalSeconds > 60)
+            if (candles.Count == 0 || candles.Last().Time != barTime)
             {
-                TriggerKillSwitch($"Order timeout: {o.Symbol}");
+                candles.Add(new Candle { Time = barTime, Open = price, High = price, Low = price, Close = price, Volume = size });
+                if (candles.Count > 5) // wait for 5+ candles before strategy
+                    ExecuteStrategy(symbol);
+            }
+
+            else
+            {
+                var current = candles.Last();
+                current.High = Math.Max(current.High, price);
+                current.Low = Math.Min(current.Low, price);
+                current.Close = price;
+                current.Volume += size;
             }
         }
     }
 
-    private void TriggerKillSwitch(string reason)
-    {
-        if (_killSwitchEngaged) return;
-        _killSwitchEngaged = true;
-        _haltNewTrades = true;
-        Console.WriteLine($"🚨 KILL SWITCH ENGAGED: {reason}");
-        Task.Run(() => LiquidateAll());
-    }
 
-    // ==========================================
-    // LOGIC RESTORED HERE
-    // ==========================================
-    private double RegimeBias()
-    {
-        if (!_priceHistory.TryGetValue("QQQ", out var qqq) || qqq.Count < 20) return 1;
-        string trend = GetTrend(qqq);
-        return trend == "BULL" ? 1.15 : trend == "BEAR" ? 0.75 : 1.0;
-    }
 
-    private double GetRaceSlope(string symbol)
+    // --- FULL EXECUTE STRATEGY ---
+    public void ExecuteStrategy(string symbol)
     {
-        if (!_raceScoreHistory.TryGetValue(symbol, out var q) || q.Count < 6)
-            return 0;
+        if (_haltTrading) return;
+        if (!_marketData.TryGetValue(symbol, out var candles) || candles.Count == 0) return;
 
-        lock (q)
+        lock (_lock)
         {
-            var arr = q.ToArray();
-            double sum = 0;
-            for (int i = 1; i < arr.Length; i++)
-                sum += (arr[i].score - arr[i - 1].score);
+            // Already in a position or max positions reached
+            if (_positions.ContainsKey(symbol) || _positions.Count >= MAX_POSITIONS) return;
 
-            return sum / (arr.Length - 1);
+            // Cooldown check
+            if (_lastTradeTime.TryGetValue(symbol, out var lastTime))
+                if ((DateTime.UtcNow - lastTime).TotalSeconds < COOLDOWN_SECONDS) return;
+
+            // Last candle
+            var lastCandle = candles.Last();
+            if (lastCandle == null) return;
+
+            // --- INDICATORS ---
+            decimal sma20 = SafeSMA(candles, 20);
+            decimal sma50 = SafeSMA(candles, 50);
+
+            // sma50 5 bars ago (use all available if <55)
+            var last55 = candles.Count >= 55 ? candles.Skip(candles.Count - 55).ToList() : new List<Candle>(candles);
+            decimal sma50_5ago = SafeSMA(last55, 50);
+
+            double rsi = SafeRSI(candles, 14);
+            decimal atr = SafeATR(candles, 14);
+            decimal atrPct = lastCandle.Close > 0 ? atr / lastCandle.Close : 0m;
+
+            decimal highest30 = SafeHighestHigh(candles, 30);
+            decimal highest10 = SafeHighestHigh(candles, 10);
+
+            bool isTrendUp = lastCandle.Close > sma50 && sma50 > sma50_5ago;
+
+            // Skip low-volatility ranges
+            if (atrPct < 0.004m) return;
+
+            // Resistance filter
+            bool resistanceOk = lastCandle.Close <= highest30 * 0.995m;
+
+            // SPY regime check
+            bool regimeOk = true;
+            if (_marketData.TryGetValue("SPY", out var spy) && spy.Count > 0)
+            {
+                decimal spySma50 = SafeSMA(spy, 50);
+                regimeOk = spy.Last().Close > spySma50;
+            }
+
+            // --- BUY CONDITIONS ---
+            bool buyDip =
+                regimeOk &&
+                isTrendUp &&
+                atrPct >= 0.004m &&
+                resistanceOk &&
+                lastCandle.Close > sma50 &&
+                rsi > 40 && rsi < 55;
+
+            bool buyBreakout =
+                regimeOk &&
+                isTrendUp &&
+                atrPct >= 0.004m &&
+                resistanceOk &&
+                lastCandle.Close > highest10 &&
+                candles.Count > 1 && candles[^2].Close > highest10 &&
+                rsi > 55 && rsi < 75;
+
+            if (buyDip || buyBreakout)
+            {
+                int qty = (int)(POSITION_SIZE / lastCandle.Close);
+                if (qty > 0)
+                {
+                    string note = buyDip ? "DIP_CONTINUATION" : "STRUCTURE_BREAKOUT";
+                    SubmitOrder(symbol, qty, lastCandle.Close, TradeSide.Buy, note);
+                }
+            }
         }
     }
 
-    private double CalculateRaceScore(string symbol)
+    private void CheckExits(string symbol, decimal currentPrice)
     {
-        if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count < 15) return 0;
-        if (!_volumeHistory.TryGetValue(symbol, out var volumes) || volumes.Count < 15) return 0;
-
-        decimal priceROC = (prices.Last() - prices[^6]) / prices[^6] * 100m;
-        if (volumes.Count < 10 || prices.Count < 10) return 0;
-        decimal avgVol = (decimal)volumes.Skip(volumes.Count - 10).Average();
-
-        decimal volExpansion = avgVol > 0 ? volumes.Last() / avgVol : 0;
-
-        double rawScore = (double)(priceROC * 25m) + (double)(volExpansion * 15m);
-        return Math.Max(0, rawScore);
-    }
-
-    public bool IsMarketSafe()
-    {
-        if (!_priceHistory.TryGetValue("QQQ", out var qqq) || qqq.Count < 100)
-            return true;
-
-        var shortAvg = qqq.Skip(qqq.Count - 20).Average();
-        var longAvg = qqq.Skip(qqq.Count - 100).Average();
-
-        return shortAvg >= longAvg;
-    }
-
-
-    public decimal GetTotalEquity()
-    {
-        decimal equity = _startingDayEquity + _totalRealizedPnL;
-        foreach (var pos in _positions.Values)
-            equity += pos.UnrealizedPnL;
-        return equity;
-    }
-    private void UpdateRaceHistory(string symbol, double score)
-    {
-        var q = _raceScoreHistory.GetOrAdd(symbol, _ => new Queue<(double, DateTime)>());
-        lock (q)
+        lock (_lock)
         {
-            q.Enqueue((score, DateTime.UtcNow));
-            if (q.Count > 10) q.Dequeue();
+            if (!_positions.TryGetValue(symbol, out var pos)) return;
+
+            // Minimum 2 minutes hold
+            double secondsHeld = (DateTime.UtcNow - pos.EntryTime).TotalSeconds;
+            if (secondsHeld < 120) return;
+
+            pos.HighWaterMark = Math.Max(pos.HighWaterMark, currentPrice);
+            decimal gainPct = pos.AvgPrice > 0 ? (currentPrice - pos.AvgPrice) / pos.AvgPrice : 0m;
+
+            // 1. HARD STOP LOSS (-1.5%) - Always active
+            if (gainPct <= -0.015m)
+            {
+                SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, "HARD_STOP");
+                return;
+            }
+
+            // 2. STRATEGIC EXITS - Only after minimum hold
+            if (secondsHeld > MIN_HOLD_SECONDS)
+            {
+                // Profit target trailing exit (drop 0.5% from high)
+                if (gainPct > 0.02m && currentPrice < pos.HighWaterMark * 0.995m)
+                {
+                    SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, "TRAILING_TAKE_PROFIT");
+                    return;
+                }
+
+                // Exit if trend breaks (Price below SMA20)
+                if (_marketData.TryGetValue(symbol, out var candles) && candles.Count > 0)
+                {
+                    decimal sma20 = SafeSMA(candles, 20);
+                    if (currentPrice < sma20 && gainPct > 0.005m)
+                    {
+                        SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, "TREND_EXIT_PROFIT");
+                        return;
+                    }
+                }
+
+                // Optional: exit if volatility collapsed (ATR very low)
+                if (_marketData.TryGetValue(symbol, out var volsCandles) && volsCandles.Count > 0)
+                {
+                    decimal atr = SafeATR(volsCandles, 14);
+                    decimal atrPct = currentPrice > 0 ? atr / currentPrice : 0m;
+                    if (atrPct < 0.004m)
+                    {
+                        SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, "VOLATILITY_EXIT");
+                        return;
+                    }
+                }
+            }
         }
     }
-    // ==========================================
-    // TRADE EXECUTION (FIXED)
-    // ==========================================
-    private decimal GetATR(string symbol, int period = 14)
+
+    // --- PERSISTENCE ---
+    public void SaveState()
     {
-        if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count < period + 1)
-            return 0;
+        try
+        {
+            var data = new BotPersistData { Positions = _positions, TotalPnL = _totalRealizedPnL };
+            File.WriteAllText("bot_state.json", JsonSerializer.Serialize(data));
+        }
+        catch { }
+    }
 
-        decimal atr = 0;
-        for (int i = prices.Count - period; i < prices.Count; i++)
-            atr += Math.Abs(prices[i] - prices[i - 1]);
+    public void LoadState()
+    {
+        if (File.Exists("bot_state.json"))
+        {
+            try
+            {
+                var data = JsonSerializer.Deserialize<BotPersistData>(File.ReadAllText("bot_state.json"));
+                if (data != null) { _positions = data.Positions; _totalRealizedPnL = data.TotalPnL; }
+            }
+            catch { }
+        }
+    }
 
-        return atr / period;
+    // --- ORDER MANAGEMENT ---
+    public void SubmitOrder(string symbol, int qty, decimal price, TradeSide side, string note, string type = "LMT")
+    {
+        if (RealBroker == null) return;
+        RealBroker.SubmitOrder(symbol, qty, price, side, 0, type);
+        Console.WriteLine($"[ORDER] {note} -> {side} {symbol} x {qty} @ {price}");
     }
 
     public void RegisterLiveOrder(int orderId, string symbol, TradeSide side, int qty)
@@ -286,628 +334,334 @@ public class SimulatedBroker : IBroker
         _ordersById[orderId] = new TrackedOrder { OrderId = orderId, Symbol = symbol, Side = side, Qty = qty };
     }
 
-    public void UpdateHistory(string symbol, decimal price, long volume)
+    public void OnOrderFilled(int orderId, int fillQty, decimal fillPrice)
     {
-        // Step 1: Manage data (throttled logic)
-        ManagePriceData(symbol, price, volume);
+        if (!_ordersById.TryRemove(orderId, out var order)) return;
 
-        // Step 2: Immediate checks (Stop Loss)
-        CheckImmediateStops(symbol, price);
-    }
+        string subject = ""; string body = "";
 
-    private void ManagePriceData(string symbol, decimal price, long volume)
-    {
-        var lastTime = _lastPriceUpdate.GetOrAdd(symbol, DateTime.MinValue);
-
-        // FIX 1: Safety check. Ensure list exists and has elements before checking .Last()
-        bool hasHistory = _priceHistory.TryGetValue(symbol, out var historyList);
-        bool isFirstTick = hasHistory && historyList.Count > 0 && historyList.Last() == 0;
-
-        // FIX 2: Use 1 second for faster updates (as you requested), or immediate if it's the first tick
-        if (isFirstTick || (DateTime.UtcNow - lastTime).TotalSeconds >= 1)
-        {
-            var prices = _priceHistory.GetOrAdd(symbol, _ => new List<decimal>());
-            var vols = _volumeHistory.GetOrAdd(symbol, _ => new List<long>());
-
-            lock (prices)
-            {
-                // FIX 3: Remove the "Dummy 0" placeholder if it exists
-                if (prices.Count > 0 && prices[0] == 0)
-                {
-                    prices.RemoveAt(0);
-                    // Also remove corresponding dummy volume if it exists
-                    if (vols.Count > 0) vols.RemoveAt(0);
-                }
-
-                if (price > 0) prices.Add(price);
-                vols.Add(volume);
-
-                // Keep memory manageable (rolling window of 300 data points)
-                if (prices.Count > 300)
-                {
-                    prices.RemoveAt(0);
-                    vols.RemoveAt(0);
-                }
-            }
-
-            // FIX 4: CRITICAL - Update Cumulative Volume for "Learning"
-            // This ensures market_memory.json actually updates at the end of the day
-            _cumVolume.AddOrUpdate(symbol, volume, (key, existingVal) => existingVal + volume);
-
-            _lastPriceUpdate[symbol] = DateTime.UtcNow;
-            ExecuteTradeLogic(symbol);
-        }
-    }
-
-    public void SubmitOrder(string symbol, int qty, decimal price, TradeSide side, double rsi = 0, string type = "LMT")
-    {
-        // FIX 8 & Reviewer logic: Block shorts
-        if (side == TradeSide.Sell && !_positions.ContainsKey(symbol)) return;
-
-        if (_pendingOrders.TryAdd(symbol, true))
-        {
-            RealBroker?.SubmitOrder(symbol, qty, price, side, rsi, type);
-        }
-    }
-    public void OnOrderFilled(int orderId, int filledQty, decimal avgFillPrice)
-    {
         lock (_lock)
         {
-            if (!_ordersById.TryGetValue(orderId, out var order)) return;
-
             if (order.Side == TradeSide.Buy)
             {
-                if (!_positions.TryGetValue(order.Symbol, out var pos))
+                var pos = new SimPosition
                 {
-                    // 🔥 FIX: Initialize Trailing Stop and Position Metadata
-                    _positions[order.Symbol] = new SimPosition
-                    {
-                        Symbol = order.Symbol,
-                        Quantity = filledQty,
-                        AvgPrice = avgFillPrice,
-                        EntryTime = DateTime.UtcNow,
-                        TrailingStop = avgFillPrice - (GetATR(order.Symbol) * 1.5m)
-                    };
-
-                    // 🔥 FIX: Increment daily counter to enforce the 3-trade limit
-                    _tradesExecutedToday++;
-                }
-                else
-                {
-                    // Handle adding to an existing position
-                    pos.AvgPrice = ((pos.AvgPrice * pos.Quantity) + (avgFillPrice * filledQty)) / (pos.Quantity + filledQty);
-                    pos.Quantity += filledQty;
-                }
-
-                LogTradeToCSV(order.Symbol, "BUY", avgFillPrice, 0, CalculateRSI(order.Symbol), false);
-                _ = SendEmailNotification($"🚀 BUY: {order.Symbol}", $"Bought {filledQty} at {avgFillPrice:C2}");
+                    Symbol = order.Symbol,
+                    Quantity = fillQty,
+                    AvgPrice = fillPrice,
+                    HighWaterMark = fillPrice,
+                    CurrentPrice = fillPrice,
+                    EntryTime = DateTime.UtcNow
+                };
+                _positions[order.Symbol] = pos;
+                _tradesToday++;
+                subject = $"🚀 BUY: {order.Symbol} x {fillQty} @ {fillPrice:C2}";
+                body = $"Bought {fillQty} @ {fillPrice:C2}";
             }
-            else // SELL
+            else
             {
                 if (_positions.TryGetValue(order.Symbol, out var pos))
                 {
-                    decimal profit = (avgFillPrice - pos.AvgPrice) * filledQty;
-                    _totalRealizedPnL += profit;
-
-                    _tradeHistory.Add(new ClosedTrade { Symbol = order.Symbol, Profit = profit, ExitTime = DateTime.Now });
-
-                    LogTradeToCSV(order.Symbol, "SELL", avgFillPrice, profit, CalculateRSI(order.Symbol), false);
-                    _ = SendEmailNotification($"💰 SELL: {order.Symbol}", $"Sold at {avgFillPrice:C2}. Profit: {profit:C2}");
-
-                    pos.Quantity -= filledQty;
-                    if (pos.Quantity <= 0) _positions.Remove(order.Symbol);
+                    decimal pnl = (fillPrice - pos.AvgPrice) * fillQty;
+                    _totalRealizedPnL += pnl;
+                    _positions.Remove(order.Symbol);
+                    _lastTradeTime[order.Symbol] = DateTime.UtcNow;
+                    subject = $"💰 SELL: {order.Symbol} x {fillQty} @ {fillPrice:C2} | PnL: {pnl:C2}";
+                    body = $"Sold {fillQty} @ {fillPrice:C2}\nPnL: {pnl:C2}";
                 }
             }
 
-            // Clear pending flag so the symbol is eligible for trading again later
-            _pendingOrders.TryRemove(order.Symbol, out _);
+            // Log trade
+            string logLine = order.Side == TradeSide.Buy ?
+                $"[{DateTime.Now:HH:mm:ss}] BUY  {order.Symbol} x {fillQty} @ {fillPrice:C2}" :
+                $"[{DateTime.Now:HH:mm:ss}] SELL {order.Symbol} x {fillQty} @ {fillPrice:C2}";
+
+            _tradeHistoryLog.Add(logLine);
+            if (_tradeHistoryLog.Count > 50) _tradeHistoryLog.RemoveAt(0); // keep last 50 trades
+
+            // Print log below dashboard
+            Console.SetCursorPosition(0, 22 + _tradeHistoryLog.Count - 1);
+            Console.ForegroundColor = order.Side == TradeSide.Buy ? ConsoleColor.Green : ConsoleColor.Red;
+            Console.WriteLine(logLine);
+            Console.ResetColor();
+
+            Task.Run(() => SendEmail(subject, body));
         }
+
+        CheckDailyLimits();
+        SaveState();
     }
 
-    public void NotifyOrderFailed(int orderId, string reason)
-    {
-        if (_ordersById.TryRemove(orderId, out var order))
-        {
-            _symbolToOrderId.TryRemove(order.Symbol, out _);
-            _pendingOrders.TryRemove(order.Symbol, out _);
-        }
-        Console.WriteLine($"[ORDER FAIL] {reason}");
-        //_haltNewTrades = true;
-        _softTradeUsed = false;
-    }
-
-    // ==========================================
-    // DATA & CALC HELPERS (RESTORED)
-    // ==========================================
-    protected double CalculateRSI(string symbol, int period = 14)
-    {
-        if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count <= period + 5)
-            return 50;
-
-        decimal avgGain = 0, avgLoss = 0;
-        for (int i = prices.Count - period; i < prices.Count; i++)
-        {
-            decimal diff = prices[i] - prices[i - 1];
-            if (diff > 0) avgGain += diff; else avgLoss -= diff;
-        }
-        if (avgLoss == 0) return 100;
-        return 100 - (100 / (1 + (double)(avgGain / avgLoss)));
-    }
-
-
-    private string GetTrend(List<decimal> prices)
-    {
-       
-
-        if (prices == null || prices.Count < 20) return "WAIT";
-
-        int n = 15;
-        var recent = prices.Skip(prices.Count - n).ToList();
-        decimal slope = 0;
-        for (int i = 1; i < recent.Count; i++)
-            slope += recent[i] - recent[i - 1];
-
-        slope /= n;
-
-        if (slope > recent.Average() * 0.001m) return "BULL";
-        if (slope < -recent.Average() * 0.002m) return "BEAR";
-        return "FLAT";
-    }
-
-    private double TimeOfDayMultiplier()
-    {
-        var ny = GetEasternTime().TimeOfDay;
-        if (ny < new TimeSpan(10, 15, 0)) return 1.3;
-        if (ny < new TimeSpan(11, 30, 0)) return 1.0;
-        if (ny < new TimeSpan(13, 30, 0)) return 0.7;
-        return 0.5;
-    }
-
-    private decimal GetEntryThrottle()
-    {
-        decimal pct = (_startingDayEquity > 0) ? (_totalRealizedPnL / _startingDayEquity) : 0;
-        if (pct > 0.007m) return 0.5m;
-        if (pct > 0.009m) return 0.25m;
-        if (_chopWarnings >= 2) return 0.5m;
-        if (_chopWarnings >= 3) return 0.25m;
-        return 1.0m;
-    }
-
-    private decimal GetVolatilityAdjustedLoss(string symbol)
-    {
-        if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count < 20) return -6m;
-        decimal atr = prices.Skip(prices.Count - 14).Zip(prices.Skip(prices.Count - 15), (c, p) => Math.Abs(c - p)).Average();
-        return -Math.Max(6m, atr * 1.8m);
-    }
-
-    public void SyncFromIB(string symbol, int realQty, decimal avgPrice)
-    {
-        lock (_positions)
-        {
-            if (realQty == 0) _positions.Remove(symbol);
-            else _positions[symbol] = new SimPosition { Symbol = symbol, Quantity = realQty, AvgPrice = avgPrice };
-        }
-    }
-    // ==========================================
-    // BOILERPLATE (Load/Save, Printing, Sync)
-    // ==========================================
-    public void LoadMarketMemory()
+    private void LogToCsv(string symbol, string side, decimal price, decimal pnl)
     {
         try
         {
-            lock (_memoryFileLock)
-            {
-                if (File.Exists(MemoryFilePath))
-                {
-                    string json = File.ReadAllText(MemoryFilePath);
-                    _learnedAvgVolume = JsonSerializer.Deserialize<Dictionary<string, decimal>>(json) ?? new Dictionary<string, decimal>();
-                    Console.WriteLine($"[SYSTEM] Memory Loaded: {_learnedAvgVolume.Count} symbols.");
-                }
-            }
-        }
-        catch (Exception ex) { Console.WriteLine($"[ERROR] Load memory: {ex.Message}"); }
-    }
-
-    public void SaveMarketMemory()
-    {
-        if (_isSavingMemory) return;
-        _isSavingMemory = true;
-        try
-        {
-            foreach (var symbol in _tradeableStars)
-            {
-                if (_cumVolume.TryGetValue(symbol, out long todayVol))
-                {
-                    decimal todaysVolDecimal = (decimal)todayVol;
-                    if (!_learnedAvgVolume.ContainsKey(symbol)) _learnedAvgVolume[symbol] = todaysVolDecimal;
-                    else _learnedAvgVolume[symbol] = (_learnedAvgVolume[symbol] * 0.9m) + (todaysVolDecimal * 0.1m);
-                }
-            }
-            string json = JsonSerializer.Serialize(_learnedAvgVolume, new JsonSerializerOptions { WriteIndented = true });
-            lock (_memoryFileLock) { File.WriteAllText(MemoryFilePath, json); }
-            Console.WriteLine("[SYSTEM] Market memory saved.");
-        }
-        catch (Exception ex) { Console.WriteLine($"[ERROR] SaveMemory: {ex.Message}"); }
-        finally { _isSavingMemory = false; }
-    }
-
-    public void LoadState()
-    {
-        if (!File.Exists(SaveFilePath)) return;
-        try
-        {
-            var data = JsonSerializer.Deserialize<BotPersistData>(File.ReadAllText(SaveFilePath));
-            if (data == null) return;
-            _totalRealizedPnL = data.RealizedPnLTotal;
-            _tradesExecutedToday = data.TradesExecutedToday;
-            _startingDayEquity = data.StartingDayEquity;
-            _dailyLossCount = data.DailyLossCount;
-            foreach (var kv in data.Positions) _positions[kv.Key] = kv.Value;
-            foreach (var kv in data.PriceHistory) _priceHistory[kv.Key] = kv.Value;
-            foreach (var kv in data.VolumeHistory) _volumeHistory[kv.Key] = kv.Value;
-            foreach (var kv in data.LastSellTimes) _lastSellTimes[kv.Key] = kv.Value;
-            foreach (var kv in data.BuyTimes) _buyTimes[kv.Key] = kv.Value;
+            using (var sw = new StreamWriter("trades_log.csv", true))
+                sw.WriteLine($"{DateTime.Now},{symbol},{side},{price},{pnl}");
         }
         catch { }
     }
-    public void ExecuteTradeLogic(string symbol)
+
+    private void CheckDailyLimits()
     {
-        // 1. Safety Filters
-        double regime = RegimeBias();
-
-        if (_haltNewTrades || symbol == "QQQ") return;
-        if (!_priceHistory.ContainsKey(symbol) || _priceHistory[symbol].Count < 8) return;
-
-        var nyNow = GetEasternTime();
-        if (nyNow.TimeOfDay < new TimeSpan(9, 35, 0)) return;
-
-        if (nyNow.TimeOfDay > new TimeSpan(15, 30, 0)) return;
-
-        // 2. Momentum Calculation
-        double currentScore = CalculateRaceScore(symbol) * regime;
-
-        _raceScores[symbol] = currentScore;
-
-        // 🔥 FIX: Populate history so GetRaceSlope has data to calculate
-        UpdateRaceHistory(symbol, currentScore);
-        double slope = GetRaceSlope(symbol);
-
-        bool hasPosition = _positions.ContainsKey(symbol);
-
-        // 3. ENTRY LOGIC
-        // Check if we already have a position or an order in-flight for this symbol
-        if (!hasPosition && !_pendingOrders.ContainsKey(symbol))
+        if (_totalRealizedPnL >= DAILY_PROFIT_GOAL || _totalRealizedPnL <= MAX_DAILY_LOSS)
         {
-            if (_positions.Count < 3 && _tradesExecutedToday < 10 && !_goalReached)
-            {
-                if (GetTrend(_priceHistory[symbol]) != "BEAR"
-     && slope > 0.015        // was 0.05
-     && currentScore > 2.0) // was 4
-
-                {
-                    decimal currentPrice = _priceHistory[symbol].Last();
-                    int qty = (int)(3000m / currentPrice);
-
-                    if (_lastSellTimes.TryGetValue(symbol, out var lastSell))
-                        if ((DateTime.UtcNow - lastSell).TotalSeconds < 60) return;
-
-                    if (qty > 0)
-                        SubmitOrder(symbol, qty, currentPrice, TradeSide.Buy, CalculateRSI(symbol));
-                }
-
-            }
-        }
-        // 4. EXIT LOGIC
-        else if (hasPosition)
-        {
-            var pos = _positions[symbol];
-            pos.CurrentPrice = _priceHistory[symbol].Last();
-
-            // 1. Hard Stop Loss (MUST be checked before any timers)
-            decimal atr = GetATR(symbol);
-
-            // 2. Minimum Holding Time (Now only applies to "Smart" exits)
-            double secondsHeld = (DateTime.UtcNow - pos.EntryTime).TotalSeconds;
-            if (secondsHeld < 15) return;
-
-            // 3. Dynamic Exit (RSI Hook or Trailing Stop)
-            double rsi = CalculateRSI(symbol);
-            decimal gainPct = (pos.CurrentPrice - pos.AvgPrice) / pos.AvgPrice;
-
-
-            // --- EXIT LOGIC FIX ---
-            if (gainPct <= -0.03m || gainPct >= 0.012m)
-            {
-                SubmitOrder(symbol, pos.Quantity, pos.CurrentPrice, TradeSide.Sell, rsi, "MKT");
-                _lastSellTimes[symbol] = DateTime.UtcNow;
-                return;
-            }
-
-
+            _haltTrading = true;
+            string status = _totalRealizedPnL > 0 ? "GOAL REACHED" : "MAX LOSS HIT";
+            SendEmail($"🛑 TRADING HALTED: {status}", $"Final PnL: {_totalRealizedPnL:C2}");
         }
     }
-    public void SaveState()
+
+    public void CheckEndOfDay()
+    {
+        var now = GetEasternTime();
+        if (now.Hour == 15 && now.Minute >= 50 && !_eodSent)
+        {
+            _haltTrading = true;
+            foreach (var p in _positions.Values.ToList())
+                SubmitOrder(p.Symbol, p.Quantity, 0, TradeSide.Sell, "EOD_LIQUIDATE", "MKT");
+
+            if (now.Hour >= 16)
+            {
+                _eodSent = true;
+                string report = $"EOD PnL: {_totalRealizedPnL:C2}\nTrades: {_tradesToday}\n\nLog:\n" + string.Join("\n", _tradeHistoryLog);
+                SendEmail("📊 EOD PERFORMANCE REPORT", report);
+            }
+        }
+    }
+
+    // --- SAFE HELPERS ---
+    private decimal SafeSMA(List<Candle> candles, int period)
+    {
+        if (candles == null || candles.Count < period) return 0m;
+        return candles.TakeLast(period).Average(c => c.Close);
+    }
+
+    private double SafeRSI(List<Candle> candles, int period)
+    {
+        if (candles == null || candles.Count <= period) return 50.0;
+        double gain = 0, loss = 0;
+        for (int i = candles.Count - period + 1; i < candles.Count; i++)
+        {
+            double diff = (double)(candles[i].Close - candles[i - 1].Close);
+            if (diff > 0) gain += diff; else loss -= diff;
+        }
+        return loss == 0 ? 100 : 100 - (100 / (1 + (gain / loss)));
+    }
+
+    private decimal SafeATR(List<Candle> candles, int period)
+    {
+        if (candles == null || candles.Count <= period) return 0m;
+        decimal sum = 0;
+        for (int i = candles.Count - period + 1; i < candles.Count; i++)
+        {
+            var c = candles[i];
+            var prev = candles[i - 1];
+            decimal tr = Math.Max(c.High - c.Low,
+                          Math.Max(Math.Abs(c.High - prev.Close),
+                                   Math.Abs(c.Low - prev.Close)));
+            sum += tr;
+        }
+        return sum / period;
+    }
+
+    private decimal SafeHighestHigh(List<Candle> candles, int lookback)
+    {
+        if (candles == null || candles.Count < lookback) return 0m;
+        return candles.TakeLast(lookback).Max(c => c.High);
+    }
+
+    // --- REFACTORED DASHBOARD ---
+    public void PrintDetailedDashboard()
+    {
+        Console.Clear();
+        var now = DateTime.Now;
+
+        // --- HEADER ---
+        Console.WriteLine("┌────────────────────────────────────────────────────────────────────────────┐");
+        Console.WriteLine($"│ IBKR TRADING BOT │ {now:HH:mm:ss} │ PnL: {_totalRealizedPnL,8:C2} │ Budget: {_positions.Count * POSITION_SIZE + (_totalRealizedPnL >= 0 ? TOTAL_BUDGET : TOTAL_BUDGET + _totalRealizedPnL),7:C0} │");
+        Console.WriteLine("└────────────────────────────────────────────────────────────────────────────┘\n");
+
+        // --- ACTIVE POSITIONS ---
+        Console.WriteLine($"ACTIVE POSITIONS ({_positions.Count}/{MAX_POSITIONS}) | Available Cash: {(TOTAL_BUDGET - _positions.Count * POSITION_SIZE):C2}");
+        Console.WriteLine("┌────────┬─────┬─────────┬─────────┬─────────┬───────┬───────┬─────────┐");
+        Console.WriteLine("│ Symbol │ Qty │ Entry   │ Current │ PnL     │ PnL%  │ Hold  │ High    │");
+        Console.WriteLine("├────────┼─────┼─────────┼─────────┼─────────┼───────┼───────┼─────────┤");
+
+        if (_positions.Count == 0)
+            Console.WriteLine("│                       NO ACTIVE POSITIONS                                   │");
+        else
+        {
+            foreach (var p in _positions.Values)
+            {
+                double mins = (DateTime.UtcNow - p.EntryTime).TotalMinutes;
+                decimal pnl = p.UnrealizedPnL(p.CurrentPrice);
+                decimal pnlPct = p.AvgPrice > 0 ? (p.CurrentPrice - p.AvgPrice) / p.AvgPrice * 100 : 0;
+                Console.WriteLine($"│ {p.Symbol,-6} │ {p.Quantity,-3} │ {p.AvgPrice,7:C} │ {p.CurrentPrice,7:C} │ {pnl,7:C} │ {pnlPct,5:F1}% │ {mins,5:F0} │ {p.HighWaterMark,7:C} │");
+            }
+        }
+
+        Console.WriteLine("└────────┴─────┴─────────┴─────────┴─────────┴───────┴───────┴─────────┘\n");
+
+        // --- MARKET SCANNER ---
+        Console.WriteLine("MARKET SCANNER (RSI & Trend Signals)");
+        Console.WriteLine("┌────────┬─────────┬─────────┬─────────┬─────┬─────────┬─────────┬─────────────┐");
+        Console.WriteLine("│ Symbol │ Price   │ SMA20   │ SMA50   │ RSI │ Trend   │ Signal  │ RSI Heat    │");
+        Console.WriteLine("├────────┼─────────┼─────────┼─────────┼─────┼─────────┼─────────┼─────────────┤");
+
+        foreach (var sym in _watchlist)
+        {
+            _marketData.TryGetValue(sym, out var candles);
+            var last = candles != null && candles.Count > 0 ? candles.Last() : null;
+
+            decimal price = last?.Close ?? 0m;
+            decimal sma20 = SafeSMA(candles, 20);
+            decimal sma50 = SafeSMA(candles, 50);
+            double rsi = SafeRSI(candles, 14);
+            decimal atr = SafeATR(candles, 14);
+            decimal highest10 = SafeHighestHigh(candles, 10);
+            decimal highest30 = SafeHighestHigh(candles, 30);
+
+            string trend = price > sma50 ? "UP" : "NEUTRAL";
+            string signal = "WAIT";
+
+            bool isTrendUp = sma50 > SafeSMA(candles?.Take(Math.Max(0, candles.Count - 55)).ToList(), 50);
+            bool volOk = atr / Math.Max(price, 0.0001m) >= 0.004m;
+            bool resistanceOk = price <= highest30 * 0.995m;
+
+            bool regimeOk = true;
+            if (_marketData.TryGetValue("SPY", out var spy) && spy.Count >= 50)
+                regimeOk = spy.Last().Close > SafeSMA(spy, 50);
+
+            bool buyDip = regimeOk && isTrendUp && volOk && resistanceOk && price > sma50 && rsi > 40 && rsi < 55;
+            bool buyBreakout = regimeOk && isTrendUp && volOk && resistanceOk && price > highest10 && candles?.Count > 1 && candles[^2].Close > highest10 && rsi > 55 && rsi < 75;
+
+            if (buyDip) signal = "BUY DIP";
+            else if (buyBreakout) signal = "BUY BREAK";
+
+            int barLength = 10;
+            int fill = (int)Math.Round(rsi / 100.0 * barLength);
+            string heatBar = new string('█', fill) + new string(' ', barLength - fill);
+
+            Console.WriteLine($"│ {sym,-6} │ {price,7:C} │ {sma20,7:C} │ {sma50,7:C} │ {rsi,3:F0} │ {trend,-7} │ {signal,-7} │ {heatBar,-11} │");
+        }
+
+        Console.WriteLine("└────────┴─────────┴─────────┴─────────┴─────┴─────────┴─────────┴─────────────┘\n");
+
+        // --- RULES & STRATEGY ---
+        Console.WriteLine("RULES & STRATEGY");
+        Console.WriteLine($"Max Positions: {MAX_POSITIONS} | Position Size: {POSITION_SIZE:C} | Cooldown: {COOLDOWN_SECONDS / 60} min");
+        Console.WriteLine($"Hard Stop: -1.5% | Trail: 0.5% after +2% | Min Hold: {MIN_HOLD_SECONDS / 60} min\n");
+
+        // --- TRADE LOG ---
+        Console.WriteLine("TRADE LOG (recent 10 trades):");
+        var recent = _tradeHistoryLog.TakeLast(10).ToList();
+        if (!recent.Any())
+            Console.WriteLine("No trades yet.");
+        else
+            foreach (var log in recent)
+                Console.WriteLine(log);
+
+        Console.WriteLine("\n");
+    }
+
+
+    private double CalculateRSI(List<Candle> candles, int period)
+    {
+        if (candles.Count <= period) return 50;
+        double gain = 0, loss = 0;
+        for (int i = candles.Count - period + 1; i < candles.Count; i++)
+        {
+            double diff = (double)(candles[i].Close - candles[i - 1].Close);
+            if (diff > 0) gain += diff; else loss -= diff;
+        }
+        return loss == 0 ? 100 : 100 - (100 / (1 + (gain / loss)));
+    }
+
+    private DateTime GetEasternTime() => TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"));
+
+    public async Task SendEmail(string subject, string body)
     {
         try
         {
-            var data = new BotPersistData
-            {
-                Positions = _positions,
-                TradesExecutedToday = _tradesExecutedToday,
-                DailyLossCount = _dailyLossCount,
-                RealizedPnLTotal = _totalRealizedPnL,
-                StartingDayEquity = _startingDayEquity,
-                TradesPerSymbol = _tradesToday,
-                BuyTimes = _buyTimes,
-                PriceHistory = _priceHistory,
-                VolumeHistory = _volumeHistory,
-                LastSellTimes = _lastSellTimes,
-                LastTradeWasLoss = _lastTradeWasLoss
-            };
-            string json = JsonSerializer.Serialize(data, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(SaveFilePath, json);
+            var smtp = new SmtpClient("smtp.gmail.com") { Port = 587, EnableSsl = true, Credentials = new NetworkCredential(EmailFrom, EmailPassword) };
+            using var msg = new MailMessage(EmailFrom, EmailTo) { Subject = subject, Body = body };
+            await smtp.SendMailAsync(msg);
         }
-        catch (Exception ex) { Console.WriteLine($"[ERROR] Save state: {ex.Message}"); }
+        catch { }
     }
-
-    public void ProcessHistoricalBar(string symbol, decimal close, long volume)
+    // Add this inside the SimulatedBroker class in SimulatedBroker.cs
+    public void AddHistoricalCandle(string symbol, DateTime time, decimal open, decimal high, decimal low, decimal close, long vol)
     {
-        lock (_lock)
+        var candles = _marketData.GetOrAdd(symbol, _ => new List<Candle>());
+        lock (candles)
         {
-            if (!_priceHistory.ContainsKey(symbol))
+            if (!candles.Any(c => c.Time == time))
             {
-                _priceHistory[symbol] = new List<decimal>();
-                _volumeHistory[symbol] = new List<long>();
-            }
-            _priceHistory[symbol].Add(close);
-            _volumeHistory[symbol].Add(volume);
-            if (_priceHistory[symbol].Count > 300)
-            {
-                _priceHistory[symbol].RemoveAt(0);
-                _volumeHistory[symbol].RemoveAt(0);
-            }
-        }
-    }
-
-    public void CheckDailyGoal()
-    {
-        lock (_lock)
-        {
-            if (_goalReached || _haltNewTrades) return;
-            decimal currentEquity = GetTotalEquity();
-            decimal profitPercent = (currentEquity - _startingDayEquity) / _startingDayEquity;
-
-            if (profitPercent >= dailyProfitGoalPct)
-            {
-                _goalReached = true;
-                _haltNewTrades = true;
-                LiquidateAll();
-            }
-            else if (profitPercent <= (dailyLossLimitPct * -1))
-            {
-                _haltNewTrades = true;
-                LiquidateAll();
-            }
-        }
-    }
-
-    private void LiquidateAll()
-    {
-        if (_positions.Count == 0 || _emergencyExit) return;
-        _emergencyExit = true;
-
-        foreach (var kv in _positions.ToList())
-        {
-            var symbol = kv.Key;
-            var pos = kv.Value;
-            _pendingOrders.TryRemove(symbol, out _);
-
-            // Int Cast
-            int orderId = ((IbClient)RealBroker).SubmitEmergencyMarketSell(symbol, pos.Quantity);
-            RegisterLiveOrder(orderId, symbol, TradeSide.Sell, pos.Quantity);
-        }
-    }
-
-
-    public void CheckImmediateStops(string symbol, decimal currentPrice)
-    {
-        lock (_lock)
-        {
-            if (_positions.TryGetValue(symbol, out var pos))
-            {
-                pos.CurrentPrice = currentPrice;
-                decimal atr = GetATR(symbol);
-
-                // Instant Hard Stop - No 5-second waiting
-                if (currentPrice < pos.AvgPrice - (atr * 1.5m))
+                candles.Add(new Candle
                 {
-                    Console.WriteLine($"[EMERGENCY] ATR Stop Hit for {symbol} at {currentPrice}");
-                    SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, 0, "MKT");
-                }
+                    Time = time,
+                    Open = open,
+                    High = high,
+                    Low = low,
+                    Close = close,
+                    Volume = vol
+                });
+                // Keep them sorted by time
+                _marketData[symbol] = candles.OrderBy(c => c.Time).ToList();
             }
         }
     }
-    public void PrintStatusTable()
+    public void UpdateHistory(string symbol, decimal price, long size)
     {
-        var sb = new System.Text.StringBuilder();
-        int w = 110;
-
-        lock (_lock)
-        {
-            sb.AppendLine(new string('=', w));
-            sb.AppendLine($" BOT: {(_haltNewTrades ? "HALTED" : "ACTIVE")} | PnL: {_totalRealizedPnL:C2} | TRADES: {_tradesExecutedToday}/10 | POS: {_positions.Count}".PadRight(w));
-            sb.AppendLine(new string('-', w));
-            sb.AppendLine($"{"SYMBOL",-8} | {"PRICE",-10} | {"RSI",-6} | {"TREND",-6} | {"POSITION",-15} | {"PnL $",-10}");
-            sb.AppendLine(new string('-', w));
-
-            foreach (var symbol in _tradeableStars)
-
-            {
-                // FIX: Don't skip row if data is missing, just show "Loading"
-                if (!_priceHistory.TryGetValue(symbol, out var prices) || prices.Count == 0)
-                {
-                    sb.AppendLine($"{symbol,-8} | {"WAITING...",-10} | {"-",-6} | {"-",-6} | {"-",-15} | {"-",-10}");
-                    continue;
-                }
-
-                decimal last = prices.Last();
-                if (last == 0) // Placeholder data
-                {
-                    sb.AppendLine($"{symbol,-8} | {"LOADING...",-10} | {"-",-6} | {"-",-6} | {"-",-15} | {"-",-10}");
-                    continue;
-                }
-
-                double rsi = CalculateRSI(symbol);
-                string trend = GetTrend(prices);
-
-                string posStr = "---";
-                string pnlStr = "---";
-                if (_positions.TryGetValue(symbol, out var p))
-                {
-                    posStr = $"{p.Quantity}@{p.AvgPrice:F0}";
-                    pnlStr = ((last - p.AvgPrice) * p.Quantity).ToString("C2");
-                }
-
-                sb.AppendLine($"{symbol,-8} | {last,-10:C2} | {rsi,-6:F0} | {trend,-6} | {posStr,-15} | {pnlStr,-10}");
-            }
-        }
-        Console.SetCursorPosition(0, 0);
-        Console.Write(sb.ToString());
+        // This bridges the IB Client call to your existing logic
+        UpdateLiveTick(symbol, price, size);
     }
     public void PreInitializeSymbols(List<string> symbols)
     {
-        foreach (var s in symbols)
+        foreach (var sym in symbols)
         {
-            if (!_priceHistory.ContainsKey(s))
-                _priceHistory.TryAdd(s, new List<decimal>()); // NO ZERO
-        }
-    }
+            _marketData.TryAdd(sym, new List<Candle>());
 
-    private DateTime GetEasternTime()
-    {
-        string tzId = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "Eastern Standard Time" : "America/New_York";
-        return TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, TimeZoneInfo.FindSystemTimeZoneById(tzId));
-    }
-
-    public void ResetPositionSync() { _syncedSymbols.Clear(); }
-
-    public void SyncExistingPosition(string symbol, int qty, decimal avgPrice)
-    {
-        if (_ignoreSyncUntil.TryGetValue(symbol, out var until) && DateTime.UtcNow < until) return;
-        _syncedSymbols.Add(symbol);
-
-        if (qty == 0) { _positions.Remove(symbol); return; }
-
-        if (_positions.TryGetValue(symbol, out var pos))
-        {
-            pos.Quantity = qty;
-            pos.AvgPrice = avgPrice;
-        }
-        else
-        {
-            _positions[symbol] = new SimPosition
+            // Optional: add 1 fake candle to avoid nulls at startup
+            _marketData[sym].Add(new Candle
             {
-                Symbol = symbol,
-                Quantity = qty,
-                AvgPrice = avgPrice,
-                EntryTime = DateTime.UtcNow
-            };
+                Time = DateTime.UtcNow.AddMinutes(-5),
+                Open = 0m,
+                High = 0m,
+                Low = 0m,
+                Close = 0m,
+                Volume = 0
+            });
         }
     }
 
-    public void FinalizePositionSync()
-    {
-        var toRemove = _positions.Keys.Where(k => !_syncedSymbols.Contains(k)).ToList();
-        foreach (var sym in toRemove) _positions.Remove(sym);
-    }
 
-    public void CheckEndOfDayLiquidation()
-    {
-        var nyNow = GetEasternTime();
-        if (nyNow.TimeOfDay > new TimeSpan(15, 45, 0) && nyNow.TimeOfDay < new TimeSpan(16, 0, 0))
-        {
-            if (_positions.Count > 0) LiquidateAll();
-        }
-        if (nyNow.TimeOfDay >= new TimeSpan(16, 0, 0) && !_hasSavedToday)
-        {
-            SaveMarketMemory();
-            _hasSavedToday = true;
-        }
-    }
-
-    public async Task SendEmailNotification(string subject, string messageBody)
+    public void SaveMarketMemory()
     {
         try
         {
-            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-            var fromAddress = new MailAddress("uygargunay@gmail.com", "TradeBot Live");
-            var toAddress = new MailAddress("uygargunay@gmail.com");
-            const string fromPassword = "sznd kafk nhec skqh";
-
-            var smtp = new SmtpClient
-            {
-                Host = "smtp.gmail.com",
-                Port = 587,
-                EnableSsl = true,
-                DeliveryMethod = SmtpDeliveryMethod.Network,
-                UseDefaultCredentials = false,
-                Credentials = new NetworkCredential(fromAddress.Address, fromPassword),
-                Timeout = 10000
-            };
-
-            using (var message = new MailMessage(fromAddress, toAddress) { Subject = subject, Body = messageBody })
-            {
-                await smtp.SendMailAsync(message); // Use Async method
-            }
-            Console.WriteLine($"[EMAIL] Sent: {subject}");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[EMAIL ERROR] {ex.Message}");
-        }
-    }
-
-
-    public void LogTradeToCSV(string symbol, string side, decimal price, decimal pnl, double rsi, bool surge)
-    {
-        try
-        {
-            using (StreamWriter sw = new StreamWriter("trade_log.csv", true))
-            {
-                sw.WriteLine($"{DateTime.Now},{symbol},{side},{price},{pnl},{rsi},{surge}");
-            }
+            var json = JsonSerializer.Serialize(_marketData);
+            File.WriteAllText("market_memory.json", json);
         }
         catch { }
     }
 
-    public void SendEodSummary()
+    public void LoadMarketMemory()
     {
-        lock (_lock)
+        if (File.Exists("market_memory.json"))
         {
-            int totalTrades = _tradeHistory.Count;
-            int wins = _tradeHistory.Count(t => t.Profit > 0);
-            int losses = _tradeHistory.Count(t => t.Profit <= 0);
-            decimal winRate = totalTrades > 0 ? (decimal)wins / totalTrades * 100 : 0;
-
-            // REPLACE your current PnL calculation with this:
-            decimal reportPnL = _tradeHistory.Sum(t => t.Profit);
-
-            string report = $"--- DAILY PERFORMANCE REPORT ---\n\n" +
-                            $"Final PnL: {reportPnL:C2}\n" + // Use the calculated value
-                            $"Total Trades: {totalTrades}\n" +
-                            $"Wins: {wins} | Losses: {losses}\n" +
-                            $"Win Rate: {winRate:F1}%\n" +
-                            $"Daily Loss Count: {_dailyLossCount}/4\n\n" +
-                            "--- TRADE DETAILS ---\n";
-
-            foreach (var t in _tradeHistory)
+            try
             {
-                report += $"[{t.ExitTime:HH:mm}] {t.Symbol}: {t.Profit:C2}\n";
+                var data = JsonSerializer.Deserialize<ConcurrentDictionary<string, List<Candle>>>(File.ReadAllText("market_memory.json"));
+                if (data != null)
+                {
+                    foreach (var kvp in data) _marketData.TryAdd(kvp.Key, kvp.Value);
+                }
             }
-            var emailTask = SendEmailNotification($"📊 EOD REPORT: {reportPnL:C2}", report);
-            emailTask.Wait(); // Force wait so program doesn't exit before sending
-
+            catch { }
         }
-
     }
+  
+
 }
