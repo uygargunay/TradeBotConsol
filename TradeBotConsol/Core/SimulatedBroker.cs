@@ -37,7 +37,7 @@ public class SimPosition
     public decimal TrailingStop { get; set; }
     public decimal HighWaterMark { get; set; }
     public decimal CurrentPrice { get; set; }
-    public DateTime EntryTime { get; set; } = DateTime.UtcNow;
+    public DateTime EntryTime { get; set; } = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, TimeZoneInfo.FindSystemTimeZoneById("Pacific Standard Time"));
     public decimal UnrealizedPnL(decimal price) => Quantity * (price - AvgPrice);
 }
 
@@ -94,6 +94,7 @@ public class SimulatedBroker
     "NFLX", "COIN", "MARA", "ARM", "PLTR", "TSM", "MSTR", "SMCI"
 };
 
+    private static readonly TimeZoneInfo Pacific = TimeZoneInfo.FindSystemTimeZoneById("Pacific Standard Time");
     // --- MARKET DATA INGESTION ---
     public void UpdateLiveTick(string symbol, decimal price, long size)
     {
@@ -136,7 +137,7 @@ public class SimulatedBroker
     private void ManageCandles(string symbol, decimal price, long size)
     {
         var candles = _marketData.GetOrAdd(symbol, _ => new List<Candle>());
-        var now = DateTime.UtcNow;
+        var now = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific);
         var barTime = new DateTime(now.Year, now.Month, now.Day, now.Hour, now.Minute / 5 * 5, 0);
 
         lock (candles)
@@ -174,7 +175,7 @@ public class SimulatedBroker
 
             // Cooldown check
             if (_lastTradeTime.TryGetValue(symbol, out var lastTime))
-                if ((DateTime.UtcNow - lastTime).TotalSeconds < COOLDOWN_SECONDS) return;
+                if ((TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific) - lastTime).TotalSeconds < COOLDOWN_SECONDS) return;
 
             // Last candle
             var lastCandle = candles.Last();
@@ -201,7 +202,8 @@ public class SimulatedBroker
             if (atrPct < 0.004m) return;
 
             // Resistance filter
-            bool resistanceOk = lastCandle.Close <= highest30 * 0.995m;
+            bool resistanceOk = lastCandle.Close <= highest30 * 1.005m;
+
 
             // SPY regime check
             bool regimeOk = true;
@@ -248,7 +250,7 @@ public class SimulatedBroker
             if (!_positions.TryGetValue(symbol, out var pos)) return;
 
             // Minimum 2 minutes hold
-            double secondsHeld = (DateTime.UtcNow - pos.EntryTime).TotalSeconds;
+            double secondsHeld = (TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific) - pos.EntryTime).TotalSeconds;
             if (secondsHeld < 120) return;
 
             pos.HighWaterMark = Math.Max(pos.HighWaterMark, currentPrice);
@@ -351,7 +353,7 @@ public class SimulatedBroker
                     AvgPrice = fillPrice,
                     HighWaterMark = fillPrice,
                     CurrentPrice = fillPrice,
-                    EntryTime = DateTime.UtcNow
+                    EntryTime = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific)
                 };
                 _positions[order.Symbol] = pos;
                 _tradesToday++;
@@ -365,7 +367,7 @@ public class SimulatedBroker
                     decimal pnl = (fillPrice - pos.AvgPrice) * fillQty;
                     _totalRealizedPnL += pnl;
                     _positions.Remove(order.Symbol);
-                    _lastTradeTime[order.Symbol] = DateTime.UtcNow;
+                    _lastTradeTime[order.Symbol] = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific);
                     subject = $"💰 SELL: {order.Symbol} x {fillQty} @ {fillPrice:C2} | PnL: {pnl:C2}";
                     body = $"Sold {fillQty} @ {fillPrice:C2}\nPnL: {pnl:C2}";
                 }
@@ -373,8 +375,8 @@ public class SimulatedBroker
 
             // Log trade
             string logLine = order.Side == TradeSide.Buy ?
-                $"[{DateTime.Now:HH:mm:ss}] BUY  {order.Symbol} x {fillQty} @ {fillPrice:C2}" :
-                $"[{DateTime.Now:HH:mm:ss}] SELL {order.Symbol} x {fillQty} @ {fillPrice:C2}";
+                $"[{TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific):HH:mm:ss}] BUY  {order.Symbol} x {fillQty} @ {fillPrice:C2}" :
+                $"[{TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific):HH:mm:ss}] SELL {order.Symbol} x {fillQty} @ {fillPrice:C2}";
 
             _tradeHistoryLog.Add(logLine);
             if (_tradeHistoryLog.Count > 50) _tradeHistoryLog.RemoveAt(0); // keep last 50 trades
@@ -397,7 +399,7 @@ public class SimulatedBroker
         try
         {
             using (var sw = new StreamWriter("trades_log.csv", true))
-                sw.WriteLine($"{DateTime.Now},{symbol},{side},{price},{pnl}");
+                sw.WriteLine($"{TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific)},{symbol},{side},{price},{pnl}");
         }
         catch { }
     }
@@ -475,7 +477,7 @@ public class SimulatedBroker
     public void PrintDetailedDashboard()
     {
         Console.Clear();
-        var now = DateTime.Now;
+        var now = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific);
 
         // --- HEADER ---
         Console.WriteLine("┌────────────────────────────────────────────────────────────────────────────┐");
@@ -494,7 +496,7 @@ public class SimulatedBroker
         {
             foreach (var p in _positions.Values)
             {
-                double mins = (DateTime.UtcNow - p.EntryTime).TotalMinutes;
+                double mins = (TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific) - p.EntryTime).TotalMinutes;
                 decimal pnl = p.UnrealizedPnL(p.CurrentPrice);
                 decimal pnlPct = p.AvgPrice > 0 ? (p.CurrentPrice - p.AvgPrice) / p.AvgPrice * 100 : 0;
                 Console.WriteLine($"│ {p.Symbol,-6} │ {p.Quantity,-3} │ {p.AvgPrice,7:C} │ {p.CurrentPrice,7:C} │ {pnl,7:C} │ {pnlPct,5:F1}% │ {mins,5:F0} │ {p.HighWaterMark,7:C} │");
@@ -525,7 +527,22 @@ public class SimulatedBroker
             string trend = price > sma50 ? "UP" : "NEUTRAL";
             string signal = "WAIT";
 
-            bool isTrendUp = sma50 > SafeSMA(candles?.Take(Math.Max(0, candles.Count - 55)).ToList(), 50);
+            decimal sma50_5ago;
+
+            if (candles?.Count >= 55)
+            {
+                sma50_5ago = candles
+                    .Take(candles.Count - 5)
+                    .TakeLast(50)
+                    .Average(c => c.Close);
+            }
+            else
+            {
+                sma50_5ago = SafeSMA(candles, 50);
+            }
+
+            bool isTrendUp = sma50 > sma50_5ago;
+
             bool volOk = atr / Math.Max(price, 0.0001m) >= 0.004m;
             bool resistanceOk = price <= highest30 * 0.995m;
 
@@ -578,7 +595,7 @@ public class SimulatedBroker
         return loss == 0 ? 100 : 100 - (100 / (1 + (gain / loss)));
     }
 
-    private DateTime GetEasternTime() => TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"));
+    private DateTime GetEasternTime() => TimeZoneInfo.ConvertTimeFromUtc(TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific), TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"));
 
     public async Task SendEmail(string subject, string body)
     {
@@ -617,25 +634,6 @@ public class SimulatedBroker
         // This bridges the IB Client call to your existing logic
         UpdateLiveTick(symbol, price, size);
     }
-    public void PreInitializeSymbols(List<string> symbols)
-    {
-        foreach (var sym in symbols)
-        {
-            _marketData.TryAdd(sym, new List<Candle>());
-
-            // Optional: add 1 fake candle to avoid nulls at startup
-            _marketData[sym].Add(new Candle
-            {
-                Time = DateTime.UtcNow.AddMinutes(-5),
-                Open = 0m,
-                High = 0m,
-                Low = 0m,
-                Close = 0m,
-                Volume = 0
-            });
-        }
-    }
-
 
     public void SaveMarketMemory()
     {
