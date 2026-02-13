@@ -88,13 +88,40 @@ public class SimulatedBroker
     private const string EmailPassword = "sznd kafk nhec skqh";
 
     public readonly string[] _watchlist =
-    {
-    "SPY",
-    "NVDA", "TSLA", "AMD", "META", "AMZN", "MSFT", "AAPL",
-    "NFLX", "COIN", "MARA", "ARM", "PLTR", "TSM", "MSTR", "SMCI"
+ {
+    // Index / ETFs
+    "SPY","QQQ","IWM","DIA","SMH","XLK","XLF","XLE","ARKK",
+
+    // Mega Tech
+    "AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","AMD","INTC","ORCL","IBM",
+
+    // AI / Semis
+    "TSM","ASML","AVGO","QCOM","TXN","MU","ARM","LRCX","AMAT","KLAC","SMCI",
+
+    // Cloud / SaaS
+    "CRM","NOW","SNOW","MDB","DDOG","NET","OKTA","ZS","CRWD","PANW","PLTR",
+
+    // Consumer / Growth
+    "NFLX","DIS","UBER","LYFT","ABNB","BKNG","RBLX","SHOP","ETSY","PINS",
+
+    // Finance / Crypto
+    "COIN","MSTR","SQ","PYPL","HOOD","SOFI","JPM","BAC","GS","MS",
+
+    // EV / Energy
+    "NIO","RIVN","LCID","ENPH","SEDG","FSLR","PLUG","CHPT",
+
+    // Healthcare / Biotech
+    "JNJ","PFE","MRNA","LLY","ABBV","UNH","VRTX","REGN",
+
+    // Industrials
+    "BA","CAT","DE","GE","HON","RTX","LMT","NOC"
 };
 
+
+
     private static readonly TimeZoneInfo Pacific = TimeZoneInfo.FindSystemTimeZoneById("Pacific Standard Time");
+    private DateTime _lastMemorySave = DateTime.MinValue;
+
     // --- MARKET DATA INGESTION ---
     public void UpdateLiveTick(string symbol, decimal price, long size)
     {
@@ -110,6 +137,12 @@ public class SimulatedBroker
 
             ManageCandles(symbol, price, size);
             CheckExits(symbol, price);
+            if ((DateTime.UtcNow - _lastMemorySave).TotalMinutes >= 1)
+            {
+                SaveMarketMemory();
+                _lastMemorySave = DateTime.UtcNow;
+            }
+
         }
         catch (Exception ex)
         {
@@ -138,7 +171,10 @@ public class SimulatedBroker
     {
         var candles = _marketData.GetOrAdd(symbol, _ => new List<Candle>());
         var now = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific);
-        var barTime = new DateTime(now.Year, now.Month, now.Day, now.Hour, now.Minute / 5 * 5, 0);
+        int minuteBlock = (now.Minute / 5) * 5;
+        var barTime = new DateTime(now.Year, now.Month, now.Day, now.Hour, minuteBlock, 0);
+
+
 
         lock (candles)
         {
@@ -167,6 +203,10 @@ public class SimulatedBroker
     {
         if (_haltTrading) return;
         if (!_marketData.TryGetValue(symbol, out var candles) || candles.Count == 0) return;
+        long todayVolume = candles
+       .Where(c => c.Time.Date == TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific).Date)
+       .Sum(c => c.Volume);
+        if (todayVolume < 1_000_000) return;
 
         lock (_lock)
         {
@@ -202,8 +242,11 @@ public class SimulatedBroker
             if (atrPct < 0.004m) return;
 
             // Resistance filter
-            bool resistanceOk = lastCandle.Close <= highest30 * 1.005m;
+            // bool resistanceOk = lastCandle.Close <= highest30 * 1.005m;
 
+            bool resistanceOkDip = lastCandle.Close <= highest30 * 1.06m;
+
+            bool resistanceOkBreakout = true;
 
             // SPY regime check
             bool regimeOk = true;
@@ -215,21 +258,21 @@ public class SimulatedBroker
 
             // --- BUY CONDITIONS ---
             bool buyDip =
-                regimeOk &&
-                isTrendUp &&
-                atrPct >= 0.004m &&
-                resistanceOk &&
-                lastCandle.Close > sma50 &&
-                rsi > 40 && rsi < 55;
+     regimeOk &&
+     isTrendUp &&
+     atrPct >= 0.0025m &&
+     resistanceOkDip &&
+     lastCandle.Close > sma50 &&
+     rsi > 35 && rsi < 60;
 
             bool buyBreakout =
                 regimeOk &&
                 isTrendUp &&
-                atrPct >= 0.004m &&
-                resistanceOk &&
+                atrPct >= 0.0025m &&
+                resistanceOkBreakout &&
                 lastCandle.Close > highest10 &&
-                candles.Count > 1 && candles[^2].Close > highest10 &&
                 rsi > 55 && rsi < 75;
+
 
             if (buyDip || buyBreakout)
             {
@@ -474,10 +517,54 @@ public class SimulatedBroker
     }
 
     // --- REFACTORED DASHBOARD ---
+    private const int LOG_LINES = 20; // lines reserved for scrolling log
+    private Queue<string> _scrollingLog = new Queue<string>();
+    
+    Queue<string> _logQueue = new Queue<string>();
+
+    private Timer _dashboardTimer;
+
+    public void Start()
+    {
+        // Start a timer to refresh the dashboard every second
+        _dashboardTimer = new Timer(_ =>
+        {
+            PrintDetailedDashboard();
+        }, null, 0, 1000);
+    }
+
+    public void LogMessage(string msg)
+    {
+        if (_logQueue.Count >= LOG_LINES)
+            _logQueue.Dequeue();
+
+        _logQueue.Enqueue(msg);
+
+        int originalCursor = Console.CursorTop;
+        Console.SetCursorPosition(0, 0);
+
+        foreach (var line in _logQueue)
+        {
+            string truncated = line.Length > Console.WindowWidth - 1
+                ? line.Substring(0, Console.WindowWidth - 1)
+                : line;
+            Console.WriteLine(truncated.PadRight(Console.WindowWidth - 1));
+        }
+
+        // fill remaining lines if less than LOG_LINES
+        for (int i = _logQueue.Count; i < LOG_LINES; i++)
+            Console.WriteLine(new string(' ', Console.WindowWidth - 1));
+
+        Console.SetCursorPosition(0, originalCursor); // restore cursor for dashboard
+    }
+
     public void PrintDetailedDashboard()
     {
-        Console.Clear();
-        var now = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific);
+        int dashboardTop = LOG_LINES;
+        Console.SetCursorPosition(0, dashboardTop);
+
+
+        var now = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, TimeZoneInfo.FindSystemTimeZoneById("Pacific Standard Time"));
 
         // --- HEADER ---
         Console.WriteLine("┌────────────────────────────────────────────────────────────────────────────┐");
@@ -496,7 +583,7 @@ public class SimulatedBroker
         {
             foreach (var p in _positions.Values)
             {
-                double mins = (TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific) - p.EntryTime).TotalMinutes;
+                double mins = (TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, TimeZoneInfo.FindSystemTimeZoneById("Pacific Standard Time")) - p.EntryTime).TotalMinutes;
                 decimal pnl = p.UnrealizedPnL(p.CurrentPrice);
                 decimal pnlPct = p.AvgPrice > 0 ? (p.CurrentPrice - p.AvgPrice) / p.AvgPrice * 100 : 0;
                 Console.WriteLine($"│ {p.Symbol,-6} │ {p.Quantity,-3} │ {p.AvgPrice,7:C} │ {p.CurrentPrice,7:C} │ {pnl,7:C} │ {pnlPct,5:F1}% │ {mins,5:F0} │ {p.HighWaterMark,7:C} │");
@@ -520,41 +607,9 @@ public class SimulatedBroker
             decimal sma20 = SafeSMA(candles, 20);
             decimal sma50 = SafeSMA(candles, 50);
             double rsi = SafeRSI(candles, 14);
-            decimal atr = SafeATR(candles, 14);
-            decimal highest10 = SafeHighestHigh(candles, 10);
-            decimal highest30 = SafeHighestHigh(candles, 30);
 
             string trend = price > sma50 ? "UP" : "NEUTRAL";
             string signal = "WAIT";
-
-            decimal sma50_5ago;
-
-            if (candles?.Count >= 55)
-            {
-                sma50_5ago = candles
-                    .Take(candles.Count - 5)
-                    .TakeLast(50)
-                    .Average(c => c.Close);
-            }
-            else
-            {
-                sma50_5ago = SafeSMA(candles, 50);
-            }
-
-            bool isTrendUp = sma50 > sma50_5ago;
-
-            bool volOk = atr / Math.Max(price, 0.0001m) >= 0.004m;
-            bool resistanceOk = price <= highest30 * 0.995m;
-
-            bool regimeOk = true;
-            if (_marketData.TryGetValue("SPY", out var spy) && spy.Count >= 50)
-                regimeOk = spy.Last().Close > SafeSMA(spy, 50);
-
-            bool buyDip = regimeOk && isTrendUp && volOk && resistanceOk && price > sma50 && rsi > 40 && rsi < 55;
-            bool buyBreakout = regimeOk && isTrendUp && volOk && resistanceOk && price > highest10 && candles?.Count > 1 && candles[^2].Close > highest10 && rsi > 55 && rsi < 75;
-
-            if (buyDip) signal = "BUY DIP";
-            else if (buyBreakout) signal = "BUY BREAK";
 
             int barLength = 10;
             int fill = (int)Math.Round(rsi / 100.0 * barLength);
@@ -579,10 +634,12 @@ public class SimulatedBroker
             foreach (var log in recent)
                 Console.WriteLine(log);
 
-        Console.WriteLine("\n");
+        // Clear remaining dashboard space
+        int dashboardHeight = Console.WindowHeight - LOG_LINES;
+        int currentHeight = Console.CursorTop;
+        for (int i = currentHeight; i < dashboardHeight + LOG_LINES; i++)
+            Console.WriteLine(new string(' ', Console.WindowWidth - 1));
     }
-
-
     private double CalculateRSI(List<Candle> candles, int period)
     {
         if (candles.Count <= period) return 50;
@@ -639,27 +696,50 @@ public class SimulatedBroker
     {
         try
         {
-            var json = JsonSerializer.Serialize(_marketData);
-            File.WriteAllText("market_memory.json", json);
+            var normalDict = _marketData.ToDictionary(k => k.Key, v => v.Value);
+
+            // STEP 5 — TRIM OLD DATA (keep 3 days)
+            foreach (var kv in normalDict)
+            {
+                kv.Value.RemoveAll(c =>
+                    c.Time < TimeZoneInfo.ConvertTimeFromUtc(
+                        DateTime.UtcNow.AddDays(-3), Pacific));
+            }
+
+            File.WriteAllText("market_memory.json",
+                JsonSerializer.Serialize(normalDict));
         }
         catch { }
     }
 
+
     public void LoadMarketMemory()
     {
-        if (File.Exists("market_memory.json"))
+        if (!File.Exists("market_memory.json")) return;
+
+        try
         {
-            try
+            var data = JsonSerializer.Deserialize<ConcurrentDictionary<string, List<Candle>>>(
+                File.ReadAllText("market_memory.json"));
+
+            if (data != null)
             {
-                var data = JsonSerializer.Deserialize<ConcurrentDictionary<string, List<Candle>>>(File.ReadAllText("market_memory.json"));
-                if (data != null)
-                {
-                    foreach (var kvp in data) _marketData.TryAdd(kvp.Key, kvp.Value);
-                }
+                foreach (var kv in data)
+                    _marketData[kv.Key] = kv.Value;
             }
-            catch { }
+        }
+        catch { }
+    }
+    public async Task RequestAllHistoricalSlow()
+    {
+        foreach (var sym in _watchlist)
+        {
+            RealBroker.RequestHistoricalData(sym);
+            Console.WriteLine($"[HIST REQ] {sym}");
+            await Task.Delay(1200);   // IBKR-safe throttle
         }
     }
-  
+
+
 
 }

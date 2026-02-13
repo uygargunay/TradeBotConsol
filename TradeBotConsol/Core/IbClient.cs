@@ -116,7 +116,34 @@ public class IbClient : EWrapper, IBroker
     public void Disconnect() => _client.eDisconnect();
 
     // Required by IBroker but logic handled in SimulatedBroker
-    public void RequestHistoricalData(string symbol) { /* Logic for IBKR req */ }
+    public void RequestHistoricalData(string symbol)
+    {
+        int id = _liveReqId++;
+        _reqIdToSymbol[id] = symbol;
+
+        Contract contract = new Contract
+        {
+            Symbol = symbol,
+            SecType = "STK",
+            Exchange = "SMART",
+            PrimaryExch = "NASDAQ",
+            Currency = "USD"
+        };
+
+        _client.reqHistoricalData(
+            id,
+            contract,
+            "",
+            "3 D",        // last 3 days
+            "1 min",      // 1-minute bars
+            "TRADES",
+            0,
+            1,
+            false,
+            null
+        );
+    }
+
 
     // --- EWRAPPER CALLBACKS (Crucial for _isReady) ---
     void EWrapper.nextValidId(int orderId)
@@ -292,10 +319,57 @@ public class IbClient : EWrapper, IBroker
 
     }
 
-    public void historicalData(int reqId, Bar bar)
+    public void historicalData(int reqId, IBApi.Bar bar)
     {
+        if (_reqIdToSymbol.TryGetValue(reqId, out string symbol))
+        {
+            DateTime time;
 
+            // Try standard parse first
+            if (!DateTime.TryParse(bar.Time, out time))
+            {
+                // Fallback: IB format "yyyyMMdd  HH:mm:ss" (double space)
+                if (DateTime.TryParseExact(bar.Time.Trim(),
+                                           "yyyyMMdd  HH:mm:ss",
+                                           System.Globalization.CultureInfo.InvariantCulture,
+                                           System.Globalization.DateTimeStyles.None,
+                                           out time))
+                {
+                    // Parsed successfully
+                }
+                else
+                {
+                    // Some IB historical bars are just timestamps like "20260211"
+                    if (DateTime.TryParseExact(bar.Time.Trim(),
+                                               "yyyyMMdd",
+                                               System.Globalization.CultureInfo.InvariantCulture,
+                                               System.Globalization.DateTimeStyles.AssumeLocal,
+                                               out time))
+                    {
+                        // Only date, default to midnight
+                    }
+                    else
+                    {
+                        Console.WriteLine($"[WARN] Could not parse historical bar time: '{bar.Time}' for {symbol}");
+                        return;
+                    }
+                }
+            }
+
+            _broker.AddHistoricalCandle(
+                symbol,
+                time,
+                (decimal)bar.Open,
+                (decimal)bar.High,
+                (decimal)bar.Low,
+                (decimal)bar.Close,
+                bar.Volume
+            );
+        }
     }
+
+
+
 
     public void historicalDataUpdate(int reqId, Bar bar)
     {
@@ -304,8 +378,12 @@ public class IbClient : EWrapper, IBroker
 
     public void historicalDataEnd(int reqId, string start, string end)
     {
-
+        if (_reqIdToSymbol.TryGetValue(reqId, out string symbol))
+        {
+            Console.WriteLine($"[HISTORY LOADED] {symbol}");
+        }
     }
+
 
     public void marketDataType(int reqId, int marketDataType)
     {
