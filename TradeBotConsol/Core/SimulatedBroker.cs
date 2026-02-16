@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Mail;
+using System.Reflection.Metadata;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
@@ -75,12 +76,14 @@ public class SimulatedBroker
     private readonly ConcurrentDictionary<int, TrackedOrder> _ordersById = new();
     private readonly List<string> _tradeHistoryLog = new();
     private readonly Dictionary<string, DateTime> _lastTradeTime = new();
+    private const decimal ATR_TRAIL_MULT = 2.0m;   // 2x ATR is standard for scalping
 
     private decimal _totalRealizedPnL = 0m;
     private int _tradesToday = 0;
     private bool _haltTrading = false;
     private bool _eodSent = false;
     private readonly ConcurrentDictionary<string, decimal> _latestTick = new();
+    private const decimal SLIPPAGE_PCT = 0.0015m; // 0.15%
 
     // --- EMAIL SETTINGS (FILL THESE IN) ---
     private const string EmailFrom = "uygargunay@gmail.com";
@@ -229,7 +232,7 @@ public class SimulatedBroker
             var last55 = candles.Count >= 55 ? candles.Skip(candles.Count - 55).ToList() : new List<Candle>(candles);
             decimal sma50_5ago = SafeSMA(last55, 50);
 
-            double rsi = SafeRSI(candles, 14);
+            double rsi = SafeRSI(candles, 7);
             decimal atr = SafeATR(candles, 14);
             decimal atrPct = lastCandle.Close > 0 ? atr / lastCandle.Close : 0m;
 
@@ -291,6 +294,7 @@ public class SimulatedBroker
         lock (_lock)
         {
             if (!_positions.TryGetValue(symbol, out var pos)) return;
+            if (!_marketData.TryGetValue(symbol, out var candles)) return;
 
             // Minimum 2 minutes hold
             double secondsHeld = (TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific) - pos.EntryTime).TotalSeconds;
@@ -299,48 +303,46 @@ public class SimulatedBroker
             pos.HighWaterMark = Math.Max(pos.HighWaterMark, currentPrice);
             decimal gainPct = pos.AvgPrice > 0 ? (currentPrice - pos.AvgPrice) / pos.AvgPrice : 0m;
 
-            // 1. HARD STOP LOSS (-1.5%) - Always active
-            if (gainPct <= -0.015m)
+            // === HARD STOP (ATR based) ===
+            decimal atrValue = SafeATR(candles, 14);
+            decimal hardStop = pos.AvgPrice - (atrValue * 1.5m);
+
+            if (currentPrice < hardStop)
             {
                 SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, "HARD_STOP");
                 return;
             }
 
-            // 2. STRATEGIC EXITS - Only after minimum hold
+            // === STRATEGIC EXITS ===
             if (secondsHeld > MIN_HOLD_SECONDS)
             {
-                // Profit target trailing exit (drop 0.5% from high)
-                if (gainPct > 0.02m && currentPrice < pos.HighWaterMark * 0.995m)
+                // ATR trailing
+                decimal atrTrailStop = pos.HighWaterMark - (atrValue * ATR_TRAIL_MULT);
+                if (currentPrice < atrTrailStop && gainPct > 0.01m)
                 {
-                    SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, "TRAILING_TAKE_PROFIT");
+                    SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, "ATR_TRAIL_EXIT");
                     return;
                 }
 
-                // Exit if trend breaks (Price below SMA20)
-                if (_marketData.TryGetValue(symbol, out var candles) && candles.Count > 0)
+                // Trend break
+                decimal sma20 = SafeSMA(candles, 20);
+                if (currentPrice < sma20 && gainPct > 0.005m)
                 {
-                    decimal sma20 = SafeSMA(candles, 20);
-                    if (currentPrice < sma20 && gainPct > 0.005m)
-                    {
-                        SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, "TREND_EXIT_PROFIT");
-                        return;
-                    }
+                    SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, "TREND_EXIT_PROFIT");
+                    return;
                 }
 
-                // Optional: exit if volatility collapsed (ATR very low)
-                if (_marketData.TryGetValue(symbol, out var volsCandles) && volsCandles.Count > 0)
+                // Volatility collapse
+                decimal atrPct = currentPrice > 0 ? atrValue / currentPrice : 0m;
+                if (atrPct < 0.004m)
                 {
-                    decimal atr = SafeATR(volsCandles, 14);
-                    decimal atrPct = currentPrice > 0 ? atr / currentPrice : 0m;
-                    if (atrPct < 0.004m)
-                    {
-                        SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, "VOLATILITY_EXIT");
-                        return;
-                    }
+                    SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, "VOLATILITY_EXIT");
+                    return;
                 }
             }
         }
     }
+
 
     // --- PERSISTENCE ---
     public void SaveState()
@@ -350,7 +352,12 @@ public class SimulatedBroker
             var data = new BotPersistData { Positions = _positions, TotalPnL = _totalRealizedPnL };
             File.WriteAllText("bot_state.json", JsonSerializer.Serialize(data));
         }
-        catch { }
+        catch (Exception ex)
+        {
+            File.AppendAllText("errors.log",
+                $"[{DateTime.Now}] SaveMarketMemory ERROR: {ex.Message}\n");
+        }
+
     }
 
     public void LoadState()
@@ -362,7 +369,12 @@ public class SimulatedBroker
                 var data = JsonSerializer.Deserialize<BotPersistData>(File.ReadAllText("bot_state.json"));
                 if (data != null) { _positions = data.Positions; _totalRealizedPnL = data.TotalPnL; }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                File.AppendAllText("errors.log",
+                    $"[{DateTime.Now}] SaveMarketMemory ERROR: {ex.Message}\n");
+            }
+
         }
     }
 
@@ -370,7 +382,18 @@ public class SimulatedBroker
     public void SubmitOrder(string symbol, int qty, decimal price, TradeSide side, string note, string type = "LMT")
     {
         if (RealBroker == null) return;
-        RealBroker.SubmitOrder(symbol, qty, price, side, 0, type);
+        decimal adjusted = price;
+
+        if (type == "LMT")
+        {
+            if (side == TradeSide.Buy)
+                adjusted = price * (1 + SLIPPAGE_PCT);
+            else
+                adjusted = price * (1 - SLIPPAGE_PCT);
+        }
+
+        RealBroker.SubmitOrder(symbol, qty, adjusted, side, 0, type);
+
         Console.WriteLine($"[ORDER] {note} -> {side} {symbol} x {qty} @ {price}");
     }
 
@@ -444,7 +467,12 @@ public class SimulatedBroker
             using (var sw = new StreamWriter("trades_log.csv", true))
                 sw.WriteLine($"{TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific)},{symbol},{side},{price},{pnl}");
         }
-        catch { }
+        catch (Exception ex)
+        {
+            File.AppendAllText("errors.log",
+                $"[{DateTime.Now}] SaveMarketMemory ERROR: {ex.Message}\n");
+        }
+
     }
 
     private void CheckDailyLimits()
@@ -606,7 +634,7 @@ public class SimulatedBroker
             decimal price = last?.Close ?? 0m;
             decimal sma20 = SafeSMA(candles, 20);
             decimal sma50 = SafeSMA(candles, 50);
-            double rsi = SafeRSI(candles, 14);
+            double rsi = SafeRSI(candles, 7);
 
             string trend = price > sma50 ? "UP" : "NEUTRAL";
             string signal = "WAIT";
@@ -662,7 +690,12 @@ public class SimulatedBroker
             using var msg = new MailMessage(EmailFrom, EmailTo) { Subject = subject, Body = body };
             await smtp.SendMailAsync(msg);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            File.AppendAllText("errors.log",
+                $"[{DateTime.Now}] SaveMarketMemory ERROR: {ex.Message}\n");
+        }
+
     }
     // Add this inside the SimulatedBroker class in SimulatedBroker.cs
     public void AddHistoricalCandle(string symbol, DateTime time, decimal open, decimal high, decimal low, decimal close, long vol)
@@ -709,7 +742,12 @@ public class SimulatedBroker
             File.WriteAllText("market_memory.json",
                 JsonSerializer.Serialize(normalDict));
         }
-        catch { }
+        catch (Exception ex)
+        {
+            File.AppendAllText("errors.log",
+                $"[{DateTime.Now}] SaveMarketMemory ERROR: {ex.Message}\n");
+        }
+
     }
 
 
@@ -728,7 +766,12 @@ public class SimulatedBroker
                     _marketData[kv.Key] = kv.Value;
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            File.AppendAllText("errors.log",
+                $"[{DateTime.Now}] SaveMarketMemory ERROR: {ex.Message}\n");
+        }
+
     }
     public async Task RequestAllHistoricalSlow()
     {
