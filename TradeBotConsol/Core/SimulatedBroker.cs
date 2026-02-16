@@ -174,20 +174,25 @@ public class SimulatedBroker
     {
         var candles = _marketData.GetOrAdd(symbol, _ => new List<Candle>());
         var now = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Pacific);
-        int minuteBlock = (now.Minute / 5) * 5;
-        var barTime = new DateTime(now.Year, now.Month, now.Day, now.Hour, minuteBlock, 0);
 
-
+        // UPDATE: Define a 5-minute rolling window (300 seconds)
+        var windowStart = now.AddSeconds(-300);
 
         lock (candles)
         {
-            if (candles.Count == 0 || candles.Last().Time != barTime)
+            // 1. Add the new tick as a micro-candle or update the tail
+            if (candles.Count == 0 || (now - candles.Last().Time).TotalSeconds >= 1)
             {
-                candles.Add(new Candle { Time = barTime, Open = price, High = price, Low = price, Close = price, Volume = size });
-                if (candles.Count > 5) // wait for 5+ candles before strategy
-                    ExecuteStrategy(symbol);
+                candles.Add(new Candle
+                {
+                    Time = now,
+                    Open = price,
+                    High = price,
+                    Low = price,
+                    Close = price,
+                    Volume = size
+                });
             }
-
             else
             {
                 var current = candles.Last();
@@ -196,9 +201,17 @@ public class SimulatedBroker
                 current.Close = price;
                 current.Volume += size;
             }
+
+            // 2. Remove data older than 5 minutes to keep indicators "Rolling"
+            candles.RemoveAll(c => c.Time < windowStart);
+
+            // 3. Only execute strategy if we have a full 5 minutes of data
+            if (candles.Count > 0 && (candles.Last().Time - candles.First().Time).TotalSeconds >= 290)
+            {
+                ExecuteStrategy(symbol);
+            }
         }
     }
-
 
 
     // --- FULL EXECUTE STRATEGY ---
@@ -386,15 +399,21 @@ public class SimulatedBroker
 
         if (type == "LMT")
         {
+            // UPDATE: Get current volatility (ATR) for this specific stock
+            _marketData.TryGetValue(symbol, out var candles);
+            decimal atr = SafeATR(candles, 14);
+
+            // Use 10% of the ATR as a "buffer" to ensure the limit order fills
+            decimal slippageBuffer = atr * 0.1m;
+
             if (side == TradeSide.Buy)
-                adjusted = price * (1 + SLIPPAGE_PCT);
+                adjusted = price + slippageBuffer; // Bid slightly higher to secure the buy
             else
-                adjusted = price * (1 - SLIPPAGE_PCT);
+                adjusted = price - slippageBuffer; // Ask slightly lower to secure the sell
         }
 
         RealBroker.SubmitOrder(symbol, qty, adjusted, side, 0, type);
-
-        Console.WriteLine($"[ORDER] {note} -> {side} {symbol} x {qty} @ {price}");
+        Console.WriteLine($"[ORDER] {note} -> {side} {symbol} x {qty} @ {adjusted:F2} (Orig: {price:F2})");
     }
 
     public void RegisterLiveOrder(int orderId, string symbol, TradeSide side, int qty)
