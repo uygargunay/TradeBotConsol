@@ -8,6 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="Core\PositionManager.cs" />
     <Compile Remove="IB\EClientSocket.cs" />
   </ItemGroup>
 

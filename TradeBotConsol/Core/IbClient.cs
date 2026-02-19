@@ -95,22 +95,44 @@ public class IbClient : EWrapper, IBroker
             Symbol = symbol,
             SecType = "STK",
             Exchange = "SMART",
-            PrimaryExch = "NASDAQ",   // <-- THIS LINE
             Currency = "USD"
         };
 
-
-        _client.reqMktData(id, contract, "", false, false, null);
-
+        _client.reqRealTimeBars(
+            id,
+            contract,
+            5,          // 5-second bars
+            "TRADES",
+            true,
+            null
+        );
     }
 
-    public void realtimeBar(int reqId, long time, double open, double high, double low, double close, long volume, double WAP, int count)
+    public void realtimeBar(
+        int reqId,
+        long time,
+        double open,
+        double high,
+        double low,
+        double close,
+        long volume,
+        double wap,
+        int count)
     {
-        if (_reqIdToSymbol.TryGetValue(reqId, out string symbol))
-        {
-            _broker.UpdateLiveTick(symbol, (decimal)close, volume);
-        }
+        if (!_reqIdToSymbol.TryGetValue(reqId, out var symbol))
+            return;
+
+        _broker.AddRealtimeBar(
+            symbol,
+            DateTimeOffset.FromUnixTimeSeconds(time).UtcDateTime,
+            (decimal)open,
+            (decimal)high,
+            (decimal)low,
+            (decimal)close,
+            volume
+        );
     }
+
 
     public bool IsConnected() => _client.IsConnected();
     public void Disconnect() => _client.eDisconnect();
