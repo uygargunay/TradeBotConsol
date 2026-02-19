@@ -101,7 +101,7 @@ public class IbClient : EWrapper, IBroker
         _client.reqRealTimeBars(
             id,
             contract,
-            5,          // 5-second bars
+            60,          // 5-second bars
             "TRADES",
             true,
             null

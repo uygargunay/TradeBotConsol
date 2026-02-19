@@ -39,6 +39,8 @@ public class SimPosition
     public decimal HighWaterMark { get; set; }
     public decimal CurrentPrice { get; set; }
     public DateTime EntryTime { get; set; } = DateTime.UtcNow;
+    public bool ExitSubmitted { get; set; }
+
 
     public decimal UnrealizedPnL(decimal price) => Quantity * (price - AvgPrice);
 }
@@ -124,6 +126,7 @@ public class SimulatedBroker
     "BA","CAT","DE","GE","HON","RTX","LMT"
 };
 
+    private readonly List<(DateTime time, decimal equity)> _equityCurve = new();
 
 
     private static readonly TimeZoneInfo Pacific = TimeZoneInfo.FindSystemTimeZoneById("Pacific Standard Time");
@@ -245,6 +248,7 @@ public class SimulatedBroker
             if (candles.Count > 500)
                 candles.RemoveAt(0);
         }
+        Console.WriteLine($"[BAR] {symbol} {close}");
 
         ExecuteStrategy(symbol);
     }
@@ -302,7 +306,7 @@ public class SimulatedBroker
             bool isTrendUp = lastCandle.Close > sma50 && sma50 > sma50_5ago;
 
             // Skip low-volatility ranges
-            if (atrPct < 0.004m) return;
+            if (atrPct < 0.002m) return;
 
             // Resistance filter
             // bool resistanceOk = lastCandle.Close <= highest30 * 1.005m;
@@ -315,38 +319,64 @@ public class SimulatedBroker
             bool regimeOk = true;
             if (_marketData.TryGetValue("SPY", out var spy) && spy.Count > 0)
             {
-                decimal spySma50 = SafeSMA(spy, 50);
+                decimal spySma50 = SafeSMA(spy, 40);
                 regimeOk = spy.Last().Close > spySma50;
             }
 
-            // --- BUY CONDITIONS ---
-            bool buyDip =
-     regimeOk &&
-     isTrendUp &&
-     atrPct >= 0.0025m &&
-     resistanceOkDip &&
-     lastCandle.Close > sma50 &&
-     rsi > 35 && rsi < 60;
 
-            bool buyBreakout =
+            bool volumeExpansion = false;
+
+            if (candles.Count >= 10)
+            {
+                var last10 = candles.TakeLast(10).ToList();
+                long prev5 = last10.Take(5).Sum(c => c.Volume);
+                long recent5 = last10.Skip(5).Take(5).Sum(c => c.Volume);
+
+                volumeExpansion = recent5 > prev5 * 1.3m;
+            }
+
+
+
+            // ===============================
+            // CLEAN 1-MIN MOMENTUM LOGIC
+            // ===============================
+
+            bool trendAligned =
+    sma20 > sma50 ||
+    (lastCandle.Close > sma50 && rsi > 55);
+
+
+            bool momentumStrong =
+                lastCandle.Close > sma20 &&
+                rsi > 55 &&
+                atrPct > 0.0015m;        // 0.2% volatility filter
+
+            // Optional breakout confirmation
+            decimal recentHigh = SafeHighestHigh(
+                candles.Take(candles.Count - 1).ToList(), 5);
+
+            bool structureBreak = lastCandle.Close > recentHigh;
+
+            bool buySignal =
                 regimeOk &&
-                isTrendUp &&
-                atrPct >= 0.0025m &&
-                resistanceOkBreakout &&
-                lastCandle.Close > highest10 &&
-                rsi > 55 && rsi < 75;
+                trendAligned &&
+                momentumStrong &&
+                structureBreak;
 
-
-            if (buyDip || buyBreakout)
+            if (buySignal)
             {
                 int qty = (int)(POSITION_SIZE / lastCandle.Close);
+
                 if (qty > 0)
                 {
-                    string note = buyDip ? "DIP_CONTINUATION" : "STRUCTURE_BREAKOUT";
-                    SubmitOrder(symbol, qty, lastCandle.Close, TradeSide.Buy, note);
+                    SubmitOrder(symbol, qty, lastCandle.Close,
+                        TradeSide.Buy, "MOMENTUM_BREAKOUT");
                 }
             }
+            Console.WriteLine($"{symbol} | Regime: {regimeOk} | Trend: {trendAligned} | RSI: {rsi:F1} | Break: {structureBreak}");
+
         }
+
     }
 
     private void CheckExits(string symbol, decimal currentPrice)
@@ -358,7 +388,8 @@ public class SimulatedBroker
 
             // Minimum 2 minutes hold
             double secondsHeld = (DateTime.UtcNow - pos.EntryTime).TotalSeconds;
-            if (secondsHeld < 120) return;
+            if (secondsHeld < MIN_HOLD_SECONDS) return;
+
 
             pos.HighWaterMark = Math.Max(pos.HighWaterMark, currentPrice);
             decimal gainPct = pos.AvgPrice > 0 ? (currentPrice - pos.AvgPrice) / pos.AvgPrice : 0m;
@@ -367,18 +398,20 @@ public class SimulatedBroker
             decimal atrValue = SafeATR(candles, 14);
             decimal hardStop = pos.AvgPrice - (atrValue * 1.5m);
 
-            if (currentPrice < hardStop)
+            if (currentPrice < hardStop && !pos.ExitSubmitted)
             {
+                pos.ExitSubmitted = true;
                 SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, "HARD_STOP");
                 return;
             }
+
 
             // === STRATEGIC EXITS ===
             if (secondsHeld > MIN_HOLD_SECONDS)
             {
                 // ATR trailing
                 decimal atrTrailStop = pos.HighWaterMark - (atrValue * ATR_TRAIL_MULT);
-                if (currentPrice < atrTrailStop && gainPct > 0.01m)
+                if (currentPrice < atrTrailStop && gainPct > 0.005m)
                 {
                     SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, "ATR_TRAIL_EXIT");
                     return;
@@ -446,18 +479,19 @@ public class SimulatedBroker
 
         if (type == "LMT")
         {
-            // UPDATE: Get current volatility (ATR) for this specific stock
             _marketData.TryGetValue(symbol, out var candles);
             decimal atr = SafeATR(candles, 14);
 
-            // Use 10% of the ATR as a "buffer" to ensure the limit order fills
-            decimal slippageBuffer = atr * 0.1m;
+            decimal slippageBuffer = Math.Max(
+                atr * 0.1m,
+                price * 0.0005m
+            );
 
-            if (side == TradeSide.Buy)
-                adjusted = price + slippageBuffer; // Bid slightly higher to secure the buy
-            else
-                adjusted = price - slippageBuffer; // Ask slightly lower to secure the sell
+            adjusted = side == TradeSide.Buy
+                ? price + slippageBuffer
+                : price - slippageBuffer;
         }
+
 
         RealBroker.SubmitOrder(symbol, qty, adjusted, side, 0, type);
         Console.WriteLine($"[ORDER] {note} -> {side} {symbol} x {qty} @ {adjusted:F2} (Orig: {price:F2})");
@@ -497,6 +531,23 @@ public class SimulatedBroker
                 if (_positions.TryGetValue(order.Symbol, out var pos))
                 {
                     decimal pnl = (fillPrice - pos.AvgPrice) * fillQty;
+                    decimal holdMinutes = (decimal)(DateTime.UtcNow - pos.EntryTime).TotalMinutes;
+
+                    _marketData.TryGetValue(order.Symbol, out var candlesAtExit);
+                    decimal atrAtExit = SafeATR(candlesAtExit, 14);
+                    double rsiAtExit = SafeRSI(candlesAtExit, 7);
+
+                    // Detailed analytics log
+                    LogTradeAnalytics(
+                        order.Symbol,
+                        pos.AvgPrice,
+                        fillPrice,
+                        pnl,
+                        holdMinutes,
+                        atrAtExit,
+                        rsiAtExit
+                    );
+
                     _totalRealizedPnL += pnl;
                     _positions.Remove(order.Symbol);
                     _lastTradeTime[order.Symbol] = DateTime.UtcNow;
@@ -521,9 +572,49 @@ public class SimulatedBroker
 
             Task.Run(() => SendEmail(subject, body));
         }
+        _equityCurve.Add((DateTime.UtcNow, _totalRealizedPnL));
+
+        SaveEquityCurve();
 
         CheckDailyLimits();
         SaveState();
+    }
+    private void SaveEquityCurve()
+    {
+        try
+        {
+            File.WriteAllLines("equity_curve.csv",
+                _equityCurve.Select(e =>
+                    $"{e.time},{e.equity}"));
+        }
+        catch { }
+    }
+
+
+    private void LogTradeAnalytics(
+    string symbol,
+    decimal entry,
+    decimal exit,
+    decimal pnl,
+    decimal holdMinutes,
+    decimal atr,
+    double rsi)
+    {
+        try
+        {
+            using var sw = new StreamWriter("trade_analytics.csv", true);
+
+            sw.WriteLine(
+                $"{DateTime.UtcNow}," +
+                $"{symbol}," +
+                $"{entry}," +
+                $"{exit}," +
+                $"{pnl}," +
+                $"{holdMinutes:F2}," +
+                $"{atr}," +
+                $"{rsi:F2}");
+        }
+        catch { }
     }
 
     private void LogToCsv(string symbol, string side, decimal price, decimal pnl)
@@ -621,7 +712,9 @@ public double SafeRSI(List<Candle> candles, int period)
 
     private decimal SafeATR(List<Candle> candles, int period)
     {
-        if (candles == null || candles.Count <= period) return 0m;
+        if (candles == null || candles.Count <= period)
+            return candles?.LastOrDefault()?.Close * 0.002m ?? 0.01m;
+
         decimal sum = 0;
         for (int i = candles.Count - period + 1; i < candles.Count; i++)
         {
