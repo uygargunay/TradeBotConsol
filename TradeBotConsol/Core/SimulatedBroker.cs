@@ -111,7 +111,7 @@ public class SimulatedBroker
     "CRM","NOW","SNOW","MDB","DDOG","NET","OKTA","ZS","CRWD","PANW","PLTR",
 
     // Consumer / Growth
-    "NFLX","DIS","UBER","LYFT","ABNB","BKNG","RBLX","SHOP","ETSY",
+    "NFLX","DIS","UBER","LYFT","ABNB","RBLX","SHOP","ETSY",
 
     // Finance / Crypto
     "COIN","MSTR","SQ","PYPL","HOOD","SOFI","JPM","BAC","GS",
@@ -120,7 +120,7 @@ public class SimulatedBroker
     "NIO","RIVN","LCID","ENPH","SEDG","FSLR","PLUG",
 
     // Healthcare / Biotech
-    "JNJ","PFE","MRNA","LLY","ABBV","UNH","VRTX",
+    "JNJ","PFE","MRNA","ABBV","UNH","VRTX",
 
     // Industrials
     "BA","CAT","DE","GE","HON","RTX","LMT"
@@ -128,6 +128,7 @@ public class SimulatedBroker
 
     private readonly List<(DateTime time, decimal equity)> _equityCurve = new();
 
+    private readonly ConcurrentDictionary<string, Candle> _currentMinuteCandle = new();
 
     private static readonly TimeZoneInfo Pacific = TimeZoneInfo.FindSystemTimeZoneById("Pacific Standard Time");
     private DateTime _lastMemorySave = DateTime.MinValue;
@@ -137,28 +138,92 @@ public class SimulatedBroker
     {
         try
         {
+            _latestTick[symbol] = price;
+
+            var nowEt = GetEasternTime();
+            var minute = new DateTime(
+                nowEt.Year, nowEt.Month, nowEt.Day,
+                nowEt.Hour, nowEt.Minute, 0);
+
+            var current = _currentMinuteCandle.GetOrAdd(symbol, _ =>
+                new Candle
+                {
+                    Time = minute,
+                    Open = price,
+                    High = price,
+                    Low = price,
+                    Close = price,
+                    Volume = size
+                });
+
+            // If new minute → finalize old candle
+            if (current.Time != minute)
+            {
+                FinalizeCandle(symbol, current);
+
+                current = new Candle
+                {
+                    Time = minute,
+                    Open = price,
+                    High = price,
+                    Low = price,
+                    Close = price,
+                    Volume = size
+                };
+
+                _currentMinuteCandle[symbol] = current;
+            }
+            else
+            {
+                // Update running candle
+                current.High = Math.Max(current.High, price);
+                current.Low = Math.Min(current.Low, price);
+                current.Close = price;
+                current.Volume += size;
+            }
+
             if (_haltTrading) return;
+
             OnTradeTick(symbol, size);
+
             lock (_lock)
             {
                 if (_positions.TryGetValue(symbol, out var pos))
                     pos.CurrentPrice = price;
             }
 
-            //ManageCandles(symbol, price, size);
             CheckExits(symbol, price);
+
             if ((DateTime.UtcNow - _lastMemorySave).TotalMinutes >= 1)
             {
                 SaveMarketMemory();
                 _lastMemorySave = DateTime.UtcNow;
             }
-
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[UpdateLiveTick ERROR] {symbol} -> {ex.Message}");
         }
     }
+    private void FinalizeCandle(string symbol, Candle candle)
+    {
+        var list = _marketData.GetOrAdd(symbol, _ => new List<Candle>());
+
+        lock (list)
+        {
+            // Prevent duplicate minute
+            if (!list.Any(c => c.Time == candle.Time))
+            {
+                list.Add(candle);
+            }
+
+            if (list.Count > 500)
+                list.RemoveAt(0);
+        }
+
+        ExecuteStrategy(symbol);
+    }
+
     public void OnTradeTick(string symbol, long size)
     {
         lock (_lock)
@@ -171,87 +236,6 @@ public class SimulatedBroker
     }
 
 
-    public void AddCandle(string symbol, Candle candle)
-    {
-        if (!_marketData.ContainsKey(symbol))
-            _marketData[symbol] = new List<Candle>();
-
-        var candles = _marketData[symbol];
-
-        // Avoid duplicates (same timestamp)
-        if (candles.Count == 0 || candles.Last().Time != candle.Time)
-            candles.Add(candle);
-
-        // Optional: keep last N candles to limit memory
-        if (candles.Count > 500)
-            candles.RemoveAt(0);
-    }
-
-
-    private readonly Dictionary<string, List<Candle>> _candles
-    = new Dictionary<string, List<Candle>>();
-
-    public void AddRealtimeCandle(
-    string symbol,
-    DateTime time,
-    decimal open,
-    decimal high,
-    decimal low,
-    decimal close,
-    long volume)
-    {
-        if (!_candles.ContainsKey(symbol))
-            _candles[symbol] = new List<Candle>();
-
-        var candles = _candles[symbol];
-
-        candles.Add(new Candle
-        {
-            Time = time,
-            Open = open,
-            High = high,
-            Low = low,
-            Close = close,
-            Volume = volume
-        });
-
-        // Keep memory clean
-        if (candles.Count > 500)
-            candles.RemoveAt(0);
-
-        ExecuteStrategy(symbol);
-    }
-
-    public void AddRealtimeBar(
-    string symbol,
-    DateTime time,
-    decimal open,
-    decimal high,
-    decimal low,
-    decimal close,
-    long volume)
-    {
-        var candles = _marketData.GetOrAdd(symbol, _ => new List<Candle>());
-
-        lock (candles)
-        {
-            candles.Add(new Candle
-            {
-                Time = time,
-                Open = open,
-                High = high,
-                Low = low,
-                Close = close,
-                Volume = volume
-            });
-
-            if (candles.Count > 500)
-                candles.RemoveAt(0);
-        }
-        Console.WriteLine($"[BAR] {symbol} {close}");
-
-        ExecuteStrategy(symbol);
-    }
 
 
     // --- FULL EXECUTE STRATEGY ---
@@ -429,7 +413,7 @@ public class SimulatedBroker
                 decimal atrPct = currentPrice > 0 ? atrValue / currentPrice : 0m;
                 if (atrPct < 0.004m)
                 {
-                    SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, "VOLATILITY_EXIT");
+                    SubmitOrder(symbol, pos.Quantity, 0, TradeSide.Sell, "VOLATILITY_EXIT", "MKT");
                     return;
                 }
             }
@@ -504,7 +488,7 @@ public class SimulatedBroker
 
     public void OnOrderFilled(int orderId, int fillQty, decimal fillPrice)
     {
-        if (!_ordersById.TryRemove(orderId, out var order)) return;
+        if (!_ordersById.TryGetValue(orderId, out var order)) return;
 
         string subject = ""; string body = "";
 
@@ -879,19 +863,27 @@ public double SafeRSI(List<Candle> candles, int period)
         catch (Exception ex)
         {
             File.AppendAllText("errors.log",
-                $"[{DateTime.Now}] SaveMarketMemory ERROR: {ex.Message}\n");
+                $"[{DateTime.Now}] SaveMarketMemory ERROR: {ex}\n");
         }
 
     }
     // Add this inside the SimulatedBroker class in SimulatedBroker.cs
-    public void AddHistoricalCandle(string symbol, DateTime time, decimal open, decimal high, decimal low, decimal close, long vol)
+    public void AddHistoricalCandle(
+    string symbol,
+    DateTime time,
+    decimal open,
+    decimal high,
+    decimal low,
+    decimal close,
+    long vol)
     {
-        var candles = _marketData.GetOrAdd(symbol, _ => new List<Candle>());
-        lock (candles)
+        var list = _marketData.GetOrAdd(symbol, _ => new List<Candle>());
+
+        lock (list)
         {
-            if (!candles.Any(c => c.Time == time))
+            if (!list.Any(c => c.Time == time))
             {
-                candles.Add(new Candle
+                list.Add(new Candle
                 {
                     Time = time,
                     Open = open,
@@ -900,17 +892,15 @@ public double SafeRSI(List<Candle> candles, int period)
                     Close = close,
                     Volume = vol
                 });
-                // Keep them sorted by time
-                candles.Sort((a, b) => a.Time.CompareTo(b.Time));
 
+                list.Sort((a, b) => a.Time.CompareTo(b.Time));
             }
+
+            if (list.Count > 500)
+                list.RemoveAt(0);
         }
     }
-    public void UpdateHistory(string symbol, decimal price, long size)
-    {
-        // This bridges the IB Client call to your existing logic
-        UpdateLiveTick(symbol, price, size);
-    }
+
 
     public void SaveMarketMemory()
     {
@@ -960,13 +950,32 @@ public double SafeRSI(List<Candle> candles, int period)
         }
 
     }
+
+    public void ClearMarketData()
+    {
+        foreach (var kv in _marketData)
+        {
+            lock (kv.Value)
+            {
+                kv.Value.Clear();
+            }
+        }
+
+        _marketData.Clear();
+        Console.WriteLine("[CANDLE ENGINE] Market data cleared.");
+    }
     public async Task RequestAllHistoricalSlow()
     {
-        foreach (var sym in _watchlist)
+        if (RealBroker == null)
+            throw new Exception("RealBroker not set.");
+
+        foreach (var symbol in _watchlist)
         {
-            RealBroker.RequestHistoricalData(sym);
-            Console.WriteLine($"[HIST REQ] {sym}");
-            await Task.Delay(1200);   // IBKR-safe throttle
+            Console.WriteLine($"Requesting history for {symbol}");
+            RealBroker.RequestHistoricalData(symbol);
+
+            // IB pacing safety delay
+            await Task.Delay(1500);
         }
     }
 

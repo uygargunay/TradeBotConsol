@@ -53,8 +53,8 @@ public class IbClient : EWrapper, IBroker
             Symbol = symbol,
             SecType = "STK",
             Exchange = "SMART",
-            PrimaryExch = "NASDAQ",   
-            Currency = "USD"
+            //PrimaryExch = "ISLAND",   
+            Currency = "USD",
         };
 
 
@@ -85,54 +85,59 @@ public class IbClient : EWrapper, IBroker
         })
         { IsBackground = true }.Start();
     }
+
     public void Subscribe(string symbol)
     {
-        int id = _liveReqId++;
-        _reqIdToSymbol[id] = symbol;
+        int reqId = Interlocked.Increment(ref _liveReqId);
+        _reqIdToSymbol[reqId] = symbol;
 
         Contract contract = new Contract
         {
             Symbol = symbol,
             SecType = "STK",
             Exchange = "SMART",
-            Currency = "USD"
+            Currency = "USD",
+            //PrimaryExch = "ISLAND" // SPY trades on ARCA
         };
 
-        _client.reqRealTimeBars(
-            id,
+        // Subscribe to real-time market data
+        _client.reqMktData(
+            reqId,
             contract,
-            60,          // 5-second bars
-            "TRADES",
-            true,
-            null
+            "",      // generic ticks
+            false,   // snapshot? false = streaming
+            false,   // regulatory snapshot
+            null     // mktDataOptions
         );
+
+        Console.WriteLine($"[IBKR] Subscribed to {symbol} with reqId {reqId}");
     }
 
-    public void realtimeBar(
-        int reqId,
-        long time,
-        double open,
-        double high,
-        double low,
-        double close,
-        long volume,
-        double wap,
-        int count)
+    // TickPrice callback
+    public void tickPrice(int tickerId, int field, double price, TickAttrib attribs)
     {
-        if (!_reqIdToSymbol.TryGetValue(reqId, out var symbol))
+        if (!_reqIdToSymbol.TryGetValue(tickerId, out string symbol))
             return;
 
-        _broker.AddRealtimeBar(
-            symbol,
-            DateTimeOffset.FromUnixTimeSeconds(time).UtcDateTime,
-            (decimal)open,
-            (decimal)high,
-            (decimal)low,
-            (decimal)close,
-            volume
-        );
+        if (price <= 0) return; // ignore invalid prices
+
+        // Log all tick updates for debugging
+        //Console.WriteLine($"TickPrice | Symbol: {symbol}, Field: {field}, Price: {price}");
+
+        // Update broker — you can filter inside UpdateLiveTick if you want LAST trade only
+        _tickVolume.TryGetValue(symbol, out long vol);
+        _broker.UpdateLiveTick(symbol, (decimal)price, vol);
+        _tickVolume[symbol] = 0; // reset tick volume
     }
 
+    // TickSize callback
+    public void tickSize(int tickerId, int field, int size)
+    {
+        if (!_reqIdToSymbol.TryGetValue(tickerId, out string symbol))
+            return;
+
+        _tickVolume.AddOrUpdate(symbol, size, (_, old) => old + size);
+    }
 
     public bool IsConnected() => _client.IsConnected();
     public void Disconnect() => _client.eDisconnect();
@@ -148,9 +153,10 @@ public class IbClient : EWrapper, IBroker
             Symbol = symbol,
             SecType = "STK",
             Exchange = "SMART",
-            PrimaryExch = "NASDAQ",
+            //PrimaryExch = "ISLAND",
             Currency = "USD"
         };
+
 
         _client.reqHistoricalData(
             id,
@@ -171,6 +177,7 @@ public class IbClient : EWrapper, IBroker
     void EWrapper.nextValidId(int orderId)
     {
         _currentOrderId = orderId;
+        _client.reqMarketDataType(1); // 1 = Live
         _isReady = true; // This flips the switch so the bot can start trading
         Console.WriteLine("[IBKR] Connected and Ready.");
     }
@@ -200,24 +207,6 @@ public class IbClient : EWrapper, IBroker
     public void currentTime(long time)
     {
 
-    }
-
-    public void tickSize(int tickerId, int field, int size)
-    {
-        if (_reqIdToSymbol.TryGetValue(tickerId, out string symbol))
-        {
-            _tickVolume.AddOrUpdate(symbol, size, (_, old) => old + size);
-        }
-    }
-
-    public void tickPrice(int tickerId, int field, double price, TickAttrib attribs)
-    {
-        if (_reqIdToSymbol.TryGetValue(tickerId, out string symbol))
-        {
-            _tickVolume.TryGetValue(symbol, out long vol);
-            _broker.UpdateLiveTick(symbol, (decimal)price, vol);
-            _tickVolume[symbol] = 0; // reset after sending
-        }
     }
 
 
@@ -296,9 +285,16 @@ public class IbClient : EWrapper, IBroker
 
     }
 
-    public void orderStatus(int orderId, string status, double filled, double remaining, double avgFillPrice, int permId, int parentId, double lastFillPrice, int clientId, string whyHeld, double mktCapPrice)
+    public void orderStatus(int orderId, string status, double filled, double remaining,
+        double avgFillPrice, int permId, int parentId,
+        double lastFillPrice, int clientId, string whyHeld, double mktCapPrice)
     {
+        Console.WriteLine($"[ORDER STATUS] Id={orderId} Status={status} Filled={filled} Remaining={remaining}");
 
+        if (status == "Filled")
+        {
+            _broker.OnOrderFilled(orderId, (int)filled, (decimal)avgFillPrice);
+        }
     }
 
     public void openOrder(int orderId, Contract contract, Order order, OrderState orderState)
@@ -323,8 +319,15 @@ public class IbClient : EWrapper, IBroker
 
     public void execDetails(int reqId, Contract contract, Execution execution)
     {
+        Console.WriteLine($"[EXECUTION] OrderId={execution.OrderId} Shares={execution.Shares} Price={execution.Price}");
 
+        _broker.OnOrderFilled(
+            execution.OrderId,
+            (int)Math.Round(execution.Shares),   // <-- FIX HERE
+            (decimal)execution.Price
+        );
     }
+
 
     public void execDetailsEnd(int reqId)
     {
@@ -642,6 +645,11 @@ public class IbClient : EWrapper, IBroker
     public void tickByTickMidPoint(int reqId, long time, double midPoint)
     {
 
+    }
+
+    void EWrapper.realtimeBar(int reqId, long time, double open, double high, double low, double close, long volume, double WAP, int count)
+    {
+   
     }
 
     // Add empty implementations for the rest of EWrapper methods to satisfy the compiler...
