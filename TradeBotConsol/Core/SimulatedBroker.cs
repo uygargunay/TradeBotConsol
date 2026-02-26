@@ -86,28 +86,33 @@ public class SimulatedBroker
     public IBroker RealBroker { get; set; }
     private readonly object _lock = new object();
 
-    // ── TRADING RULES ──────────────────────────────────────
+    // ── TRADING RULES — SWEET SPOT ─────────────────────────
     private const decimal TOTAL_BUDGET = 4000m;
-    private const int MAX_POSITIONS = 2;        // long + short count together
+    private const int MAX_POSITIONS = 2;
     private const decimal POSITION_SIZE = 2000m;
     private const int MIN_HOLD_SECONDS = 300;
     private const decimal DAILY_PROFIT_GOAL = 300m;
     private const decimal MAX_DAILY_LOSS = -150m;
-    private const int COOLDOWN_SECONDS = 300;      // RELAXED: was 600
-    private const decimal ATR_TRAIL_MULT = 2.5m;     // long trail multiplier
-    private const decimal SHORT_ATR_TRAIL = 2.0m;     // tighter trail for shorts
+    private const int COOLDOWN_SECONDS = 480;    // 8 min
+    private const decimal ATR_TRAIL_MULT = 2.5m;
+    private const decimal SHORT_ATR_TRAIL = 2.0m;
+    private const decimal HARD_STOP_ATR_MULT = 2.0m;   // KEY FIX — was 1.5
     private const decimal MAX_LOSS_PER_TRADE = 75m;
     private const decimal MIN_STOP_DISTANCE = 0.10m;
     private const int MAX_QTY_SANITY = 500;
-    private const decimal RISK_PCT = 0.02m;     // RELAXED: was 0.01 (1%)
-    private const int ORB_MINUTES = 30;        // Opening Range window
-    private const decimal VOL_EXPAND_MULT = 1.2m;      // RELAXED: was 1.5
-    private const double RSI_LONG_MIN = 52.0;      // RELAXED: was 57
-    private const double RSI_SHORT_MAX = 48.0;      // for short entries
-    private const double RSI_OVERSOLD = 32.0;      // mean-reversion buy
-    private const double RSI_OVERBOUGHT = 68.0;      // mean-reversion short
-    private const decimal GAP_GO_MIN_PCT = 0.005m;    // min 0.5% gap for gap-and-go
-    private const decimal GAP_GO_REL_VOL = 1.5m;      // 1.5x relative volume for gap-and-go
+    private const decimal RISK_PCT = 0.015m;  // 1.5%
+    private const int ORB_MINUTES = 30;
+    private const decimal VOL_EXPAND_MULT = 1.3m;    // middle ground
+    private const double RSI_LONG_MIN = 54.0;    // slightly above neutral
+    private const double RSI_SHORT_MAX = 46.0;
+    private const double RSI_OVERSOLD = 30.0;    // genuinely stretched
+    private const double RSI_OVERBOUGHT = 70.0;
+    private const decimal GAP_GO_MIN_PCT = 0.005m;
+    private const decimal GAP_GO_REL_VOL = 1.5m;
+    private const int VWAP_CONFIRM_BARS = 2;
+
+
+    private bool _allowShorts = false; // set to true only if you have a margin account
 
     // ── STATE ──────────────────────────────────────────────
     public readonly ConcurrentDictionary<string, List<Candle>> _marketData = new();
@@ -140,6 +145,9 @@ public class SimulatedBroker
 
     // Previous bar VWAP tracking for crossover detection
     private readonly ConcurrentDictionary<string, bool> _prevBarAboveVwap = new();
+
+    // Strategy tag staging — set before order, stamped onto position at fill
+    private ConcurrentDictionary<string, string> _pendingStrategyTag = new();
 
     private decimal _totalRealizedPnL = 0m;
     private int _tradesToday = 0;
@@ -306,12 +314,9 @@ public class SimulatedBroker
         // Snapshot prev-day close just before open (for gap calc)
         var nowEt = GetEasternTime();
         if (nowEt.Hour == 9 && nowEt.Minute == 29)
-        {
             _prevDayClose[symbol] = candle.Close;
-            // Pre-compute daily gap for gap-and-go strategy
-            if (_latestTick.TryGetValue(symbol, out decimal tick) && candle.Close > 0)
-                _dailyGapPct[symbol] = (tick - candle.Close) / candle.Close;
-        }
+        // NOTE: _dailyGapPct is now computed live in TryGapAndGoStrategy
+        //       using _latestTick vs _prevDayClose, so it's always fresh
 
         // Track whether prev bar was above/below VWAP for crossover detection
         _vwap.TryGetValue(symbol, out decimal vwapNow);
@@ -432,7 +437,7 @@ public class SimulatedBroker
             // Confirm not in sell-off for longs
             if (_marketRegime == "SELL-OFF") goto TryShortOrb;
 
-            decimal stopDistance = Math.Max(atr * 1.5m, MIN_STOP_DISTANCE);
+            decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
             int qty = CalcQty(close, stopDistance);
             if (qty <= 0) return false;
 
@@ -444,7 +449,7 @@ public class SimulatedBroker
         // ── SHORT: price breaks below ORB low with volume ──────
         if (close < orb.Low && volumeExpansion && rsi < RSI_SHORT_MAX)
         {
-            decimal stopDistance = Math.Max(atr * 1.5m, MIN_STOP_DISTANCE);
+            decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
             int qty = CalcQty(close, stopDistance);
             if (qty <= 0) return false;
 
@@ -461,7 +466,11 @@ public class SimulatedBroker
 
     private bool TryGapAndGoStrategy(string symbol, List<Candle> candles)
     {
-        _dailyGapPct.TryGetValue(symbol, out decimal gapPct);
+        // Compute gap live: current price vs previous day close
+        if (!_prevDayClose.TryGetValue(symbol, out decimal prevClose) || prevClose <= 0) return false;
+        if (!_latestTick.TryGetValue(symbol, out decimal currentPrice) || currentPrice <= 0) return false;
+        decimal gapPct = (currentPrice - prevClose) / prevClose;
+
         if (Math.Abs(gapPct) < GAP_GO_MIN_PCT) return false;
 
         // Relative volume: compare today's volume so far vs historical avg
@@ -487,7 +496,7 @@ public class SimulatedBroker
         // Gap UP → long (not in sell-off)
         if (gapPct > 0 && rsi > RSI_LONG_MIN && volExp && _marketRegime != "SELL-OFF")
         {
-            decimal stopDistance = Math.Max(atr * 1.5m, MIN_STOP_DISTANCE);
+            decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
             int qty = CalcQty(close, stopDistance);
             if (qty <= 0) return false;
 
@@ -498,7 +507,7 @@ public class SimulatedBroker
         // Gap DOWN → short
         if (gapPct < 0 && rsi < RSI_SHORT_MAX && volExp)
         {
-            decimal stopDistance = Math.Max(atr * 1.5m, MIN_STOP_DISTANCE);
+            decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
             int qty = CalcQty(close, stopDistance);
             if (qty <= 0) return false;
 
@@ -519,41 +528,42 @@ public class SimulatedBroker
         _vwap.TryGetValue(symbol, out decimal vwapVal);
         if (vwapVal <= 0) return false;
 
+        // Need the last VWAP_CONFIRM_BARS candles ALL above VWAP — not just a 1-bar flicker
+        if (candles.Count < VWAP_CONFIRM_BARS) return false;
+        var recentBars = candles.TakeLast(VWAP_CONFIRM_BARS).ToList();
+        bool allRecentAbove = recentBars.All(c => c.Close > vwapVal);
+        bool allRecentBelow = recentBars.All(c => c.Close < vwapVal);
+
         var lastCandle = candles.Last();
         decimal close = lastCandle.Close;
         double rsi = SafeRSI(candles, 7);
         decimal atr = SafeATR(candles, 14);
         bool volExp = CheckVolumeExpansion(candles);
 
-        // ── VWAP RECLAIM (cross back above) → long ───────────
-        // Price was below VWAP last bar, now above — with volume
-        bool vwapReclaim = !prevAbove && currAbove;
-        if (vwapReclaim && volExp && rsi > 50 && _marketRegime != "SELL-OFF")
+        // Reclaim: previous bar below, now 2 bars confirmed above
+        bool vwapReclaim = !prevAbove && allRecentAbove;
+        if (vwapReclaim && volExp && rsi > RSI_LONG_MIN && _marketRegime != "SELL-OFF")
         {
-            decimal stopDistance = Math.Max(atr * 1.5m, MIN_STOP_DISTANCE);
+            decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
             int qty = CalcQty(close, stopDistance);
             if (qty <= 0) return false;
-
             OpenPosition(symbol, qty, close, TradeSide.Buy, false, "VWAP_RECLAIM");
             return true;
         }
 
-        // ── VWAP REJECTION (cross back below) → short ────────
-        // Price was above VWAP last bar, now below — with volume and falling RSI
-        bool vwapRejection = prevAbove && !currAbove;
-        if (vwapRejection && volExp && rsi < 50)
+        // Rejection: previous bar above, now 2 bars confirmed below
+        bool vwapRejection = prevAbove && allRecentBelow;
+        if (vwapRejection && volExp && rsi < RSI_SHORT_MAX && _allowShorts)
         {
-            decimal stopDistance = Math.Max(atr * 1.5m, MIN_STOP_DISTANCE);
+            decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
             int qty = CalcQty(close, stopDistance);
             if (qty <= 0) return false;
-
             OpenPosition(symbol, qty, close, TradeSide.Sell, true, "VWAP_REJECT_SHORT");
             return true;
         }
 
         return false;
     }
-
     // ══════════════════════════════════════════════════════════
     //  STRATEGY 4 — RSI MEAN REVERSION
     // ══════════════════════════════════════════════════════════
@@ -573,7 +583,7 @@ public class SimulatedBroker
         bool oversoldInUptrend = close > sma50 && rsi < RSI_OVERSOLD && _marketRegime != "SELL-OFF";
         if (oversoldInUptrend)
         {
-            decimal stopDistance = Math.Max(atr * 1.5m, MIN_STOP_DISTANCE);
+            decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
             int qty = CalcQty(close, stopDistance);
             if (qty <= 0) return false;
 
@@ -586,7 +596,7 @@ public class SimulatedBroker
         bool overboughtInDowntrend = close < sma50 && rsi > RSI_OVERBOUGHT;
         if (overboughtInDowntrend)
         {
-            decimal stopDistance = Math.Max(atr * 1.5m, MIN_STOP_DISTANCE);
+            decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
             int qty = CalcQty(close, stopDistance);
             if (qty <= 0) return false;
 
@@ -634,14 +644,17 @@ public class SimulatedBroker
         bool breakoutSignal = !choppyMode && expansion && volExp && close > recentHigh;
         bool hasSignal = breakoutSignal || pullbackEntry;
 
+        // In TryMomentumStrategy — replace the score check:
         int score = (regimeStrong ? 1 : 0)
                   + (relativeStrength ? 1 : 0)
                   + (rsiConfirm ? 1 : 0)
                   + (aboveVwap ? 1 : 0);
 
-        if (score >= 3 && hasSignal && volExp)
+        // Require all 4 in normal/trending, allow 3 only in choppy
+        int required = (_marketRegime == "CHOPPY") ? 3 : 4;
+        if (score >= required && hasSignal && volExp)
         {
-            decimal stopDistance = Math.Max(atr * 1.5m, MIN_STOP_DISTANCE);
+            decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
             int qty = CalcQty(close, stopDistance);
             if (qty <= 0) return false;
 
@@ -664,7 +677,7 @@ public class SimulatedBroker
 
             if (shortScore >= 3 && breakdownSignal)
             {
-                decimal stopDistance = Math.Max(atr * 1.5m, MIN_STOP_DISTANCE);
+                decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
                 int qty = CalcQty(close, stopDistance);
                 if (qty <= 0) return false;
 
@@ -681,17 +694,25 @@ public class SimulatedBroker
     // ══════════════════════════════════════════════════════════
 
     private void OpenPosition(string symbol, int qty, decimal price,
-                              TradeSide side, bool isShort, string strategyTag)
+                           TradeSide side, bool isShort, string strategyTag)
     {
-        // qty sanity checks
+        // Guard against nulls before touching any dictionary
+        if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(strategyTag)) return;
+
+        // Block short selling if not enabled or no margin account
+        if (isShort && !_allowShorts) return;
+
         if (qty <= 0 || qty > MAX_QTY_SANITY) return;
 
-        // For shorts, IBKR side is SELL; for longs it's BUY.
-        // We pass the side through directly — IBKR handles it as a short sell.
-        SubmitOrder(symbol, qty, price, side, strategyTag);
-        LogMessage($"[{strategyTag}] {'S'}{symbol} x{qty} @ {price:F2} | regime={_marketRegime}");
-    }
+        // Store the strategy tag so OnOrderFilled can stamp it onto the SimPosition
+        // Lazy-init guard: if field is null for any reason, recreate it before use
+        if (_pendingStrategyTag == null)
+            _pendingStrategyTag = new ConcurrentDictionary<string, string>();
+        _pendingStrategyTag[symbol] = strategyTag;
 
+        SubmitOrder(symbol, qty, price, side, strategyTag);
+        LogMessage($"[{strategyTag}] {symbol} x{qty} @ {price:F2} | regime={_marketRegime}");
+    }
     // ══════════════════════════════════════════════════════════
     //  EXIT LOGIC
     // ══════════════════════════════════════════════════════════
@@ -713,14 +734,13 @@ public class SimulatedBroker
 
             if (pos.IsShort)
             {
-                // Short: stop out if price rallies above entry + 1.5 ATR
-                decimal shortHardStop = pos.AvgPrice + atrValue * 1.5m;
+                decimal shortHardStop = pos.AvgPrice + atrValue * HARD_STOP_ATR_MULT;
                 atrStopHit = currentPrice > shortHardStop;
                 dollarStopHit = unrealizedLoss <= -MAX_LOSS_PER_TRADE;
             }
             else
             {
-                decimal longHardStop = pos.AvgPrice - atrValue * 1.5m;
+                decimal longHardStop = pos.AvgPrice - atrValue * HARD_STOP_ATR_MULT;
                 atrStopHit = currentPrice < longHardStop;
                 dollarStopHit = unrealizedLoss <= -MAX_LOSS_PER_TRADE;
             }
@@ -865,6 +885,10 @@ public class SimulatedBroker
 
             if (isLongEntry || isShortEntry)
             {
+                string tag = "";
+                _pendingStrategyTag?.TryRemove(order.Symbol, out tag);
+                string resolvedTag = tag ?? "";
+
                 _positions[order.Symbol] = new SimPosition
                 {
                     Symbol = order.Symbol,
@@ -874,7 +898,7 @@ public class SimulatedBroker
                     CurrentPrice = fillPrice,
                     EntryTime = DateTime.UtcNow,
                     IsShort = isShortEntry,
-                    StrategyTag = "" // will be filled via LogMessage from OpenPosition
+                    StrategyTag = resolvedTag
                 };
                 _tradesToday++;
 
@@ -890,20 +914,30 @@ public class SimulatedBroker
                     : (fillPrice - pos.AvgPrice) * fillQty;
                 decimal holdMinutes = (decimal)(DateTime.UtcNow - pos.EntryTime).TotalMinutes;
 
-                _marketData.TryGetValue(order.Symbol, out var exitCandles);
-                LogTradeAnalytics(order.Symbol, pos.AvgPrice, fillPrice,
-                                  pnl, holdMinutes,
-                                  SafeATR(exitCandles, 14), SafeRSI(exitCandles, 7),
-                                  pos.StrategyTag, pos.IsShort);
-
                 _totalRealizedPnL += pnl;
-                if (pnl > 0) _winCount++;
-                else _lossCount++;
 
-                _positions.Remove(order.Symbol);
-                _lastTradeTime[order.Symbol] = DateTime.UtcNow;
-                subject = $"💰 CLOSE: {order.Symbol} x{fillQty} @ {fillPrice:C2} | PnL: {pnl:C2}";
-                body = $"Closed {fillQty} @ {fillPrice:C2}\nPnL: {pnl:C2}\nStrategy: {pos.StrategyTag}";
+                // Only count win/loss and remove position on FULL close
+                // Partial exits reduce qty but keep the position alive
+                bool isFullClose = fillQty >= pos.Quantity;
+                if (isFullClose)
+                {
+                    if (pnl > 0) _winCount++;
+                    else _lossCount++;
+
+                    _marketData.TryGetValue(order.Symbol, out var exitCandles);
+                    LogTradeAnalytics(order.Symbol, pos.AvgPrice, fillPrice,
+                                      pnl, holdMinutes,
+                                      SafeATR(exitCandles, 14), SafeRSI(exitCandles, 7),
+                                      pos.StrategyTag, pos.IsShort);
+
+                    _positions.Remove(order.Symbol);
+                    _lastTradeTime[order.Symbol] = DateTime.UtcNow;
+                }
+                // Partial close — qty was already reduced in CheckExits before submit,
+                // so pos.Quantity is already the remaining amount. Nothing more to do.
+
+                subject = $"💰 {(isFullClose ? "CLOSE" : "PARTIAL")}: {order.Symbol} x{fillQty} @ {fillPrice:C2} | PnL: {pnl:C2}";
+                body = $"{(isFullClose ? "Closed" : "Partial")} {fillQty} @ {fillPrice:C2}\nPnL: {pnl:C2}\nStrategy: {pos.StrategyTag}";
             }
 
             string arrow = order.Side == TradeSide.Buy ? "▲" : "▼";
