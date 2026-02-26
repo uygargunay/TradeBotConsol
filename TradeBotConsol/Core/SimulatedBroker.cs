@@ -82,7 +82,7 @@ public class SimulatedBroker
     private readonly ConcurrentDictionary<int, TrackedOrder> _ordersById = new();
     private readonly List<string> _tradeHistoryLog = new();
     private readonly Dictionary<string, DateTime> _lastTradeTime = new();
-    private const decimal ATR_TRAIL_MULT = 2.0m;   // 2x ATR is standard for scalping
+    private const decimal ATR_TRAIL_MULT = 2.5m;   // 2x ATR is standard for scalping
 
     private decimal _totalRealizedPnL = 0m;
     private int _tradesToday = 0;
@@ -300,12 +300,7 @@ public class SimulatedBroker
             bool resistanceOkBreakout = true;
 
             // SPY regime check
-            bool regimeOk = true;
-            if (_marketData.TryGetValue("SPY", out var spy) && spy.Count > 0)
-            {
-                decimal spySma50 = SafeSMA(spy, 40);
-                regimeOk = spy.Last().Close > spySma50;
-            }
+
 
 
             bool volumeExpansion = false;
@@ -315,8 +310,8 @@ public class SimulatedBroker
                 var last10 = candles.TakeLast(10).ToList();
                 long prev5 = last10.Take(5).Sum(c => c.Volume);
                 long recent5 = last10.Skip(5).Take(5).Sum(c => c.Volume);
-
-                volumeExpansion = recent5 > prev5 * 1.3m;
+                //uygar change 1.2 to 1.5 if loosing too many trades
+                volumeExpansion = recent5 > prev5 * 1.2m;
             }
 
 
@@ -325,39 +320,101 @@ public class SimulatedBroker
             // CLEAN 1-MIN MOMENTUM LOGIC
             // ===============================
 
-            bool trendAligned =
-    sma20 > sma50 ||
-    (lastCandle.Close > sma50 && rsi > 55);
+            // === RANGE EXPANSION MODEL ===
+
+            // 1) Structure Break
+            decimal recentHigh = SafeHighestHigh(
+                candles.Take(candles.Count - 1).ToList(), 8);  // was 5
+
+            bool structureBreak =
+                lastCandle.Close > recentHigh &&
+                lastCandle.Close > sma20;   // add trend confirmation
 
 
-            bool momentumStrong =
+            // 2) Range Expansion
+            decimal range = lastCandle.High - lastCandle.Low;
+            decimal avgRange = candles.TakeLast(10)
+                                      .Average(c => c.High - c.Low);
+
+            bool expansion = range > avgRange * 1.8m;
+            bool rsiConfirm = rsi > 57;   // light confirmation
+
+            // 3) Relative Strength vs SPY
+            bool relativeStrength = true;
+
+            // --- Pullback Continuation ---
+            bool pullbackEntry =
+                lastCandle.Low <= sma20 &&
                 lastCandle.Close > sma20 &&
                 rsi > 55 &&
-                atrPct > 0.0015m;        // 0.2% volatility filter
+                volumeExpansion;
 
-            // Optional breakout confirmation
-            decimal recentHigh = SafeHighestHigh(
-                candles.Take(candles.Count - 1).ToList(), 5);
 
-            bool structureBreak = lastCandle.Close > recentHigh;
+            if (_marketData.TryGetValue("SPY", out var spy) && spy.Count > 20)
+            {
+                decimal symbolReturn =
+                    lastCandle.Close /
+                    candles[candles.Count - 20].Close;
+
+                decimal spyReturn =
+                    spy.Last().Close /
+                    spy[spy.Count - 20].Close;
+
+                relativeStrength = symbolReturn > spyReturn;
+            }
+
+            // 4) Strong Regime Filter
+            bool regimeStrong = true;
+
+            if (_marketData.TryGetValue("SPY", out spy) && spy.Count > 50)
+            {
+                decimal spySma20 = SafeSMA(spy, 20);
+                decimal spySma50 = SafeSMA(spy, 50);
+
+                regimeStrong =
+                    spy.Last().Close > spySma20 &&
+                    spySma20 > spySma50;
+            }
+
+            bool breakoutSignal =
+                expansion &&
+                volumeExpansion &&
+                lastCandle.Close > recentHigh;
+
+
+            bool continuationSignal =
+                pullbackEntry;
 
             bool buySignal =
-                regimeOk &&
-                trendAligned &&
-                momentumStrong &&
-                structureBreak;
+                regimeStrong &&
+                relativeStrength &&
+                volumeExpansion &&
+                rsiConfirm &&
+                (breakoutSignal || continuationSignal);
+
+
 
             if (buySignal)
             {
-                int qty = (int)(POSITION_SIZE / lastCandle.Close);
+                atr = SafeATR(candles, 14);
+                decimal stopDistance = atr * 1.5m;
+
+                decimal riskPerTrade = TOTAL_BUDGET * 0.01m; // risk 1% of account
+                int qty = stopDistance > 0
+                    ? (int)(riskPerTrade / stopDistance)
+                    : 0;
+
+                // Optional capital cap
+                int maxQtyByCapital = (int)(POSITION_SIZE / lastCandle.Close);
+                qty = Math.Min(qty, maxQtyByCapital);
 
                 if (qty > 0)
                 {
                     SubmitOrder(symbol, qty, lastCandle.Close,
-                        TradeSide.Buy, "MOMENTUM_BREAKOUT");
+                        TradeSide.Buy, "VOL_EXPANSION_BREAKOUT");
                 }
+
             }
-            Console.WriteLine($"{symbol} | Regime: {regimeOk} | Trend: {trendAligned} | RSI: {rsi:F1} | Break: {structureBreak}");
 
         }
 
@@ -402,20 +459,7 @@ public class SimulatedBroker
                 }
 
                 // Trend break
-                decimal sma20 = SafeSMA(candles, 20);
-                if (currentPrice < sma20 && gainPct > 0.005m)
-                {
-                    SubmitOrder(symbol, pos.Quantity, currentPrice, TradeSide.Sell, "TREND_EXIT_PROFIT");
-                    return;
-                }
-
-                // Volatility collapse
-                decimal atrPct = currentPrice > 0 ? atrValue / currentPrice : 0m;
-                if (atrPct < 0.004m)
-                {
-                    SubmitOrder(symbol, pos.Quantity, 0, TradeSide.Sell, "VOLATILITY_EXIT", "MKT");
-                    return;
-                }
+                
             }
         }
     }
