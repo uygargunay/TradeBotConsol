@@ -123,7 +123,7 @@ public class IbClient : EWrapper, IBroker
 
         // Log all tick updates for debugging
         //Console.WriteLine($"TickPrice | Symbol: {symbol}, Field: {field}, Price: {price}");
-
+        if (field != 4) return;
         // Update broker — you can filter inside UpdateLiveTick if you want LAST trade only
         _tickVolume.TryGetValue(symbol, out long vol);
         _broker.UpdateLiveTick(symbol, (decimal)price, vol);
@@ -145,7 +145,8 @@ public class IbClient : EWrapper, IBroker
     // Required by IBroker but logic handled in SimulatedBroker
     public void RequestHistoricalData(string symbol)
     {
-        int id = _liveReqId++;
+        int id = Interlocked.Increment(ref _liveReqId);
+
         _reqIdToSymbol[id] = symbol;
 
         Contract contract = new Contract
@@ -321,11 +322,6 @@ public class IbClient : EWrapper, IBroker
     {
         Console.WriteLine($"[EXECUTION] OrderId={execution.OrderId} Shares={execution.Shares} Price={execution.Price}");
 
-        _broker.OnOrderFilled(
-            execution.OrderId,
-            (int)Math.Round(execution.Shares),   // <-- FIX HERE
-            (decimal)execution.Price
-        );
     }
 
 

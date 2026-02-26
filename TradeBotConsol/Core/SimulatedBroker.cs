@@ -284,7 +284,7 @@ public class SimulatedBroker
             decimal atrPct = lastCandle.Close > 0 ? atr / lastCandle.Close : 0m;
 
             decimal highest30 = SafeHighestHigh(candles, 30);
-            decimal highest10 = SafeHighestHigh(candles.Take(candles.Count - 1).ToList(), 10);
+           
 
 
             bool isTrendUp = lastCandle.Close > sma50 && sma50 > sma50_5ago;
@@ -311,7 +311,7 @@ public class SimulatedBroker
                 long prev5 = last10.Take(5).Sum(c => c.Volume);
                 long recent5 = last10.Skip(5).Take(5).Sum(c => c.Volume);
                 //uygar change 1.2 to 1.5 if loosing too many trades
-                volumeExpansion = recent5 > prev5 * 1.2m;
+                volumeExpansion = recent5 > prev5 * 1.5m;
             }
 
 
@@ -446,6 +446,7 @@ public class SimulatedBroker
                 return;
             }
 
+            if (secondsHeld < MIN_HOLD_SECONDS) return;
 
             // === STRATEGIC EXITS ===
             if (secondsHeld > MIN_HOLD_SECONDS)
@@ -672,7 +673,6 @@ public class SimulatedBroker
     private void CheckDailyReset()
     {
         var nowEt = GetEasternTime();
-
         if (_lastVolumeResetEt == DateTime.MinValue)
             _lastVolumeResetEt = nowEt.Date;
 
@@ -680,25 +680,28 @@ public class SimulatedBroker
         {
             _dailyVolume.Clear();
             _lastVolumeResetEt = nowEt.Date;
-            Console.WriteLine($"[VOLUME RESET] {nowEt:yyyy-MM-dd}");
+            _eodSent = false;          // ← ADD THIS
+            _haltTrading = false;      // ← ADD THIS (so next day trading resumes)
+            _tradesToday = 0;          // ← ADD THIS
+            _totalRealizedPnL = 0m;    // ← ADD THIS if you want fresh daily PnL
+            Console.WriteLine($"[DAY RESET] {nowEt:yyyy-MM-dd}");
         }
     }
 
     public void CheckEndOfDay()
     {
         var now = GetEasternTime();
-        if (now.Hour == 15 && now.Minute >= 50 && !_eodSent)
+        if (!_eodSent && now.Hour == 15 && now.Minute >= 50)
         {
             _haltTrading = true;
             _eodSent = true;
+
             foreach (var p in _positions.Values.ToList())
                 SubmitOrder(p.Symbol, p.Quantity, 0, TradeSide.Sell, "EOD_LIQUIDATE", "MKT");
 
-            if (now.Hour >= 16)
-            {
-                string report = $"EOD PnL: {_totalRealizedPnL:C2}\nTrades: {_tradesToday}\n\nLog:\n" + string.Join("\n", _tradeHistoryLog);
-                SendEmail("📊 EOD PERFORMANCE REPORT", report);
-            }
+            string report = $"EOD PnL: {_totalRealizedPnL:C2}\nTrades: {_tradesToday}\n\nLog:\n"
+                           + string.Join("\n", _tradeHistoryLog);
+            _ = SendEmail("📊 EOD PERFORMANCE REPORT", report);  // ← moved outside the inner if
         }
     }
 

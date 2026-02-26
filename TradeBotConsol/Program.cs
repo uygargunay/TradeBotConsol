@@ -14,7 +14,7 @@ class Program
         broker.RealBroker = client;
 
         broker.LoadMarketMemory();
-        broker.ClearMarketData();
+
 
         try
         {
