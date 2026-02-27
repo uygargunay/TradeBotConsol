@@ -451,7 +451,7 @@ public class SimulatedBroker
 
         // Skip stocks trading below $10 — too noisy, wide spreads, unreliable ATR signals
         decimal lastPrice = candles.Last().Close;
-        if (lastPrice < 10m) return;
+        if (lastPrice < 10m) return; 
 
         lock (_lock)
         {
