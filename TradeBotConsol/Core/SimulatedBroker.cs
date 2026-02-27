@@ -67,6 +67,15 @@ public class BotPersistData
 {
     public Dictionary<string, SimPosition> Positions { get; set; } = new();
     public decimal TotalPnL { get; set; }
+
+    // NEW — needed to safely resume
+    public int WinCount { get; set; }
+    public int LossCount { get; set; }
+    public int TradesToday { get; set; }
+    public bool HaltTrading { get; set; }
+    public Dictionary<string, DateTime> LastTradeTime { get; set; } = new();
+    public Dictionary<string, bool> LastTradeWasLoss { get; set; } = new();
+    public Dictionary<string, int> DailyEntryCount { get; set; } = new();
 }
 
 // Tracks the Opening Range (first 30 min high/low) per symbol
@@ -149,6 +158,15 @@ public class SimulatedBroker
     // Strategy tag staging — set before order, stamped onto position at fill
     private ConcurrentDictionary<string, string> _pendingStrategyTag = new();
 
+    // Race-condition guard: counts orders submitted but not yet filled
+    // Prevents 3 entries firing before any fill comes back (12:09 bug)
+    private int _pendingEntryCount = 0;
+
+    // Per-symbol loss tracking — doubles cooldown after a losing trade
+    private readonly Dictionary<string, bool> _lastTradeWasLoss = new();
+    // Per-symbol daily entry count — max 1 entry per symbol per day
+    private readonly Dictionary<string, int> _dailyEntryCount = new();
+
     private decimal _totalRealizedPnL = 0m;
     private int _tradesToday = 0;
     private bool _haltTrading = false;
@@ -169,17 +187,38 @@ public class SimulatedBroker
 
     // ── WATCHLIST ──────────────────────────────────────────
     public readonly string[] _watchlist =
-    {
-        "SPY","QQQ","IWM","DIA","SMH","XLK","XLF","XLE","ARKK",
-        "AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","AMD","INTC","ORCL","IBM",
-        "TSM","ASML","AVGO","QCOM","TXN","MU","ARM","LRCX","AMAT","SMCI",
-        "CRM","NOW","SNOW","MDB","DDOG","NET","OKTA","ZS","CRWD","PANW","PLTR",
-        "NFLX","DIS","UBER","LYFT","ABNB","RBLX","SHOP","ETSY",
-        "COIN","MSTR","SQ","PYPL","HOOD","SOFI","JPM","BAC","GS",
-        "NIO","RIVN","LCID","ENPH","SEDG","FSLR","PLUG",
-        "JNJ","PFE","MRNA","ABBV","UNH","VRTX",
-        "BA","CAT","DE","GE","HON","RTX","LMT"
-    };
+  {
+    // ── CORE ETFs ─────────────────────────────────────────
+    "SPY","QQQ","IWM","DIA","SMH","XLK","XLF","XLE","XBI",
+
+    // ── MEGA CAP TECH ─────────────────────────────────────
+    "AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","ORCL","IBM","ADBE",
+
+    // ── SEMIS ─────────────────────────────────────────────
+    "AMD","ARM","AVGO","QCOM","MU","LRCX","AMAT","ASML","TSM","TXN",
+
+    // ── CLOUD / SAAS ──────────────────────────────────────
+    "CRM","NOW","SNOW","MDB","DDOG","NET","ZS","CRWD","PANW","PLTR",
+    "OKTA","TTD","APP",
+
+    // ── FINTECH / CRYPTO ──────────────────────────────────
+    "COIN","MSTR","PYPL","HOOD","SOFI","XYZ",   // XYZ = Block (was SQ)
+
+    // ── FINANCIALS ────────────────────────────────────────
+    "JPM","BAC","GS","MS","V","MA","BX",
+
+    // ── HIGH-MOMENTUM GROWTH ──────────────────────────────
+    "NFLX","UBER","ABNB","SHOP","MELI","BKNG","DASH","SPOT","INTU","ANET",
+
+    // ── ENERGY ────────────────────────────────────────────
+    "XOM","CVX","OXY",
+
+    // ── BIOTECH / HEALTH ──────────────────────────────────
+    "ABBV","UNH","VRTX","REGN","GILD",
+
+    // ── INDUSTRIALS / DEFENSE ─────────────────────────────
+    "CAT","DE","GE","HON","RTX","LMT","BA"
+};
 
     // Dashboard timer
     private Timer _dashboardTimer;
@@ -381,14 +420,23 @@ public class SimulatedBroker
             return;
         }
 
-        if (candles.TakeLast(300).Sum(c => c.Volume) < 30_000) return;
+        if (candles.TakeLast(300).Sum(c => c.Volume) < 50_000) return;
 
         lock (_lock)
         {
             if (_positions.ContainsKey(symbol)) return;
-            if (_positions.Count >= MAX_POSITIONS) return;
+            // Include pending (submitted but unfilled) orders in the cap
+            if (_positions.Count + _pendingEntryCount >= MAX_POSITIONS) return;
             if (_lastTradeTime.TryGetValue(symbol, out var lastTime))
-                if ((DateTime.UtcNow - lastTime).TotalSeconds < COOLDOWN_SECONDS) return;
+            {
+                // Double cooldown if the last trade on this symbol was a loss
+                int cooldown = _lastTradeWasLoss.GetValueOrDefault(symbol)
+                    ? COOLDOWN_SECONDS * 2
+                    : COOLDOWN_SECONDS;
+                if ((DateTime.UtcNow - lastTime).TotalSeconds < cooldown) return;
+            }
+            // Max 1 entry per symbol per day — if already entered once today, skip
+            if (_dailyEntryCount.GetValueOrDefault(symbol) >= 1) return;
 
             int minutesSinceOpen = (nowEt.Hour - 9) * 60 + nowEt.Minute - 30;
 
@@ -710,6 +758,14 @@ public class SimulatedBroker
             _pendingStrategyTag = new ConcurrentDictionary<string, string>();
         _pendingStrategyTag[symbol] = strategyTag;
 
+        // Reserve a slot immediately so concurrent candle events can't over-enter
+        Interlocked.Increment(ref _pendingEntryCount);
+        // Track how many times this symbol has been entered today
+        lock (_lock)
+        {
+            _dailyEntryCount[symbol] = _dailyEntryCount.GetValueOrDefault(symbol) + 1;
+        }
+
         SubmitOrder(symbol, qty, price, side, strategyTag);
         LogMessage($"[{strategyTag}] {symbol} x{qty} @ {price:F2} | regime={_marketRegime}");
     }
@@ -726,23 +782,29 @@ public class SimulatedBroker
             if (pos.ExitSubmitted) return;
             if (!_marketData.TryGetValue(symbol, out var candles)) return;
 
+            double secondsHeld = (DateTime.UtcNow - pos.EntryTime).TotalSeconds;
+
             decimal atrValue = SafeATR(candles, 14);
             decimal unrealizedLoss = pos.UnrealizedPnL(currentPrice);
 
-            bool dollarStopHit;
-            bool atrStopHit;
+            // Dollar stop fires immediately (protects against flash crashes)
+            bool dollarStopHit = unrealizedLoss <= -MAX_LOSS_PER_TRADE;
 
-            if (pos.IsShort)
+            // ATR stop has a 2-minute immunity window — normal 1-min noise
+            // was stopping out GS (31s) and COIN (2m) before they had any chance
+            bool atrStopHit = false;
+            if (secondsHeld >= 120)
             {
-                decimal shortHardStop = pos.AvgPrice + atrValue * HARD_STOP_ATR_MULT;
-                atrStopHit = currentPrice > shortHardStop;
-                dollarStopHit = unrealizedLoss <= -MAX_LOSS_PER_TRADE;
-            }
-            else
-            {
-                decimal longHardStop = pos.AvgPrice - atrValue * HARD_STOP_ATR_MULT;
-                atrStopHit = currentPrice < longHardStop;
-                dollarStopHit = unrealizedLoss <= -MAX_LOSS_PER_TRADE;
+                if (pos.IsShort)
+                {
+                    decimal shortHardStop = pos.AvgPrice + atrValue * HARD_STOP_ATR_MULT;
+                    atrStopHit = currentPrice > shortHardStop;
+                }
+                else
+                {
+                    decimal longHardStop = pos.AvgPrice - atrValue * HARD_STOP_ATR_MULT;
+                    atrStopHit = currentPrice < longHardStop;
+                }
             }
 
             if (atrStopHit || dollarStopHit)
@@ -803,8 +865,8 @@ public class SimulatedBroker
                 return;
             }
 
-            // ── TIME STOP: 20 min with no progress ────────────
-            if (secondsHeld > 1200 && gainPct < 0.003m)
+            // ── TIME STOP: 30 min with no progress (was 20, PLTR/ORCL/PANW exited too soon)
+            if (secondsHeld > 1800 && gainPct < 0.003m)
             {
                 pos.ExitSubmitted = true;
                 SubmitOrder(symbol, pos.Quantity, currentPrice, exitSide, "TIME_STOP");
@@ -885,6 +947,9 @@ public class SimulatedBroker
 
             if (isLongEntry || isShortEntry)
             {
+                // Fill received — pending slot is now a real position
+                Interlocked.Decrement(ref _pendingEntryCount);
+
                 string tag = "";
                 _pendingStrategyTag?.TryRemove(order.Symbol, out tag);
                 string resolvedTag = tag ?? "";
@@ -932,6 +997,8 @@ public class SimulatedBroker
 
                     _positions.Remove(order.Symbol);
                     _lastTradeTime[order.Symbol] = DateTime.UtcNow;
+                    // Remember outcome so we can double the cooldown after a loss
+                    _lastTradeWasLoss[order.Symbol] = pnl <= 0;
                 }
                 // Partial close — qty was already reduced in CheckExits before submit,
                 // so pos.Quantity is already the remaining amount. Nothing more to do.
@@ -982,6 +1049,9 @@ public class SimulatedBroker
         _orbRanges.Clear();
         _dailyGapPct.Clear();
         _prevBarAboveVwap.Clear();
+        _dailyEntryCount.Clear();
+        _lastTradeWasLoss.Clear();
+        _pendingEntryCount = 0;
         _lastVolumeResetEt = nowEt.Date;
         _eodSent = false;
         _haltTrading = false;
@@ -1025,13 +1095,21 @@ public class SimulatedBroker
     {
         try
         {
-            File.WriteAllText("bot_state.json",
-                JsonSerializer.Serialize(
-                    new BotPersistData { Positions = _positions, TotalPnL = _totalRealizedPnL }));
+            File.WriteAllText("bot_state.json", JsonSerializer.Serialize(new BotPersistData
+            {
+                Positions = _positions,
+                TotalPnL = _totalRealizedPnL,
+                WinCount = _winCount,
+                LossCount = _lossCount,
+                TradesToday = _tradesToday,
+                HaltTrading = _haltTrading,
+                LastTradeTime = _lastTradeTime,
+                LastTradeWasLoss = _lastTradeWasLoss,
+                DailyEntryCount = _dailyEntryCount
+            }));
         }
         catch (Exception ex) { LogError("SaveState", ex.Message); }
     }
-
     public void LoadState()
     {
         if (!File.Exists("bot_state.json")) return;
@@ -1039,11 +1117,33 @@ public class SimulatedBroker
         {
             var data = JsonSerializer.Deserialize<BotPersistData>(
                            File.ReadAllText("bot_state.json"));
-            if (data != null)
+            if (data == null) return;
+
+            _positions = data.Positions;
+            _totalRealizedPnL = data.TotalPnL;
+            _winCount = data.WinCount;
+            _lossCount = data.LossCount;
+            _tradesToday = data.TradesToday;
+            _haltTrading = data.HaltTrading;
+
+            foreach (var kv in data.LastTradeTime)
+                _lastTradeTime[kv.Key] = kv.Value;
+            foreach (var kv in data.LastTradeWasLoss)
+                _lastTradeWasLoss[kv.Key] = kv.Value;
+            foreach (var kv in data.DailyEntryCount)
+                _dailyEntryCount[kv.Key] = kv.Value;
+
+            // Safety: mark all restored positions as not yet exit-submitted
+            // so they get managed normally. HighWaterMark defaults to AvgPrice
+            // which is conservative — trail starts fresh from entry.
+            foreach (var pos in _positions.Values)
             {
-                _positions = data.Positions;
-                _totalRealizedPnL = data.TotalPnL;
+                pos.ExitSubmitted = false;
+                if (pos.HighWaterMark <= 0)
+                    pos.HighWaterMark = pos.AvgPrice;
             }
+
+            LogMessage($"[RESUME] Loaded {_positions.Count} positions, PnL={_totalRealizedPnL:C2}");
         }
         catch (Exception ex) { LogError("LoadState", ex.Message); }
     }
@@ -1279,7 +1379,7 @@ public class SimulatedBroker
                 _prevDayClose.TryGetValue(sym, out decimal prevClose);
                 decimal gapPct = prevClose > 0 ? (price - prevClose) / prevClose * 100 : 0;
                 long volK = _dailyVolume.GetValueOrDefault(sym) / 1000;
-                string trend = price > sma50 ? "▲ UP  " : "● NEUT";
+                string trend = price > sma50 ? "▲ UP  " : "- NEUT";
 
                 _orbRanges.TryGetValue(sym, out var orb);
                 decimal orbHi = orb?.High ?? 0m;
@@ -1416,10 +1516,15 @@ public class SimulatedBroker
         for (int i = candles.Count - period; i < candles.Count; i++)
         {
             double diff = (double)(candles[i].Close - candles[i - 1].Close);
-            if (diff >= 0) gain += diff;
-            else loss -= diff;
+            if (diff > 0) gain += diff;
+            else if (diff < 0) loss -= diff;
         }
+
+        // If there is literally no movement, return neutral 50
+        if (gain == 0 && loss == 0) return 50;
         if (loss == 0) return 100;
+        if (gain == 0) return 0;
+
         return 100 - 100 / (1 + gain / loss);
     }
 
@@ -1475,7 +1580,12 @@ public class SimulatedBroker
     // Unified position sizing: risk RISK_PCT of budget per trade
     private int CalcQty(decimal price, decimal stopDistance)
     {
-        if (stopDistance < MIN_STOP_DISTANCE) return 0;
+        // Enforce a price-relative floor: at least 0.3% of price
+        // Prevents over-large qty on low-ATR stocks like ABBV/JNJ where
+        // 1-min ATR can be $0.10–0.20, making stop distance trivially small
+        decimal minStop = Math.Max(MIN_STOP_DISTANCE, price * 0.003m);
+        if (stopDistance < minStop) stopDistance = minStop;
+
         decimal riskAmount = TOTAL_BUDGET * RISK_PCT;
         int qty = (int)(riskAmount / stopDistance);
         int maxByBudget = (int)(POSITION_SIZE / price);

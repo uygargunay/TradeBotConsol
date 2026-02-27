@@ -101,6 +101,7 @@ public class IbClient : EWrapper, IBroker
         Console.WriteLine($"[IBKR] Subscribed to {symbol} with reqId {reqId}");
     }
 
+
     // --- HISTORICAL DATA REQUEST ---
     // FIX: was _liveReqId++ (not thread-safe). Now uses Interlocked.Increment.
     public void RequestHistoricalData(string symbol)
