@@ -28,6 +28,9 @@ public class IbClient : EWrapper, IBroker
         _broker = broker;
     }
 
+    // IBroker.IsReady — true once nextValidId has fired
+    public bool IsReady => _isReady;
+
     // --- SUBMIT ORDER ---
     public void SubmitOrder(string symbol, int qty, decimal price, TradeSide side, double currentRsi = 0, string orderType = "LMT")
     {
@@ -82,6 +85,19 @@ public class IbClient : EWrapper, IBroker
 
     public bool IsConnected() => _client.IsConnected();
     public void Disconnect() => _client.eDisconnect();
+
+    // IBroker.RequestPositions — fires reqPositions() on the IBKR socket.
+    // IBKR will call position() once per holding, then positionEnd() when done.
+    public void RequestPositions()
+    {
+        if (!_isReady)
+        {
+            Console.WriteLine("[IBKR] RequestPositions called before ready — ignored.");
+            return;
+        }
+        Console.WriteLine("[IBKR] Sending reqPositions()...");
+        _client.reqPositions();
+    }
 
     // --- SUBSCRIBE TO LIVE DATA ---
     public void Subscribe(string symbol)
@@ -216,6 +232,14 @@ public class IbClient : EWrapper, IBroker
         _client.reqMarketDataType(1); // 1 = Live data
         _isReady = true;
         Console.WriteLine("[IBKR] Connected and Ready.");
+
+        // Case A: LoadState ran BEFORE Connect() and set NeedsReconciliation = true.
+        // This is the earliest safe point to call reqPositions() — socket is now live.
+        if (_broker.NeedsReconciliation)
+        {
+            Console.WriteLine("[IBKR] Requesting position snapshot for reconciliation (deferred from LoadState)...");
+            _client.reqPositions();
+        }
     }
 
     public void connectAck() => Console.WriteLine("[IBKR] Socket connected.");
@@ -261,8 +285,19 @@ public class IbClient : EWrapper, IBroker
     public void updateMktDepth(int tickerId, int position, int operation, int side, double price, int size) { }
     public void updateMktDepthL2(int tickerId, int position, string marketMaker, int operation, int side, double price, int size) { }
     public void updateNewsBulletin(int msgId, int msgType, string message, string origExchange) { }
-    public void position(string account, Contract contract, double pos, double avgCost) { }
-    public void positionEnd() { }
+    public void position(string account, Contract contract, double pos, double avgCost)
+    {
+        // pos == 0 means IBKR closed the position — skip it
+        if (pos == 0) return;
+        Console.WriteLine($"[IBKR] position(): {contract.Symbol} x{(int)pos} @ {avgCost:F2}");
+        _broker.OnPositionReceived(contract.Symbol, (int)pos, (decimal)avgCost);
+    }
+
+    public void positionEnd()
+    {
+        Console.WriteLine("[IBKR] positionEnd() — snapshot complete, triggering reconciliation.");
+        _broker.OnReconciliationComplete();
+    }
     public void scannerParameters(string xml) { }
     public void scannerData(int reqId, int rank, ContractDetails contractDetails, string distance, string benchmark, string projection, string legsStr) { }
     public void scannerDataEnd(int reqId) { }

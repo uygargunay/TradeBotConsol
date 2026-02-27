@@ -30,6 +30,14 @@ public interface IBroker
     void SubmitOrder(string symbol, int qty, decimal price, TradeSide side,
                      double currentRsi = 0, string orderType = "LMT");
     void RequestHistoricalData(string symbol);
+
+    // True once the IBKR socket handshake is complete (nextValidId has fired).
+    bool IsReady { get; }
+
+    // Sends reqPositions() to IBKR. The adapter must call
+    // SimulatedBroker.OnPositionReceived() per position, then
+    // SimulatedBroker.OnReconciliationComplete() when IBKR fires positionEnd().
+    void RequestPositions();
 }
 
 public enum TradeSide { Buy, Sell }
@@ -111,12 +119,12 @@ public class SimulatedBroker
     private const int MAX_QTY_SANITY = 500;
     private const decimal RISK_PCT = 0.015m;  // 1.5%
     private const int ORB_MINUTES = 30;
-    private const decimal VOL_EXPAND_MULT = 1.3m;    // middle ground
-    private const double RSI_LONG_MIN = 54.0;    // slightly above neutral
-    private const double RSI_SHORT_MAX = 46.0;
+    private const decimal VOL_EXPAND_MULT = 1.5m;    // tightened from 1.3 — need real volume surge
+    private const double RSI_LONG_MIN = 56.0;    // tightened from 54 — confirm upward momentum
+    private const double RSI_SHORT_MAX = 44.0;   // tightened from 46 — confirm downward momentum
     private const double RSI_OVERSOLD = 30.0;    // genuinely stretched
     private const double RSI_OVERBOUGHT = 70.0;
-    private const decimal GAP_GO_MIN_PCT = 0.005m;
+    private const decimal GAP_GO_MIN_PCT = 0.008m;  // tightened from 0.5% — only meaningful gaps
     private const decimal GAP_GO_REL_VOL = 1.5m;
     private const int VWAP_CONFIRM_BARS = 2;
 
@@ -173,6 +181,15 @@ public class SimulatedBroker
     private bool _eodSent = false;
     private DateTime _lastVolumeResetEt = DateTime.MinValue;
     private DateTime _lastMemorySave = DateTime.MinValue;
+
+    // ── RECONCILIATION ─────────────────────────────────────────────────────────
+    // _reconciled blocks ExecuteStrategy until IBKR confirms its live positions.
+    // _needsReconciliation is the one-shot trigger: set by LoadState(), consumed by
+    // either nextValidId (if Connect comes after LoadState) or LoadState itself
+    // (if Connect already happened first). Cleared in OnReconciliationComplete().
+    private volatile bool _reconciled = false;
+    private volatile bool _needsReconciliation = false;
+    private readonly Dictionary<string, (int qty, decimal avgCost)> _ibkrPositionSnapshot = new();
 
     private static readonly TimeZoneInfo Eastern =
         TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
@@ -409,18 +426,32 @@ public class SimulatedBroker
         CheckDailyReset();
         if (_haltTrading) return;
 
+        // Block new entries until IBKR position snapshot is reconciled.
+        // Prevents buying into already-open positions after a restart.
+        if (!_reconciled)
+        {
+            LogMessage("[SKIP] Waiting for IBKR position reconciliation before trading.");
+            return;
+        }
+
         var nowEt = GetEasternTime();
         if (nowEt.DayOfWeek == DayOfWeek.Saturday || nowEt.DayOfWeek == DayOfWeek.Sunday) return;
-        if (nowEt.Hour < 9 || (nowEt.Hour == 9 && nowEt.Minute < 31)) return;
-        if (nowEt.Hour > 15 || (nowEt.Hour == 15 && nowEt.Minute >= 45)) return;
+        // No trading in first 30 min (9:30–10:00 ET) — ORB is still forming, spreads wide
+        if (nowEt.Hour < 10) return;
+        // No trading in last 30 min (15:30–16:00 ET) — liquidity dries up, slippage spikes
+        if (nowEt.Hour > 15 || (nowEt.Hour == 15 && nowEt.Minute >= 30)) return;
 
-        if (!_marketData.TryGetValue(symbol, out var candles) || candles.Count < 20)
+        if (!_marketData.TryGetValue(symbol, out var candles) || candles.Count < 30)
         {
             LogMessage($"[SKIP] {symbol} not enough candles: {candles?.Count ?? 0}");
             return;
         }
 
         if (candles.TakeLast(300).Sum(c => c.Volume) < 50_000) return;
+
+        // Skip stocks trading below $10 — too noisy, wide spreads, unreliable ATR signals
+        decimal lastPrice = candles.Last().Close;
+        if (lastPrice < 10m) return;
 
         lock (_lock)
         {
@@ -447,7 +478,7 @@ public class SimulatedBroker
             if (minutesSinceOpen > ORB_MINUTES)
                 if (TryOrbStrategy(symbol, candles, nowEt)) return;
 
-            // 2. Gap-and-Go (only first 60 min of session)
+            // 2. Gap-and-Go (only first 30 min of allowed trading window, 10:00–10:30 ET)
             if (minutesSinceOpen <= 60)
                 if (TryGapAndGoStrategy(symbol, candles)) return;
 
@@ -790,10 +821,10 @@ public class SimulatedBroker
             // Dollar stop fires immediately (protects against flash crashes)
             bool dollarStopHit = unrealizedLoss <= -MAX_LOSS_PER_TRADE;
 
-            // ATR stop has a 2-minute immunity window — normal 1-min noise
-            // was stopping out GS (31s) and COIN (2m) before they had any chance
+            // ATR stop has a 5-minute immunity window — matches MIN_HOLD_SECONDS
+            // 2-minute window was stopping ABNB/GS/COIN on normal open volatility
             bool atrStopHit = false;
-            if (secondsHeld >= 120)
+            if (secondsHeld >= MIN_HOLD_SECONDS)
             {
                 if (pos.IsShort)
                 {
@@ -1065,7 +1096,7 @@ public class SimulatedBroker
     public void CheckEndOfDay()
     {
         var now = GetEasternTime();
-        if (!_eodSent && now.Hour == 15 && now.Minute >= 50)
+        if (!_eodSent && now.Hour == 15 && now.Minute >= 30)
         {
             _haltTrading = true;
             _eodSent = true;
@@ -1112,12 +1143,17 @@ public class SimulatedBroker
     }
     public void LoadState()
     {
-        if (!File.Exists("bot_state.json")) return;
+        if (!File.Exists("bot_state.json"))
+        {
+            // First-ever run — nothing to reconcile, allow trading immediately.
+            _reconciled = true;
+            return;
+        }
         try
         {
             var data = JsonSerializer.Deserialize<BotPersistData>(
                            File.ReadAllText("bot_state.json"));
-            if (data == null) return;
+            if (data == null) { _reconciled = true; return; }
 
             _positions = data.Positions;
             _totalRealizedPnL = data.TotalPnL;
@@ -1126,26 +1162,139 @@ public class SimulatedBroker
             _tradesToday = data.TradesToday;
             _haltTrading = data.HaltTrading;
 
-            foreach (var kv in data.LastTradeTime)
-                _lastTradeTime[kv.Key] = kv.Value;
-            foreach (var kv in data.LastTradeWasLoss)
-                _lastTradeWasLoss[kv.Key] = kv.Value;
-            foreach (var kv in data.DailyEntryCount)
-                _dailyEntryCount[kv.Key] = kv.Value;
+            foreach (var kv in data.LastTradeTime) _lastTradeTime[kv.Key] = kv.Value;
+            foreach (var kv in data.LastTradeWasLoss) _lastTradeWasLoss[kv.Key] = kv.Value;
+            foreach (var kv in data.DailyEntryCount) _dailyEntryCount[kv.Key] = kv.Value;
 
-            // Safety: mark all restored positions as not yet exit-submitted
-            // so they get managed normally. HighWaterMark defaults to AvgPrice
-            // which is conservative — trail starts fresh from entry.
             foreach (var pos in _positions.Values)
             {
                 pos.ExitSubmitted = false;
-                if (pos.HighWaterMark <= 0)
-                    pos.HighWaterMark = pos.AvgPrice;
+                if (pos.HighWaterMark <= 0) pos.HighWaterMark = pos.AvgPrice;
             }
 
             LogMessage($"[RESUME] Loaded {_positions.Count} positions, PnL={_totalRealizedPnL:C2}");
+
+            // --- Reconciliation trigger (handles both startup orderings) ---
+            // Case A: LoadState runs BEFORE Connect() / nextValidId fires.
+            //         Set the flag; IbClient.nextValidId() will call reqPositions().
+            // Case B: LoadState runs AFTER Connect() (nextValidId already fired).
+            //         IsReady is already true — call RequestPositions() right now.
+            _needsReconciliation = true;
+            if (RealBroker?.IsReady == true)
+            {
+                LogMessage("[RESUME] Broker already ready — requesting positions now.");
+                RealBroker.RequestPositions();
+            }
+            else
+            {
+                LogMessage("[RESUME] Waiting for broker ready — reconciliation deferred to nextValidId.");
+            }
         }
-        catch (Exception ex) { LogError("LoadState", ex.Message); }
+        catch (Exception ex)
+        {
+            LogError("LoadState", ex.Message);
+            _reconciled = true; // don't leave the bot permanently blocked on a bad file
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  IBKR POSITION RECONCILIATION
+    // ══════════════════════════════════════════════════════════
+
+    // Read by IbClient.nextValidId() to know whether to fire reqPositions().
+    public bool NeedsReconciliation => _needsReconciliation;
+
+    // Polled by Program.cs to know when it's safe to subscribe to live ticks.
+    public bool IsReconciled => _reconciled;
+
+    // Called by IbClient.position() for every position IBKR reports.
+    public void OnPositionReceived(string symbol, int qty, decimal avgCost)
+    {
+        if (string.IsNullOrEmpty(symbol)) return;
+        // qty < 0 = short position; qty == 0 = closed (IBKR sometimes sends these, skip)
+        if (qty == 0) return;
+        lock (_lock)
+            _ibkrPositionSnapshot[symbol] = (qty, avgCost);
+        Console.WriteLine($"[RECONCILE] ← {symbol} x{qty} @ {avgCost:F2}");
+    }
+
+    // Called by IbClient.positionEnd() — performs the merge and unblocks trading.
+    // IBKR is always the source of truth.
+    //   In IBKR, not in saved state  →  inject  (the GILD scenario)
+    //   In saved state, not in IBKR  →  ghost; remove
+    //   In both                      →  correct qty / avgCost from IBKR
+    public void OnReconciliationComplete()
+    {
+        List<string> ghosts;
+        lock (_lock)
+        {
+            if (!_needsReconciliation)
+            {
+                // positionEnd() can fire spuriously (e.g. after cancelPositions).
+                // Only act if we actually requested reconciliation.
+                return;
+            }
+
+            Console.WriteLine($"[RECONCILE] Snapshot received: {_ibkrPositionSnapshot.Count} position(s).");
+
+            // 1. Remove ghosts — in saved state but IBKR says closed
+            ghosts = _positions.Keys
+                .Where(sym => !_ibkrPositionSnapshot.ContainsKey(sym))
+                .ToList();
+            foreach (var sym in ghosts)
+            {
+                LogMessage($"[RECONCILE] Ghost removed: {sym}");
+                _positions.Remove(sym);
+            }
+
+            // 2. Inject or correct from IBKR
+            foreach (var (sym, (ibkrQty, ibkrCost)) in _ibkrPositionSnapshot)
+            {
+                if (_positions.TryGetValue(sym, out var existing))
+                {
+                    // Correct stale qty / cost
+                    if (existing.Quantity != ibkrQty || existing.AvgPrice != ibkrCost)
+                    {
+                        LogMessage($"[RECONCILE] Corrected {sym}: qty {existing.Quantity}→{ibkrQty}  cost {existing.AvgPrice:F2}→{ibkrCost:F2}");
+                        existing.Quantity = ibkrQty;
+                        existing.AvgPrice = ibkrCost;
+                        existing.HighWaterMark = ibkrCost; // restart trail conservatively
+                    }
+                }
+                else
+                {
+                    // Held in IBKR but state file didn't know — inject it
+                    LogMessage($"[RECONCILE] Injected: {sym} x{ibkrQty} @ {ibkrCost:F2}");
+                    _positions[sym] = new SimPosition
+                    {
+                        Symbol = sym,
+                        Quantity = ibkrQty,
+                        AvgPrice = ibkrCost,
+                        HighWaterMark = ibkrCost,
+                        CurrentPrice = ibkrCost,
+                        EntryTime = DateTime.UtcNow,
+                        IsShort = ibkrQty < 0,
+                        ExitSubmitted = false,
+                        StrategyTag = "UNKNOWN_RESUME"
+                    };
+                    _dailyEntryCount[sym] = 1;
+                    _lastTradeTime[sym] = DateTime.UtcNow;
+                }
+            }
+
+            _needsReconciliation = false;
+            _reconciled = true;
+            SaveState();
+        }
+
+        LogMessage($"[RECONCILE] Done — {_positions.Count} active: " +
+                   string.Join(", ", _positions.Keys.DefaultIfEmpty("none")));
+
+        _ = SendEmail("🔄 Bot Reconciled After Restart",
+            "Active positions:\n" +
+            string.Join("\n", _positions.Values.Select(p =>
+                $"  {p.Symbol} x{p.Quantity} @ {p.AvgPrice:C2}  [{p.StrategyTag}]")) +
+            $"\nGhosts removed: {string.Join(", ", ghosts.DefaultIfEmpty("none"))}");
     }
 
     public void SaveMarketMemory()
