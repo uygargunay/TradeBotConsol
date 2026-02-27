@@ -103,30 +103,33 @@ public class SimulatedBroker
     public IBroker RealBroker { get; set; }
     private readonly object _lock = new object();
 
-    // ── TRADING RULES — SWEET SPOT ─────────────────────────
+    // ── TRADING RULES ──────────────────────────────────────
     private const decimal TOTAL_BUDGET = 4000m;
     private const int MAX_POSITIONS = 2;
     private const decimal POSITION_SIZE = 2000m;
-    private const int MIN_HOLD_SECONDS = 300;
+    private const int MIN_HOLD_SECONDS = 600;          // 10 min (was 5) — ATR stop was firing on open noise
     private const decimal DAILY_PROFIT_GOAL = 300m;
     private const decimal MAX_DAILY_LOSS = -150m;
-    private const int COOLDOWN_SECONDS = 480;    // 8 min
+    private const int COOLDOWN_SECONDS = 1800;         // 30 min (was 8) — biggest lever to cut churn
     private const decimal ATR_TRAIL_MULT = 2.5m;
     private const decimal SHORT_ATR_TRAIL = 2.0m;
-    private const decimal HARD_STOP_ATR_MULT = 2.0m;   // KEY FIX — was 1.5
-    private const decimal MAX_LOSS_PER_TRADE = 75m;
+    private const decimal HARD_STOP_ATR_MULT = 2.0m;
+    private const decimal MAX_LOSS_PER_TRADE = 50m;    // was $75 — tighter dollar stop
+    private const decimal COMMISSION_PER_SIDE = 1m;    // IBKR flat $1 per order leg (buy OR sell)
     private const decimal MIN_STOP_DISTANCE = 0.10m;
     private const int MAX_QTY_SANITY = 500;
-    private const decimal RISK_PCT = 0.015m;  // 1.5%
+    private const decimal RISK_PCT = 0.015m;
     private const int ORB_MINUTES = 30;
-    private const decimal VOL_EXPAND_MULT = 1.5m;    // tightened from 1.3 — need real volume surge
-    private const double RSI_LONG_MIN = 56.0;    // tightened from 54 — confirm upward momentum
-    private const double RSI_SHORT_MAX = 44.0;   // tightened from 46 — confirm downward momentum
-    private const double RSI_OVERSOLD = 30.0;    // genuinely stretched
+    private const decimal VOL_EXPAND_MULT = 2.0m;      // was 1.5 — require a real volume surge
+    private const double RSI_LONG_MIN = 60.0;          // was 56 — need genuine momentum
+    private const double RSI_SHORT_MAX = 40.0;         // was 44
+    private const double RSI_OVERSOLD = 30.0;
     private const double RSI_OVERBOUGHT = 70.0;
-    private const decimal GAP_GO_MIN_PCT = 0.008m;  // tightened from 0.5% — only meaningful gaps
+    private const decimal GAP_GO_MIN_PCT = 0.008m;
     private const decimal GAP_GO_REL_VOL = 1.5m;
     private const int VWAP_CONFIRM_BARS = 2;
+    private const int MAX_TRADES_PER_DAY = 6;          // hard cap — 25 trades on $4k is commission suicide
+    private const decimal MIN_ATR_PCT = 0.004m;        // 0.4% — skip GILD/GE/MS-type low-vol stocks
 
 
     private bool _allowShorts = false; // set to true only if you have a margin account
@@ -441,7 +444,7 @@ public class SimulatedBroker
         // No trading in last 30 min (15:30–16:00 ET) — liquidity dries up, slippage spikes
         if (nowEt.Hour > 15 || (nowEt.Hour == 15 && nowEt.Minute >= 30)) return;
 
-        if (!_marketData.TryGetValue(symbol, out var candles) || candles.Count < 30)
+        if (!_marketData.TryGetValue(symbol, out var candles) || candles.Count < 50)
         {
             LogMessage($"[SKIP] {symbol} not enough candles: {candles?.Count ?? 0}");
             return;
@@ -451,10 +454,11 @@ public class SimulatedBroker
 
         // Skip stocks trading below $10 — too noisy, wide spreads, unreliable ATR signals
         decimal lastPrice = candles.Last().Close;
-        if (lastPrice < 10m) return; 
+        if (lastPrice < 10m) return;
 
         lock (_lock)
         {
+            if (_tradesToday >= MAX_TRADES_PER_DAY) return;
             if (_positions.ContainsKey(symbol)) return;
             // Include pending (submitted but unfilled) orders in the cap
             if (_positions.Count + _pendingEntryCount >= MAX_POSITIONS) return;
@@ -505,6 +509,7 @@ public class SimulatedBroker
         var lastCandle = candles.Last();
         decimal close = lastCandle.Close;
         decimal atr = SafeATR(candles, 14);
+        if (close > 0 && atr / close < MIN_ATR_PCT) return false;
         double rsi = SafeRSI(candles, 7);
         _vwap.TryGetValue(symbol, out decimal vwapVal);
 
@@ -571,8 +576,7 @@ public class SimulatedBroker
         double rsi = SafeRSI(candles, 7);
         decimal atr = SafeATR(candles, 14);
         bool volExp = CheckVolumeExpansion(candles);
-
-        // Gap UP → long (not in sell-off)
+        if (close > 0 && atr / close < MIN_ATR_PCT) return false;
         if (gapPct > 0 && rsi > RSI_LONG_MIN && volExp && _marketRegime != "SELL-OFF")
         {
             decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
@@ -618,8 +622,7 @@ public class SimulatedBroker
         double rsi = SafeRSI(candles, 7);
         decimal atr = SafeATR(candles, 14);
         bool volExp = CheckVolumeExpansion(candles);
-
-        // Reclaim: previous bar below, now 2 bars confirmed above
+        if (close > 0 && atr / close < MIN_ATR_PCT) return false;
         bool vwapReclaim = !prevAbove && allRecentAbove;
         if (vwapReclaim && volExp && rsi > RSI_LONG_MIN && _marketRegime != "SELL-OFF")
         {
@@ -656,8 +659,7 @@ public class SimulatedBroker
         decimal sma50 = SafeSMA(candles, 50);
         double rsi = SafeRSI(candles, 7);
         decimal atr = SafeATR(candles, 14);
-
-        // ── OVERSOLD BOUNCE → long ───────────────────────────
+        if (close > 0 && atr / close < MIN_ATR_PCT) return false;
         // Stock is in uptrend (above SMA50) but RSI has dipped — buy the dip
         bool oversoldInUptrend = close > sma50 && rsi < RSI_OVERSOLD && _marketRegime != "SELL-OFF";
         if (oversoldInUptrend)
@@ -701,7 +703,7 @@ public class SimulatedBroker
         decimal atrPct = close > 0 ? atr / close : 0m;
         bool volExp = CheckVolumeExpansion(candles);
 
-        if (atrPct < 0.002m) return false;
+        if (atrPct < MIN_ATR_PCT) return false;
 
         // ── SCORE-BASED LONG ENTRY (need 3 of 4 conditions) ───
         _vwap.TryGetValue(symbol, out decimal vwapVal);
@@ -862,12 +864,14 @@ public class SimulatedBroker
             decimal atrValue = SafeATR(candles, 14);
             TradeSide exitSide = pos.IsShort ? TradeSide.Buy : TradeSide.Sell;
 
-            // Compute gain % correctly for both directions
-            decimal gainPct = pos.AvgPrice > 0
-                ? pos.IsShort
-                    ? (pos.AvgPrice - currentPrice) / pos.AvgPrice
-                    : (currentPrice - pos.AvgPrice) / pos.AvgPrice
-                : 0m;
+            // Net P&L after full $2 round-trip commission ($1 entry already paid + $1 exit to come).
+            // All exit thresholds below use this so they reflect real account impact.
+            decimal grossPnl = pos.IsShort
+                ? (pos.AvgPrice - currentPrice) * pos.Quantity
+                : (currentPrice - pos.AvgPrice) * pos.Quantity;
+            decimal netPnl = grossPnl - (COMMISSION_PER_SIDE * 2);
+            decimal positionCost = pos.AvgPrice * pos.Quantity;
+            decimal gainPct = positionCost > 0 ? netPnl / positionCost : 0m;
 
             // Track best price (HWM = highest price for longs, lowest for shorts)
             if (pos.IsShort)
@@ -876,7 +880,7 @@ public class SimulatedBroker
             else
                 pos.HighWaterMark = Math.Max(pos.HighWaterMark, currentPrice);
 
-            // ── PARTIAL 1: +1.5% → sell half ─────────────────
+            // ── PARTIAL 1: net +1.5% → sell half ──────────────
             if (gainPct >= 0.015m && !pos.PartialExitDone && pos.Quantity >= 2)
             {
                 int halfQty = pos.Quantity / 2;
@@ -886,7 +890,7 @@ public class SimulatedBroker
                 return;
             }
 
-            // ── PARTIAL 2: +2.5% → sell another quarter ───────
+            // ── PARTIAL 2: net +2.5% → sell another quarter ───
             if (gainPct >= 0.025m && !pos.PartialExitDone2 && pos.Quantity >= 2)
             {
                 int quarterQty = Math.Max(1, pos.Quantity / 2);
@@ -896,8 +900,8 @@ public class SimulatedBroker
                 return;
             }
 
-            // ── TIME STOP: 30 min with no progress (was 20, PLTR/ORCL/PANW exited too soon)
-            if (secondsHeld > 1800 && gainPct < 0.003m)
+            // ── TIME STOP: 60 min, net gain < 0.5% ────────────
+            if (secondsHeld > 3600 && gainPct < 0.005m)
             {
                 pos.ExitSubmitted = true;
                 SubmitOrder(symbol, pos.Quantity, currentPrice, exitSide, "TIME_STOP");
@@ -998,44 +1002,48 @@ public class SimulatedBroker
                 };
                 _tradesToday++;
 
+                // $1 entry commission — charged the moment the buy/short order fills
+                _totalRealizedPnL -= COMMISSION_PER_SIDE;
+
                 string dir = isShortEntry ? "SHORT" : "BUY";
                 subject = $"🚀 {dir}: {order.Symbol} x{fillQty} @ {fillPrice:C2}";
-                body = $"{dir} {fillQty} shares @ {fillPrice:C2}";
+                body = $"{dir} {fillQty} shares @ {fillPrice:C2}  (commission: -$1)";
             }
             // ── CLOSING A POSITION ────────────────────────────
             else if (_positions.TryGetValue(order.Symbol, out var pos))
             {
-                decimal pnl = pos.IsShort
+                decimal grossPnl = pos.IsShort
                     ? (pos.AvgPrice - fillPrice) * fillQty
                     : (fillPrice - pos.AvgPrice) * fillQty;
+
+                // $1 exit commission — entry $1 was already charged at open
+                decimal netPnl = grossPnl - COMMISSION_PER_SIDE;
+
                 decimal holdMinutes = (decimal)(DateTime.UtcNow - pos.EntryTime).TotalMinutes;
 
-                _totalRealizedPnL += pnl;
+                _totalRealizedPnL += netPnl;
 
                 // Only count win/loss and remove position on FULL close
-                // Partial exits reduce qty but keep the position alive
                 bool isFullClose = fillQty >= pos.Quantity;
                 if (isFullClose)
                 {
-                    if (pnl > 0) _winCount++;
+                    // Win/loss on net — after full $2 round-trip commission
+                    if (netPnl > 0) _winCount++;
                     else _lossCount++;
 
                     _marketData.TryGetValue(order.Symbol, out var exitCandles);
                     LogTradeAnalytics(order.Symbol, pos.AvgPrice, fillPrice,
-                                      pnl, holdMinutes,
+                                      netPnl, holdMinutes,
                                       SafeATR(exitCandles, 14), SafeRSI(exitCandles, 7),
                                       pos.StrategyTag, pos.IsShort);
 
                     _positions.Remove(order.Symbol);
                     _lastTradeTime[order.Symbol] = DateTime.UtcNow;
-                    // Remember outcome so we can double the cooldown after a loss
-                    _lastTradeWasLoss[order.Symbol] = pnl <= 0;
+                    _lastTradeWasLoss[order.Symbol] = netPnl <= 0;
                 }
-                // Partial close — qty was already reduced in CheckExits before submit,
-                // so pos.Quantity is already the remaining amount. Nothing more to do.
 
-                subject = $"💰 {(isFullClose ? "CLOSE" : "PARTIAL")}: {order.Symbol} x{fillQty} @ {fillPrice:C2} | PnL: {pnl:C2}";
-                body = $"{(isFullClose ? "Closed" : "Partial")} {fillQty} @ {fillPrice:C2}\nPnL: {pnl:C2}\nStrategy: {pos.StrategyTag}";
+                subject = $"💰 {(isFullClose ? "CLOSE" : "PARTIAL")}: {order.Symbol} x{fillQty} @ {fillPrice:C2} | Net: {netPnl:C2}";
+                body = $"{(isFullClose ? "Closed" : "Partial")} {fillQty} @ {fillPrice:C2}\nGross: {grossPnl:C2}  Commission: -$1  Net: {netPnl:C2}\nStrategy: {pos.StrategyTag}";
             }
 
             string arrow = order.Side == TradeSide.Buy ? "▲" : "▼";
