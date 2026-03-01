@@ -15,6 +15,13 @@ public class IbClient : EWrapper, IBroker
 
     private int _liveReqId = 10000;
     private readonly ConcurrentDictionary<int, string> _reqIdToSymbol = new();
+    private readonly ConcurrentDictionary<string, int> _symToLiveReqId = new();     // symbol → active reqMktData reqId
+    private readonly HashSet<string> _subscribedLive = new(StringComparer.OrdinalIgnoreCase); // dedup guard
+
+    // Hard cap enforced inside Subscribe() — set this before calling Subscribe().
+    // Every reqMktData call goes through Subscribe(), so this is the single
+    // chokepoint that no other code path can bypass.
+    public int MaxMarketDataLines { get; set; } = 95;
     private readonly SimulatedBroker _broker;
     private readonly ConcurrentDictionary<string, long> _tickVolume = new();
 
@@ -100,10 +107,29 @@ public class IbClient : EWrapper, IBroker
     }
 
     // --- SUBSCRIBE TO LIVE DATA ---
+    // Safe to call multiple times — dedup guard AND hard line-count cap enforced here.
+    // This is the ONLY place reqMktData is called, so MaxMarketDataLines cannot be
+    // exceeded regardless of how many callers invoke Subscribe().
     public void Subscribe(string symbol)
     {
+        lock (_subscribedLive)
+        {
+            if (_subscribedLive.Contains(symbol))
+            {
+                Console.WriteLine($"[IBKR] Already subscribed to {symbol} — skipping duplicate reqMktData.");
+                return;
+            }
+            if (_subscribedLive.Count >= MaxMarketDataLines)
+            {
+                Console.WriteLine($"[IBKR] HARD CAP: {_subscribedLive.Count}/{MaxMarketDataLines} lines in use — skipping {symbol}. Raise MaxMarketDataLines or buy a Booster Pack.");
+                return;
+            }
+            _subscribedLive.Add(symbol);
+        }
+
         int reqId = Interlocked.Increment(ref _liveReqId);
         _reqIdToSymbol[reqId] = symbol;
+        _symToLiveReqId[symbol] = reqId;
 
         Contract contract = new Contract
         {
@@ -114,7 +140,23 @@ public class IbClient : EWrapper, IBroker
         };
 
         _client.reqMktData(reqId, contract, "", false, false, null);
-        Console.WriteLine($"[IBKR] Subscribed to {symbol} with reqId {reqId}");
+        Console.WriteLine($"[IBKR] Subscribed live ticks for {symbol} (reqId {reqId})");
+    }
+
+    // IBroker.CancelMarketData — unsubscribes live tick feed for a symbol
+    public void CancelMarketData(string symbol)
+    {
+        if (_symToLiveReqId.TryRemove(symbol, out int reqId))
+        {
+            _client.cancelMktData(reqId);
+            _reqIdToSymbol.TryRemove(reqId, out _);
+            lock (_subscribedLive) { _subscribedLive.Remove(symbol); }
+            Console.WriteLine($"[IBKR] Cancelled market data for {symbol} (reqId {reqId})");
+        }
+        else
+        {
+            Console.WriteLine($"[IBKR] CancelMarketData: no live subscription found for {symbol}");
+        }
     }
 
 
@@ -221,8 +263,13 @@ public class IbClient : EWrapper, IBroker
 
     public void historicalDataEnd(int reqId, string start, string end)
     {
-        if (_reqIdToSymbol.TryGetValue(reqId, out string symbol))
-            Console.WriteLine($"[HISTORY LOADED] {symbol}");
+        if (!_reqIdToSymbol.TryRemove(reqId, out string symbol)) return;
+
+        Console.WriteLine($"[IBKR] History loaded for {symbol} — starting live tick subscription.");
+
+        // Auto-subscribe live ticks now that candles are ready.
+        // Subscribe() is dedup-guarded so calling it here AND from Program.cs is safe.
+        Subscribe(symbol);
     }
 
     // --- EWRAPPER CORE CALLBACKS ---

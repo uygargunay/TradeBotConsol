@@ -53,12 +53,14 @@ class Program
                 Console.WriteLine($"{sym} loaded {candleCount} candles");
             }
 
-            // ── 4. SUBSCRIBE TO LIVE TICKS ───────────────────────────────────────
-            foreach (var sym in broker._watchlist)
-            {
-                client.Subscribe(sym);
-                await Task.Delay(50); // 50ms between each — 90 symbols = 4.5 seconds total
-            }
+            // ── 4. LIVE TICK SUBSCRIPTIONS ───────────────────────────────────────
+            // NOTE: No explicit Subscribe() loop needed here.
+            // IbClient.historicalDataEnd() already calls Subscribe(symbol) for every
+            // symbol that completes history, staying within the MAX_MARKET_DATA_LINES
+            // budget enforced by RequestAllHistoricalSlow(). Calling Subscribe() again
+            // here for the full watchlist bypassed that budget — symbols skipped by the
+            // slot limiter have no entry in _subscribedLive, so the dedup guard lets
+            // them through, pushing total subscriptions over the 100-line account limit.
         }
         catch (Exception ex)
         {

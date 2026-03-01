@@ -887,6 +887,370 @@
             }
         }
 
+        /* ── SETTINGS BUTTON ── */
+        #settings-btn {
+            background: none;
+            border: 1px solid var(--border);
+            color: var(--muted);
+            border-radius: 5px;
+            padding: 4px 9px;
+            cursor: pointer;
+            font-size: 13px;
+            line-height: 1;
+            transition: color .15s, border-color .15s, background .15s;
+            flex-shrink: 0;
+        }
+
+            #settings-btn:hover {
+                color: var(--text);
+                border-color: var(--subtle);
+                background: rgba(255,255,255,.04);
+            }
+
+        /* ── SETTINGS MODAL ── */
+        #settings-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,.72);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+            #settings-overlay.open {
+                display: flex;
+            }
+
+        #settings-modal {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            width: 780px;
+            max-width: 98vw;
+            max-height: 90vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            box-shadow: 0 24px 60px rgba(0,0,0,.6);
+        }
+
+        .sm-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 18px;
+            border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+            .sm-header h2 {
+                font-size: 14px;
+                font-weight: 700;
+            }
+
+        .sm-close {
+            background: none;
+            border: 1px solid var(--border);
+            color: var(--muted);
+            border-radius: 4px;
+            padding: 3px 9px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: color .15s;
+        }
+
+            .sm-close:hover {
+                color: var(--text);
+                border-color: var(--subtle);
+            }
+
+        .sm-tabs {
+            display: flex;
+            gap: 2px;
+            padding: 8px 18px 0;
+            border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .sm-tab {
+            padding: 5px 13px;
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .5px;
+            color: var(--muted);
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: color .15s, border-color .15s;
+            white-space: nowrap;
+        }
+
+            .sm-tab:hover {
+                color: var(--text);
+            }
+
+            .sm-tab.active {
+                color: var(--blue);
+                border-bottom-color: var(--blue);
+            }
+
+        .sm-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px 18px;
+        }
+
+        .sm-section {
+            margin-bottom: 20px;
+        }
+
+        .sm-section-title {
+            font-size: 9px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .7px;
+            color: var(--muted);
+            margin-bottom: 10px;
+            padding-bottom: 5px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .sm-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 10px;
+        }
+
+        .sm-field {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .sm-label {
+            font-size: 9px;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: .4px;
+        }
+
+        .sm-input {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text);
+            font-size: 12px;
+            font-family: inherit;
+            padding: 5px 8px;
+            transition: border-color .15s;
+            width: 100%;
+        }
+
+            .sm-input:focus {
+                outline: none;
+                border-color: var(--blue);
+            }
+
+            .sm-input:hover {
+                border-color: var(--subtle);
+            }
+
+        .sm-toggle-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 6px 10px;
+        }
+
+        .sm-toggle-lbl {
+            font-size: 11px;
+        }
+
+        .sm-toggle-sub {
+            font-size: 9px;
+            color: var(--muted);
+            margin-top: 1px;
+        }
+
+        .toggle-switch {
+            position: relative;
+            width: 36px;
+            height: 20px;
+            flex-shrink: 0;
+        }
+
+            .toggle-switch input {
+                opacity: 0;
+                width: 0;
+                height: 0;
+            }
+
+        .toggle-slider {
+            position: absolute;
+            inset: 0;
+            background: var(--subtle);
+            border-radius: 20px;
+            cursor: pointer;
+            transition: background .2s;
+        }
+
+            .toggle-slider:before {
+                content: '';
+                position: absolute;
+                width: 14px;
+                height: 14px;
+                left: 3px;
+                top: 3px;
+                background: white;
+                border-radius: 50%;
+                transition: transform .2s;
+            }
+
+        .toggle-switch input:checked + .toggle-slider {
+            background: var(--green);
+        }
+
+            .toggle-switch input:checked + .toggle-slider:before {
+                transform: translateX(16px);
+            }
+
+        /* Watchlist tab */
+        .wl-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            min-height: 40px;
+            padding: 8px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            margin-bottom: 10px;
+        }
+
+        .wl-tag {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            background: var(--subtle);
+            border-radius: 4px;
+            padding: 3px 8px;
+            font-size: 11px;
+            font-weight: 700;
+        }
+
+            .wl-tag .wl-rm {
+                cursor: pointer;
+                color: var(--muted);
+                font-size: 13px;
+                line-height: 1;
+                transition: color .15s;
+            }
+
+                .wl-tag .wl-rm:hover {
+                    color: var(--red);
+                }
+
+        .wl-add-row {
+            display: flex;
+            gap: 8px;
+        }
+
+        .wl-add-input {
+            flex: 1;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text);
+            font-size: 12px;
+            font-family: inherit;
+            padding: 5px 10px;
+            text-transform: uppercase;
+        }
+
+            .wl-add-input:focus {
+                outline: none;
+                border-color: var(--blue);
+            }
+
+        .wl-add-btn {
+            background: var(--blue);
+            border: none;
+            border-radius: 4px;
+            color: #000;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 5px 14px;
+            cursor: pointer;
+            transition: opacity .15s;
+        }
+
+            .wl-add-btn:hover {
+                opacity: .85;
+            }
+
+        .wl-group-label {
+            font-size: 9px;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: .5px;
+            margin: 14px 0 5px;
+            font-weight: 700;
+        }
+
+        .sm-footer {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 8px;
+            padding: 10px 18px;
+            border-top: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .sm-btn-secondary {
+            background: none;
+            border: 1px solid var(--border);
+            color: var(--muted);
+            border-radius: 5px;
+            padding: 6px 14px;
+            font-size: 11px;
+            cursor: pointer;
+            font-family: inherit;
+            transition: color .15s;
+        }
+
+            .sm-btn-secondary:hover {
+                color: var(--text);
+                border-color: var(--subtle);
+            }
+
+        .sm-btn-primary {
+            background: var(--blue);
+            border: none;
+            border-radius: 5px;
+            color: #000;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 6px 18px;
+            cursor: pointer;
+            font-family: inherit;
+            transition: opacity .15s;
+        }
+
+            .sm-btn-primary:hover {
+                opacity: .85;
+            }
+
+        .sm-save-note {
+            font-size: 10px;
+            color: var(--muted);
+            margin-right: auto;
+        }
+
         /* Candle chart container */
         .candle-chart-outer {
             position: relative;
@@ -956,6 +1320,33 @@
         <div class="tstat"><span class="lbl">Trades</span><span class="val" id="t-tr">—</span></div>
         <div class="tstat"><span class="lbl">Cash</span><span class="val" id="t-cash">—</span></div>
         <div id="clock"><div id="c-pt">—</div><div id="c-et">—</div></div>
+        <button id="settings-btn" onclick="openSettings()" title="Bot Settings">⚙</button>
+    </div>
+
+    <!-- SETTINGS MODAL -->
+    <div id="settings-overlay" onclick="if(event.target===this)closeSettings()">
+        <div id="settings-modal">
+            <div class="sm-header">
+                <h2>⚙ Bot Configuration</h2>
+                <button class="sm-close" onclick="closeSettings()">✕ Close</button>
+            </div>
+            <div class="sm-tabs">
+                <div class="sm-tab active" onclick="switchTab('risk')">Risk &amp; Sizing</div>
+                <div class="sm-tab" onclick="switchTab('strategy')">Strategy</div>
+                <div class="sm-tab" onclick="switchTab('filters')">Filters &amp; Signals</div>
+                <div class="sm-tab" onclick="switchTab('watchlist')">Watchlist</div>
+            </div>
+            <div class="sm-body" id="sm-body"></div>
+            <div class="sm-footer">
+                <span class="sm-save-note" id="sm-save-note">All changes apply live instantly — new watchlist symbols subscribe automatically</span>
+                <input type="password" id="sm-password" class="sm-input"
+                       placeholder="Password" autocomplete="current-password"
+                       style="width:150px;flex-shrink:0"
+                       onkeydown="if(event.key==='Enter')saveSettings()">
+                <button class="sm-btn-secondary" onclick="resetDefaults()">Reset Defaults</button>
+                <button class="sm-btn-primary" onclick="saveSettings()">Save Settings</button>
+            </div>
+        </div>
     </div>
 
     <!-- LAYOUT FLEX: main + detail side by side on desktop -->
@@ -1484,21 +1875,21 @@
                 const atrC = w.atr >= 0.4 ? 'g' : w.atr >= 0.2 ? 'y' : 'm';
                 const isSelected = w.s === selectedSym;
                 return `<tr class="${w.hot ? 'hot' : ''} ${isSelected ? 'selected' : ''}" onclick="onSymClick('${w.s}')">
-                  <td><div class="sym-cell">${w.hot ? '<span class="hot-arrow">►</span>' : ''}<span>${w.s}</span></div></td>
-                  <td class="tr ${pC}">$${w.price.toFixed(2)}</td>
-                  <td class="tr m">$${w.vwap > 0 ? w.vwap.toFixed(2) : '—'}</td>
-                  <td class="tr ${s20C}">$${w.sma20 > 0 ? w.sma20.toFixed(2) : '—'}</td>
-                  <td class="tr ${s50C}">$${w.sma50 > 0 ? w.sma50.toFixed(2) : '—'}</td>
-                  <td class="tr">${rsiHtml(w.rsi)}</td>
-                  <td class="tr ${gC}">${w.gap !== 0 ? pct(w.gap) : '<span class="m">—</span>'}</td>
-                  <td class="tr m">${volFmt(w.vol)}</td>
-                  <td class="tr ${atrC}">${w.atr.toFixed(2)}%</td>
-                  <td class="tr m">${oHi}</td>
-                  <td class="tr m">${oLo}</td>
-                  <td class="tc">${trH}</td>
-                  <td class="tc"><span class="led" style="background:${ledC}"></span></td>
-                  <td class="tc">${sigBadge(w.sig)}</td>
-                </tr>`;
+                          <td><div class="sym-cell">${w.hot ? '<span class="hot-arrow">►</span>' : ''}<span>${w.s}</span></div></td>
+                          <td class="tr ${pC}">$${w.price.toFixed(2)}</td>
+                          <td class="tr m">$${w.vwap > 0 ? w.vwap.toFixed(2) : '—'}</td>
+                          <td class="tr ${s20C}">$${w.sma20 > 0 ? w.sma20.toFixed(2) : '—'}</td>
+                          <td class="tr ${s50C}">$${w.sma50 > 0 ? w.sma50.toFixed(2) : '—'}</td>
+                          <td class="tr">${rsiHtml(w.rsi)}</td>
+                          <td class="tr ${gC}">${w.gap !== 0 ? pct(w.gap) : '<span class="m">—</span>'}</td>
+                          <td class="tr m">${volFmt(w.vol)}</td>
+                          <td class="tr ${atrC}">${w.atr.toFixed(2)}%</td>
+                          <td class="tr m">${oHi}</td>
+                          <td class="tr m">${oLo}</td>
+                          <td class="tc">${trH}</td>
+                          <td class="tc"><span class="led" style="background:${ledC}"></span></td>
+                          <td class="tc">${sigBadge(w.sig)}</td>
+                        </tr>`;
             }).join('');
         }
 
@@ -1576,11 +1967,11 @@
                     const pp = (p.pct >= 0 ? '+' : '') + p.pct.toFixed(2) + '%';
                     const [pbg, pfg] = p.unrl >= 0 ? ['var(--dg)', 'var(--green)'] : ['var(--dr)', 'var(--red)'];
                     return `<div class="pc">
-                    <div class="pct"><span class="pcsym">${p.sym}</span><span class="pcside ${p.side === 'LONG' ? 'ls' : 'ss'}">${p.side}</span></div>
-                    <div class="pcrow"><span class="m">Qty <b style="color:var(--text)">${p.qty}</b></span><span class="pcpnl ${pc}">${fmtS(p.unrl)}</span></div>
-                    <div class="pcrow"><span class="m">$${p.avg.toFixed(2)} → $${p.cur.toFixed(2)}</span><span class="ppill" style="background:${pbg};color:${pfg}">${pp}</span></div>
-                    <div class="pcm">${p.strat} · ${p.min.toFixed(0)}m held</div>
-                  </div>`;
+                            <div class="pct"><span class="pcsym">${p.sym}</span><span class="pcside ${p.side === 'LONG' ? 'ls' : 'ss'}">${p.side}</span></div>
+                            <div class="pcrow"><span class="m">Qty <b style="color:var(--text)">${p.qty}</b></span><span class="pcpnl ${pc}">${fmtS(p.unrl)}</span></div>
+                            <div class="pcrow"><span class="m">$${p.avg.toFixed(2)} → $${p.cur.toFixed(2)}</span><span class="ppill" style="background:${pbg};color:${pfg}">${pp}</span></div>
+                            <div class="pcm">${p.strat} · ${p.min.toFixed(0)}m held</div>
+                          </div>`;
                 }).join('');
             }
 
@@ -1611,8 +2002,343 @@
 
         initChart();
         initDetailCharts();
+        loadConfigFromAPI(); // pre-load config in background so settings modal is ready instantly
         poll();
         setInterval(poll, 1000);
+
+        // ══════════════════════════════════════════════════════════
+        //  SETTINGS PANEL
+        // ══════════════════════════════════════════════════════════
+
+        const DEFAULTS = {
+            // Risk & Sizing
+            TOTAL_BUDGET: 4000,
+            MAX_POSITIONS: 2,
+            POSITION_SIZE: 2000,
+            MAX_LOSS_PER_TRADE: 50,
+            MAX_TRADES_PER_DAY: 6,
+            DAILY_PROFIT_GOAL: 300,
+            MAX_DAILY_LOSS: 150,
+            RISK_PCT: 0.015,
+            COMMISSION_PER_SIDE: 1,
+            MAX_QTY_SANITY: 500,
+            // Strategy
+            MIN_HOLD_SECONDS: 600,
+            COOLDOWN_SECONDS: 1800,
+            ORB_MINUTES: 30,
+            ATR_TRAIL_MULT: 2.5,
+            SHORT_ATR_TRAIL: 2.0,
+            HARD_STOP_ATR_MULT: 2.0,
+            MIN_STOP_DISTANCE: 0.10,
+            VWAP_CONFIRM_BARS: 2,
+            ALLOW_SHORTS: false,
+            // Filters & Signals
+            MIN_ATR_PCT: 0.004,
+            VOL_EXPAND_MULT: 2.0,
+            GAP_GO_MIN_PCT: 0.008,
+            GAP_GO_REL_VOL: 1.5,
+            RSI_LONG_MIN: 60.0,
+            RSI_SHORT_MAX: 40.0,
+            RSI_OVERSOLD: 30.0,
+            RSI_OVERBOUGHT: 70.0,
+            // IBKR Data Lines
+            DATA_LINES_PER_SYMBOL: 1,
+            MAX_MARKET_DATA_LINES: 95,
+        };
+
+        const WATCHLIST_DEFAULTS = {
+            'Core ETFs': ['SPY', 'QQQ', 'IWM', 'SMH', 'XLK', 'XLF', 'XLE', 'XBI', 'DIA'],
+            'Mega Cap Tech': ['AAPL', 'MSFT', 'NVDA', 'META', 'AMZN', 'GOOGL', 'TSLA', 'ADBE'],
+            'Semis': ['AMD', 'AVGO', 'ARM', 'MU', 'AMAT', 'LRCX', 'QCOM', 'TSM'],
+            'Cloud / SaaS': ['CRM', 'NOW', 'CRWD', 'PANW', 'PLTR', 'DDOG', 'NET', 'SNOW', 'APP', 'TTD'],
+            'Fintech / Crypto': ['COIN', 'MSTR', 'PYPL', 'HOOD', 'SOFI'],
+            'Financials': ['JPM', 'GS', 'MS', 'BAC', 'V', 'MA', 'BX'],
+            'High-Momentum Growth': ['NFLX', 'UBER', 'SHOP', 'MELI', 'BKNG', 'ABNB', 'INTU', 'ANET', 'DASH', 'SPOT'],
+            'Energy': ['XOM', 'CVX', 'OXY'],
+            'Biotech / Health': ['UNH', 'ABBV', 'VRTX', 'REGN', 'GILD'],
+            'Industrials / Defense': ['CAT', 'DE', 'GE', 'HON', 'RTX', 'LMT', 'BA'],
+            'Additional Alpha': ['ORCL', 'IBM', 'TXN', 'ASML', 'ZS', 'MDB', 'OKTA', 'XYZ'],
+        };
+
+        // Load persisted config or fall back to defaults
+        let CFG = Object.assign({}, DEFAULTS);
+        let WL = Object.values(WATCHLIST_DEFAULTS).flat();
+        let _configLoaded = false;
+
+        async function loadConfigFromAPI() {
+            try {
+                const res = await fetch(API.replace('/api/status', '/api/config'), { cache: 'no-store' });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const data = await res.json();
+                // Merge numeric/bool fields into CFG
+                Object.keys(DEFAULTS).forEach(k => {
+                    if (k in data) CFG[k] = data[k];
+                });
+                // Load watchlist
+                if (Array.isArray(data.watchlist) && data.watchlist.length > 0) {
+                    WL = data.watchlist;
+                }
+                _configLoaded = true;
+            } catch (e) {
+                // Bot might not be running yet — silently fall back to defaults
+                console.warn('[config] Could not load from API, using defaults:', e.message);
+            }
+        }
+
+        let _activeTab = 'risk';
+
+        const TAB_HTML = {
+            risk: () => `
+                        <div class="sm-section">
+                            <div class="sm-section-title">Capital &amp; Exposure</div>
+                            <div class="sm-grid">
+                                ${field('TOTAL_BUDGET', 'Total Budget ($)', 'number', CFG.TOTAL_BUDGET, 'Total capital allocated to the bot')}
+                                ${field('POSITION_SIZE', 'Position Size ($)', 'number', CFG.POSITION_SIZE, 'Dollar size per trade')}
+                                ${field('MAX_POSITIONS', 'Max Open Positions', 'number', CFG.MAX_POSITIONS, 'Concurrent position limit')}
+                                ${field('MAX_QTY_SANITY', 'Max Qty Sanity Cap', 'number', CFG.MAX_QTY_SANITY, 'Hard ceiling on share quantity')}
+                                ${field('COMMISSION_PER_SIDE', 'Commission / Side ($)', 'number', CFG.COMMISSION_PER_SIDE, 'IBKR flat fee per order leg')}
+                            </div>
+                        </div>
+                        <div class="sm-section">
+                            <div class="sm-section-title">P&amp;L Limits</div>
+                            <div class="sm-grid">
+                                ${field('DAILY_PROFIT_GOAL', 'Daily Profit Goal ($)', 'number', CFG.DAILY_PROFIT_GOAL, 'Target profit to halt new entries')}
+                                ${field('MAX_DAILY_LOSS', 'Max Daily Loss ($)', 'number', CFG.MAX_DAILY_LOSS, 'Bot halts when this loss is hit (stored as positive)')}
+                                ${field('MAX_LOSS_PER_TRADE', 'Max Loss / Trade ($)', 'number', CFG.MAX_LOSS_PER_TRADE, 'Dollar stop per individual trade')}
+                                ${field('RISK_PCT', 'Risk % of Budget', 'number', CFG.RISK_PCT, 'Fractional risk per trade (e.g. 0.015 = 1.5%)')}
+                                ${field('MAX_TRADES_PER_DAY', 'Max Trades / Day', 'number', CFG.MAX_TRADES_PER_DAY, 'Hard cap on daily trade count')}
+                            </div>
+                        </div>`,
+
+            strategy: () => `
+                        <div class="sm-section">
+                            <div class="sm-section-title">Timing &amp; Cooldowns</div>
+                            <div class="sm-grid">
+                                ${field('MIN_HOLD_SECONDS', 'Min Hold (seconds)', 'number', CFG.MIN_HOLD_SECONDS, 'Minimum seconds before any exit is considered')}
+                                ${field('COOLDOWN_SECONDS', 'Cooldown (seconds)', 'number', CFG.COOLDOWN_SECONDS, 'Per-symbol cooldown after a trade closes')}
+                                ${field('ORB_MINUTES', 'ORB Window (minutes)', 'number', CFG.ORB_MINUTES, 'Opening range breakout period length')}
+                                ${field('VWAP_CONFIRM_BARS', 'VWAP Confirm Bars', 'number', CFG.VWAP_CONFIRM_BARS, 'Bars price must be above/below VWAP to confirm')}
+                            </div>
+                        </div>
+                        <div class="sm-section">
+                            <div class="sm-section-title">Stop &amp; Trail Multipliers</div>
+                            <div class="sm-grid">
+                                ${field('ATR_TRAIL_MULT', 'ATR Trail Mult (Long)', 'number', CFG.ATR_TRAIL_MULT, 'ATR multiplier for trailing stop on longs')}
+                                ${field('SHORT_ATR_TRAIL', 'ATR Trail Mult (Short)', 'number', CFG.SHORT_ATR_TRAIL, 'ATR multiplier for trailing stop on shorts')}
+                                ${field('HARD_STOP_ATR_MULT', 'Hard Stop ATR Mult', 'number', CFG.HARD_STOP_ATR_MULT, 'ATR multiplier for initial hard stop')}
+                                ${field('MIN_STOP_DISTANCE', 'Min Stop Distance ($)', 'number', CFG.MIN_STOP_DISTANCE, 'Floor on stop distance in dollars')}
+                            </div>
+                        </div>
+                        <div class="sm-section">
+                            <div class="sm-section-title">Direction</div>
+                            <div class="sm-toggle-row">
+                                <div>
+                                    <div class="sm-toggle-lbl">Allow Short Selling</div>
+                                    <div class="sm-toggle-sub">Requires a margin account. Disabled by default.</div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="cfg-ALLOW_SHORTS" ${CFG.ALLOW_SHORTS ? 'checked' : ''}>
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>`,
+
+            filters: () => `
+                        <div class="sm-section">
+                            <div class="sm-section-title">Volatility &amp; Volume Filters</div>
+                            <div class="sm-grid">
+                                ${field('MIN_ATR_PCT', 'Min ATR %', 'number', CFG.MIN_ATR_PCT, 'Skip symbols with ATR below this (e.g. 0.004 = 0.4%)')}
+                                ${field('VOL_EXPAND_MULT', 'Volume Expansion Mult', 'number', CFG.VOL_EXPAND_MULT, 'Require volume this many times average for entry')}
+                                ${field('GAP_GO_MIN_PCT', 'Gap-Go Min Gap %', 'number', CFG.GAP_GO_MIN_PCT, 'Minimum gap size for gap-and-go strategy (e.g. 0.008 = 0.8%)')}
+                                ${field('GAP_GO_REL_VOL', 'Gap-Go Relative Vol', 'number', CFG.GAP_GO_REL_VOL, 'Minimum relative volume for gap-and-go confirmation')}
+                            </div>
+                        </div>
+                        <div class="sm-section">
+                            <div class="sm-section-title">RSI Thresholds</div>
+                            <div class="sm-grid">
+                                ${field('RSI_LONG_MIN', 'RSI Long Min', 'number', CFG.RSI_LONG_MIN, 'Minimum RSI to enter a long position')}
+                                ${field('RSI_SHORT_MAX', 'RSI Short Max', 'number', CFG.RSI_SHORT_MAX, 'Maximum RSI to enter a short position')}
+                                ${field('RSI_OVERSOLD', 'RSI Oversold Level', 'number', CFG.RSI_OVERSOLD, 'RSI oversold threshold (mean-reversion long signal)')}
+                                ${field('RSI_OVERBOUGHT', 'RSI Overbought Level', 'number', CFG.RSI_OVERBOUGHT, 'RSI overbought threshold (mean-reversion short signal)')}
+                            </div>
+                        </div>
+                        <div class="sm-section">
+                            <div class="sm-section-title">IBKR Market Data Lines
+                                <span style="font-size:9px;color:var(--yellow);font-weight:400;margin-left:8px">
+                                    ⚠ Free accounts = 100 lines · Booster Pack adds 100 more
+                                </span>
+                            </div>
+                            <div style="background:rgba(210,153,34,.08);border:1px solid rgba(210,153,34,.25);border-radius:5px;padding:8px 10px;margin-bottom:10px;font-size:10px;color:var(--muted);line-height:1.6">
+                                IBKR counts <b style="color:var(--text)">data lines</b>, not symbols.
+                                If your adapter calls <code style="color:var(--blue)">reqMktData</code> only → <b>1 line/symbol</b>.
+                                If it also calls <code style="color:var(--blue)">reqRealTimeBars</code> → <b>6 lines/symbol</b> (1+5).
+                                Set <b style="color:var(--text)">Data Lines / Symbol</b> to match your adapter so the bot
+                                auto-caps subscriptions and prioritises symbols with open positions.
+                                Current budget: <b style="color:var(--green)">${Math.floor((CFG.MAX_MARKET_DATA_LINES || 95) / (CFG.DATA_LINES_PER_SYMBOL || 1))} symbols</b> can be subscribed simultaneously.
+                            </div>
+                            <div class="sm-grid">
+                                ${field('DATA_LINES_PER_SYMBOL', 'Data Lines / Symbol', 'number', CFG.DATA_LINES_PER_SYMBOL, '1 = reqMktData only · 6 = reqMktData + reqRealTimeBars')}
+                                ${field('MAX_MARKET_DATA_LINES', 'Max Data Lines (account limit)', 'number', CFG.MAX_MARKET_DATA_LINES, 'Set 5 below your IBKR limit as a safety buffer (e.g. 95 for a 100-line account)')}
+                            </div>
+                        </div>`,
+
+            watchlist: () => `
+                        <div class="sm-section">
+                            <div class="sm-section-title">Active Symbols <span style="color:var(--blue);margin-left:6px" id="wl-count">${WL.length} symbols</span></div>
+                            <div class="wl-grid" id="wl-tags">${renderWLTags()}</div>
+                            <div class="wl-add-row">
+                                <input class="wl-add-input" id="wl-new" placeholder="e.g. AMZN, TSLA, SPY…" maxlength="80"
+                                       onkeydown="if(event.key==='Enter')addWLSymbols()">
+                                <button class="wl-add-btn" onclick="addWLSymbols()">+ Add</button>
+                            </div>
+                            <div class="wl-group-label">Default groups</div>
+                            ${Object.entries(WATCHLIST_DEFAULTS).map(([grp, syms]) => `
+                                <div style="margin-bottom:8px">
+                                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+                                        <span style="font-size:10px;color:var(--muted)">${grp}</span>
+                                        <button onclick="addGroupToWL(${JSON.stringify(syms)})"
+                                            style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:3px;padding:1px 8px;font-size:9px;cursor:pointer;transition:color .15s"
+                                            onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">
+                                            + Add all
+                                        </button>
+                                    </div>
+                                    <div style="display:flex;flex-wrap:wrap;gap:4px">
+                                        ${syms.map(s => `<span style="font-size:10px;font-weight:700;color:${WL.includes(s) ? 'var(--green)' : 'var(--muted)'};cursor:pointer;padding:2px 5px;background:var(--subtle);border-radius:3px" onclick="toggleWLSym('${s}',this)" title="Toggle ${s}">${s}</span>`).join('')}
+                                    </div>
+                                </div>`).join('')}
+                        </div>`
+        };
+
+        function field(id, label, type, val, hint = '') {
+            return `<div class="sm-field" title="${hint}">
+                        <span class="sm-label">${label}</span>
+                        <input class="sm-input" id="cfg-${id}" type="${type}" value="${val}" step="any">
+                    </div>`;
+        }
+
+        function renderWLTags() {
+            return WL.map(s => `<div class="wl-tag">${s}<span class="wl-rm" onclick="removeWLSym('${s}')">×</span></div>`).join('');
+        }
+
+        function refreshWLUI() {
+            const el = document.getElementById('wl-tags');
+            if (el) el.innerHTML = renderWLTags();
+            const cnt = document.getElementById('wl-count');
+            if (cnt) cnt.textContent = WL.length + ' symbols';
+        }
+
+        function removeWLSym(sym) {
+            WL = WL.filter(s => s !== sym);
+            refreshWLUI();
+        }
+
+        function addWLSymbols() {
+            const inp = document.getElementById('wl-new');
+            const raw = inp.value.toUpperCase().replace(/[^A-Z,\s]+/g, '').split(/[\s,]+/).filter(Boolean);
+            raw.forEach(s => { if (s && !WL.includes(s)) WL.push(s); });
+            inp.value = '';
+            refreshWLUI();
+        }
+
+        function addGroupToWL(syms) {
+            syms.forEach(s => { if (!WL.includes(s)) WL.push(s); });
+            refreshWLUI();
+            switchTab('watchlist'); // re-render so colours update
+        }
+
+        function toggleWLSym(sym, el) {
+            if (WL.includes(sym)) {
+                WL = WL.filter(s => s !== sym);
+                el.style.color = 'var(--muted)';
+            } else {
+                WL.push(sym);
+                el.style.color = 'var(--green)';
+            }
+            refreshWLUI();
+        }
+
+        function switchTab(tab) {
+            _activeTab = tab;
+            document.querySelectorAll('.sm-tab').forEach((t, i) => {
+                const tabs = ['risk', 'strategy', 'filters', 'watchlist'];
+                t.classList.toggle('active', tabs[i] === tab);
+            });
+            document.getElementById('sm-body').innerHTML = TAB_HTML[tab]();
+        }
+
+        function openSettings() {
+            document.getElementById('settings-overlay').classList.add('open');
+            document.getElementById('sm-body').innerHTML = '<div style="padding:40px;text-align:center;color:var(--muted)">Loading config…</div>';
+            // Always fetch fresh config from the bot before showing the modal
+            loadConfigFromAPI().then(() => switchTab('risk'));
+        }
+
+        function closeSettings() {
+            document.getElementById('settings-overlay').classList.remove('open');
+            const pwEl = document.getElementById('sm-password');
+            if (pwEl) pwEl.value = '';
+        }
+
+        function readInputs() {
+            // Read all cfg-* inputs
+            document.querySelectorAll('[id^="cfg-"]').forEach(inp => {
+                const key = inp.id.replace('cfg-', '');
+                if (inp.type === 'checkbox') CFG[key] = inp.checked;
+                else if (inp.type === 'number') CFG[key] = parseFloat(inp.value) || 0;
+                else CFG[key] = inp.value;
+            });
+        }
+
+        async function saveSettings() {
+            readInputs();
+            const pw = document.getElementById('sm-password')?.value || '';
+            if (!pw) {
+                const note = document.getElementById('sm-save-note');
+                note.textContent = '⚠ Enter the settings password to save.';
+                note.style.color = 'var(--yellow)';
+                document.getElementById('sm-password').focus();
+                setTimeout(() => { note.textContent = 'All changes apply live instantly — new watchlist symbols subscribe automatically'; note.style.color = ''; }, 3000);
+                return;
+            }
+            const payload = Object.assign({}, CFG, { watchlist: WL, password: pw });
+            const note = document.getElementById('sm-save-note');
+            const btn = document.querySelector('.sm-btn-primary');
+            btn.disabled = true;
+            btn.textContent = 'Saving…';
+            try {
+                const res = await fetch(API.replace('/api/status', '/api/config'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.ok) {
+                    note.textContent = '✓ Saved to bot-config.json — all changes applied live!';
+                    note.style.color = 'var(--green)';
+                    document.getElementById('sm-password').value = '';
+                } else {
+                    throw new Error(data.message || 'Save failed');
+                }
+            } catch (e) {
+                note.textContent = '⚠ ' + e.message;
+                note.style.color = (e.message.toLowerCase().includes('password') || e.message.includes('401')) ? 'var(--yellow)' : 'var(--red)';
+                document.getElementById('sm-password').select();
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Save Settings';
+                setTimeout(() => { note.textContent = 'All changes apply live instantly — new watchlist symbols subscribe automatically'; note.style.color = ''; }, 4000);
+            }
+        }
+
+        function resetDefaults() {
+            if (!confirm('Reset all settings to defaults?')) return;
+            CFG = Object.assign({}, DEFAULTS);
+            WL = Object.values(WATCHLIST_DEFAULTS).flat();
+            switchTab(_activeTab);
+        }
+
+        // Close modal on Escape
+        document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSettings(); });
     </script>
 </body>
 </html>

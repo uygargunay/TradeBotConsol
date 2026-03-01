@@ -31,6 +31,10 @@ public interface IBroker
                      double currentRsi = 0, string orderType = "LMT");
     void RequestHistoricalData(string symbol);
 
+    // Unsubscribes live tick + market data feed for a symbol.
+    // Implement as a no-op if your adapter doesn't support it yet.
+    void CancelMarketData(string symbol);
+
     // True once the IBKR socket handshake is complete (nextValidId has fired).
     bool IsReady { get; }
 
@@ -104,32 +108,39 @@ public class SimulatedBroker
     private readonly object _lock = new object();
 
     // ── TRADING RULES ──────────────────────────────────────
-    private const decimal TOTAL_BUDGET = 4000m;
-    private const int MAX_POSITIONS = 2;
-    private const decimal POSITION_SIZE = 2000m;
-    private const int MIN_HOLD_SECONDS = 600;          // 10 min (was 5) — ATR stop was firing on open noise
-    private const decimal DAILY_PROFIT_GOAL = 300m;
-    private const decimal MAX_DAILY_LOSS = -150m;
-    private const int COOLDOWN_SECONDS = 1800;         // 30 min (was 8) — biggest lever to cut churn
-    private const decimal ATR_TRAIL_MULT = 2.5m;
-    private const decimal SHORT_ATR_TRAIL = 2.0m;
-    private const decimal HARD_STOP_ATR_MULT = 2.0m;
-    private const decimal MAX_LOSS_PER_TRADE = 50m;    // was $75 — tighter dollar stop
-    private const decimal COMMISSION_PER_SIDE = 1m;    // IBKR flat $1 per order leg (buy OR sell)
-    private const decimal MIN_STOP_DISTANCE = 0.10m;
-    private const int MAX_QTY_SANITY = 500;
-    private const decimal RISK_PCT = 0.015m;
-    private const int ORB_MINUTES = 30;
-    private const decimal VOL_EXPAND_MULT = 2.0m;      // was 1.5 — require a real volume surge
-    private const double RSI_LONG_MIN = 60.0;          // was 56 — need genuine momentum
-    private const double RSI_SHORT_MAX = 40.0;         // was 44
-    private const double RSI_OVERSOLD = 30.0;
-    private const double RSI_OVERBOUGHT = 70.0;
-    private const decimal GAP_GO_MIN_PCT = 0.008m;
-    private const decimal GAP_GO_REL_VOL = 1.5m;
-    private const int VWAP_CONFIRM_BARS = 2;
-    private const int MAX_TRADES_PER_DAY = 6;          // hard cap — 25 trades on $4k is commission suicide
-    private const decimal MIN_ATR_PCT = 0.004m;        // 0.4% — skip GILD/GE/MS-type low-vol stocks
+    // ── Runtime-configurable fields (loaded from bot-config.json on startup) ──
+    private decimal TOTAL_BUDGET = 4000m;
+    private int MAX_POSITIONS = 2;
+    private decimal POSITION_SIZE = 2000m;
+    private int MIN_HOLD_SECONDS = 600;          // 10 min
+    private decimal DAILY_PROFIT_GOAL = 300m;
+    private decimal MAX_DAILY_LOSS = -150m;
+    private int COOLDOWN_SECONDS = 1800;         // 30 min
+    private decimal ATR_TRAIL_MULT = 2.5m;
+    private decimal SHORT_ATR_TRAIL = 2.0m;
+    private decimal HARD_STOP_ATR_MULT = 2.0m;
+    private decimal MAX_LOSS_PER_TRADE = 50m;
+    private decimal COMMISSION_PER_SIDE = 1m;
+    private decimal MIN_STOP_DISTANCE = 0.10m;
+    private int MAX_QTY_SANITY = 500;
+    private decimal RISK_PCT = 0.015m;
+    private int ORB_MINUTES = 30;
+    private decimal VOL_EXPAND_MULT = 2.0m;
+    private double RSI_LONG_MIN = 60.0;
+    private double RSI_SHORT_MAX = 40.0;
+    private double RSI_OVERSOLD = 30.0;
+    private double RSI_OVERBOUGHT = 70.0;
+    private decimal GAP_GO_MIN_PCT = 0.008m;
+    private decimal GAP_GO_REL_VOL = 1.5m;
+    private int VWAP_CONFIRM_BARS = 2;
+    private int MAX_TRADES_PER_DAY = 6;
+    private decimal MIN_ATR_PCT = 0.004m;
+    // IBKR market data line budget.
+    // DATA_LINES_PER_SYMBOL: how many lines ONE symbol uses (1 = reqMktData only,
+    //   6 = reqMktData + reqRealTimeBars, adjust to match your IbClient adapter).
+    // MAX_MARKET_DATA_LINES: hard ceiling — stay below your account limit (100 by default).
+    private int DATA_LINES_PER_SYMBOL = 1;
+    private int MAX_MARKET_DATA_LINES = 95;
 
 
     private bool _allowShorts = false; // set to true only if you have a margin account
@@ -205,42 +216,53 @@ public class SimulatedBroker
     private static readonly string EmailPassword =
         Environment.GetEnvironmentVariable("BOT_EMAIL_PASS") ?? "sznd kafk nhec skqh";
 
-    // ── WATCHLIST ──────────────────────────────────────────
-    public readonly string[] _watchlist =
-  {
-    // ── CORE ETFs ─────────────────────────────────────────
-    "SPY","QQQ","IWM","DIA","SMH","XLK","XLF","XLE","XBI",
+    // ── WATCHLIST (mutable — updated at runtime via /api/config) ──────────────
+    // 85 best-in-class symbols — fits within the 95-slot IBKR data budget.
+    // Ranked by: daily volume, ATR, trend-following behaviour, fill quality.
+    // Add more only after purchasing an IBKR Market Data Booster Pack.
+    public string[] _watchlist =
+    {
+        // ── CORE ETFs (9) ─────────────────────────────────────────────────
+        "SPY","QQQ","IWM","SMH","XLK","XLF","XLE","XBI","DIA",
 
-    // ── MEGA CAP TECH ─────────────────────────────────────
-    "AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","ORCL","IBM","ADBE",
+        // ── MEGA CAP TECH (8) ─────────────────────────────────────────────
+        "AAPL","MSFT","NVDA","META","AMZN","GOOGL","TSLA","ADBE",
 
-    // ── SEMIS ─────────────────────────────────────────────
-    "AMD","ARM","AVGO","QCOM","MU","LRCX","AMAT","ASML","TSM","TXN",
+        // ── SEMIS (8) ─────────────────────────────────────────────────────
+        "AMD","AVGO","ARM","MU","AMAT","LRCX","QCOM","TSM",
 
-    // ── CLOUD / SAAS ──────────────────────────────────────
-    "CRM","NOW","SNOW","MDB","DDOG","NET","ZS","CRWD","PANW","PLTR",
-    "OKTA","TTD","APP",
+        // ── CLOUD / SAAS (10) ─────────────────────────────────────────────
+        "CRM","NOW","CRWD","PANW","PLTR","DDOG","NET","SNOW","APP","TTD",
 
-    // ── FINTECH / CRYPTO ──────────────────────────────────
-    "COIN","MSTR","PYPL","HOOD","SOFI","XYZ",   // XYZ = Block (was SQ)
+        // ── FINTECH / CRYPTO (5) ──────────────────────────────────────────
+        "COIN","MSTR","PYPL","HOOD","SOFI",
 
-    // ── FINANCIALS ────────────────────────────────────────
-    "JPM","BAC","GS","MS","V","MA","BX",
+        // ── FINANCIALS (7) ────────────────────────────────────────────────
+        "JPM","GS","MS","BAC","V","MA","BX",
 
-    // ── HIGH-MOMENTUM GROWTH ──────────────────────────────
-    "NFLX","UBER","ABNB","SHOP","MELI","BKNG","DASH","SPOT","INTU","ANET",
+        // ── HIGH-MOMENTUM GROWTH (10) ─────────────────────────────────────
+        "NFLX","UBER","SHOP","MELI","BKNG","ABNB","INTU","ANET","DASH","SPOT",
 
-    // ── ENERGY ────────────────────────────────────────────
-    "XOM","CVX","OXY",
+        // ── ENERGY (3) ────────────────────────────────────────────────────
+        "XOM","CVX","OXY",
 
-    // ── BIOTECH / HEALTH ──────────────────────────────────
-    "ABBV","UNH","VRTX","REGN","GILD",
+        // ── BIOTECH / HEALTH (5) ──────────────────────────────────────────
+        "UNH","ABBV","VRTX","REGN","GILD",
 
-    // ── INDUSTRIALS / DEFENSE ─────────────────────────────
-    "CAT","DE","GE","HON","RTX","LMT","BA"
-};
+        // ── INDUSTRIALS / DEFENSE (7) ─────────────────────────────────────
+        "CAT","DE","GE","HON","RTX","LMT","BA",
+
+        // ── ADDITIONAL ALPHA (8) ──────────────────────────────────────────
+        "ORCL","IBM","TXN","ASML","ZS","MDB","OKTA","XYZ"
+    };
 
     // Dashboard timer
+    // Tracks which symbols we've already called RequestHistoricalData for so
+    // ApplyWatchlistDiff doesn't re-subscribe symbols already streaming.
+    private readonly HashSet<string> _subscribedSymbols = new(StringComparer.OrdinalIgnoreCase);
+    // Used to detect ORB_MINUTES changes so we can clear stale opening ranges.
+    private int _previousOrbMinutes;
+
     private Timer _dashboardTimer;
 
     // ══════════════════════════════════════════════════════════
@@ -428,6 +450,10 @@ public class SimulatedBroker
     {
         CheckDailyReset();
         if (_haltTrading) return;
+
+        // Skip entry logic for symbols no longer on the watchlist.
+        // CheckHardStop / CheckExits still run via UpdateLiveTick to protect open positions.
+        if (!_watchlist.Contains(symbol, StringComparer.OrdinalIgnoreCase)) return;
 
         // Block new entries until IBKR position snapshot is reconciled.
         // Prevents buying into already-open positions after a restart.
@@ -1339,15 +1365,117 @@ public class SimulatedBroker
         LogMessage("[CANDLE ENGINE] Market data cleared.");
     }
 
+    // ── How many symbols we can subscribe given the current line budget ────────
+    private int GetSubscriptionSlots() =>
+        DATA_LINES_PER_SYMBOL > 0 ? MAX_MARKET_DATA_LINES / DATA_LINES_PER_SYMBOL : _watchlist.Length;
+
+    // ── Priority order for which symbols get a live-data slot ─────────────────
+    //  1. Symbols with an open position     (must never lose their feed)
+    //  2. Symbols with recent candle activity (ATR ≥ threshold = volatile/moving)
+    //  3. Everything else in watchlist order
+    private IEnumerable<string> GetPrioritizedWatchlist()
+    {
+        var withPosition = new HashSet<string>(_positions.Keys, StringComparer.OrdinalIgnoreCase);
+        return _watchlist
+            .OrderByDescending(s => withPosition.Contains(s) ? 2 :
+                (_marketData.TryGetValue(s, out var c) && c.Count > 0 &&
+                 SafeATR(c, 14) / (c.LastOrDefault()?.Close ?? 1m) >= MIN_ATR_PCT ? 1 : 0));
+    }
+
     public async Task RequestAllHistoricalSlow()
     {
         if (RealBroker == null)
             throw new Exception("RealBroker not set.");
-        foreach (var symbol in _watchlist)
+
+        int slots = GetSubscriptionSlots();
+        var toSubscribe = GetPrioritizedWatchlist().Take(slots).ToList();
+        int skipped = _watchlist.Length - toSubscribe.Count;
+
+        if (skipped > 0)
+            LogMessage($"[DATA] Line budget: {MAX_MARKET_DATA_LINES} lines ÷ {DATA_LINES_PER_SYMBOL}/sym = {slots} slots. " +
+                       $"Subscribing {toSubscribe.Count}/{_watchlist.Length} symbols ({skipped} skipped — raise MAX_MARKET_DATA_LINES or buy a Booster Pack).");
+
+        foreach (var symbol in toSubscribe)
         {
             LogMessage($"[HIST] Requesting {symbol}...");
             RealBroker.RequestHistoricalData(symbol);
+            _subscribedSymbols.Add(symbol);
             await Task.Delay(1500); // IB pacing limit
+        }
+        _previousOrbMinutes = ORB_MINUTES;
+    }
+
+    // ── Apply watchlist changes live without restart ───────────────────────────
+    public async Task ApplyWatchlistDiff(string[] oldList, string[] newList)
+    {
+        if (RealBroker == null || !RealBroker.IsReady) return;
+
+        var added = newList.Except(oldList, StringComparer.OrdinalIgnoreCase).ToArray();
+        var removed = oldList.Except(newList, StringComparer.OrdinalIgnoreCase).ToArray();
+
+        // ── Unsubscribe removed symbols first (frees slots before we add) ──────
+        foreach (var sym in removed)
+        {
+            bool hasPosition;
+            lock (_lock) { hasPosition = _positions.ContainsKey(sym); }
+            if (hasPosition)
+            {
+                LogMessage($"[WATCHLIST] {sym} removed from watchlist but has open position — keeping feed until flat.");
+                continue;
+            }
+            LogMessage($"[WATCHLIST] Unsubscribing removed symbol: {sym}");
+            try { RealBroker.CancelMarketData(sym); } catch { /* adapter may not support yet */ }
+            _subscribedSymbols.Remove(sym);
+        }
+
+        // ── Subscribe new symbols respecting the line budget ──────────────────
+        int slots = GetSubscriptionSlots();
+        int available = slots - _subscribedSymbols.Count;
+
+        if (available <= 0)
+        {
+            LogMessage($"[DATA] No free data slots for {added.Length} new symbol(s). " +
+                       $"Budget: {MAX_MARKET_DATA_LINES} lines ÷ {DATA_LINES_PER_SYMBOL}/sym = {slots} slots, all used. " +
+                       $"Raise MAX_MARKET_DATA_LINES in settings or remove other symbols first.");
+            return;
+        }
+
+        var toAdd = added.Take(available).ToArray();
+        int overflow = added.Length - toAdd.Length;
+        if (overflow > 0)
+            LogMessage($"[DATA] Line budget only allows {toAdd.Length}/{added.Length} new symbols. {overflow} skipped.");
+
+        foreach (var sym in toAdd)
+        {
+            if (_subscribedSymbols.Contains(sym)) continue;
+            LogMessage($"[WATCHLIST] Subscribing new symbol: {sym}");
+            RealBroker.RequestHistoricalData(sym);
+            _subscribedSymbols.Add(sym);
+            await Task.Delay(1500); // IBKR pacing
+        }
+    }
+
+    // ── Re-evaluate halt state after P&L limits change ────────────────────────
+    // If the user loosened the limits, un-halt so trading can resume.
+    // If they tightened them and current PnL already breaches the new values, halt.
+    public void ReevaluateHalt()
+    {
+        lock (_lock)
+        {
+            bool shouldHalt = _totalRealizedPnL >= DAILY_PROFIT_GOAL
+                           || _totalRealizedPnL <= MAX_DAILY_LOSS;
+            if (_haltTrading && !shouldHalt)
+            {
+                _haltTrading = false;
+                LogMessage($"[CONFIG] Halt lifted — PnL {_totalRealizedPnL:C2} is within updated limits " +
+                           $"(goal={DAILY_PROFIT_GOAL:C2}, maxLoss={MAX_DAILY_LOSS:C2}).");
+            }
+            else if (!_haltTrading && shouldHalt)
+            {
+                _haltTrading = true;
+                LogMessage($"[CONFIG] New limits triggered halt — PnL {_totalRealizedPnL:C2} breaches " +
+                           $"(goal={DAILY_PROFIT_GOAL:C2}, maxLoss={MAX_DAILY_LOSS:C2}).");
+            }
         }
     }
 
@@ -1406,6 +1534,144 @@ public class SimulatedBroker
     //  Open dashboard.html in any browser — auto-refreshes every second.
     // ══════════════════════════════════════════════════════════
 
+    private const string CONFIG_FILE = "bot-config.json";
+    private const string CONFIG_PASSWORD = "Efmukl123!";
+
+    // ── Load configuration from bot-config.json (called at bot startup) ───────
+    public void LoadConfig()
+    {
+        try
+        {
+            if (!File.Exists(CONFIG_FILE)) return;
+            var text = File.ReadAllText(CONFIG_FILE);
+            using var doc = System.Text.Json.JsonDocument.Parse(text);
+            var root = doc.RootElement;
+
+            T Get<T>(string key, T fallback)
+            {
+                if (!root.TryGetProperty(key, out var el)) return fallback;
+                try { return (T)Convert.ChangeType(el.GetRawText().Trim('"'), typeof(T)); } catch { return fallback; }
+            }
+            decimal GetD(string k, decimal fb) => Get<decimal>(k, fb);
+            int GetI(string k, int fb) => Get<int>(k, fb);
+            double GetF(string k, double fb) => Get<double>(k, fb);
+            bool GetB(string k, bool fb) { if (!root.TryGetProperty(k, out var el)) return fb; return el.GetBoolean(); }
+
+            TOTAL_BUDGET = GetD("TOTAL_BUDGET", TOTAL_BUDGET);
+            MAX_POSITIONS = GetI("MAX_POSITIONS", MAX_POSITIONS);
+            POSITION_SIZE = GetD("POSITION_SIZE", POSITION_SIZE);
+            MIN_HOLD_SECONDS = GetI("MIN_HOLD_SECONDS", MIN_HOLD_SECONDS);
+            DAILY_PROFIT_GOAL = GetD("DAILY_PROFIT_GOAL", DAILY_PROFIT_GOAL);
+            MAX_DAILY_LOSS = GetD("MAX_DAILY_LOSS", MAX_DAILY_LOSS);
+            COOLDOWN_SECONDS = GetI("COOLDOWN_SECONDS", COOLDOWN_SECONDS);
+            ATR_TRAIL_MULT = GetD("ATR_TRAIL_MULT", ATR_TRAIL_MULT);
+            SHORT_ATR_TRAIL = GetD("SHORT_ATR_TRAIL", SHORT_ATR_TRAIL);
+            HARD_STOP_ATR_MULT = GetD("HARD_STOP_ATR_MULT", HARD_STOP_ATR_MULT);
+            MAX_LOSS_PER_TRADE = GetD("MAX_LOSS_PER_TRADE", MAX_LOSS_PER_TRADE);
+            COMMISSION_PER_SIDE = GetD("COMMISSION_PER_SIDE", COMMISSION_PER_SIDE);
+            MIN_STOP_DISTANCE = GetD("MIN_STOP_DISTANCE", MIN_STOP_DISTANCE);
+            MAX_QTY_SANITY = GetI("MAX_QTY_SANITY", MAX_QTY_SANITY);
+            RISK_PCT = GetD("RISK_PCT", RISK_PCT);
+            ORB_MINUTES = GetI("ORB_MINUTES", ORB_MINUTES);
+            VOL_EXPAND_MULT = GetD("VOL_EXPAND_MULT", VOL_EXPAND_MULT);
+            RSI_LONG_MIN = GetF("RSI_LONG_MIN", RSI_LONG_MIN);
+            RSI_SHORT_MAX = GetF("RSI_SHORT_MAX", RSI_SHORT_MAX);
+            RSI_OVERSOLD = GetF("RSI_OVERSOLD", RSI_OVERSOLD);
+            RSI_OVERBOUGHT = GetF("RSI_OVERBOUGHT", RSI_OVERBOUGHT);
+            GAP_GO_MIN_PCT = GetD("GAP_GO_MIN_PCT", GAP_GO_MIN_PCT);
+            GAP_GO_REL_VOL = GetD("GAP_GO_REL_VOL", GAP_GO_REL_VOL);
+            VWAP_CONFIRM_BARS = GetI("VWAP_CONFIRM_BARS", VWAP_CONFIRM_BARS);
+            MAX_TRADES_PER_DAY = GetI("MAX_TRADES_PER_DAY", MAX_TRADES_PER_DAY);
+            MIN_ATR_PCT = GetD("MIN_ATR_PCT", MIN_ATR_PCT);
+            _allowShorts = GetB("ALLOW_SHORTS", _allowShorts);
+            DATA_LINES_PER_SYMBOL = GetI("DATA_LINES_PER_SYMBOL", DATA_LINES_PER_SYMBOL);
+            MAX_MARKET_DATA_LINES = GetI("MAX_MARKET_DATA_LINES", MAX_MARKET_DATA_LINES);
+
+            if (root.TryGetProperty("watchlist", out var wlEl) && wlEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                var list = new List<string>();
+                foreach (var item in wlEl.EnumerateArray())
+                {
+                    var s = item.GetString();
+                    if (!string.IsNullOrWhiteSpace(s)) list.Add(s.Trim().ToUpper());
+                }
+                // Cap at the subscription slot budget so a stale/inflated bot-config.json
+                // never loads more symbols than IBKR will allow without a Booster Pack.
+                int slotCap = DATA_LINES_PER_SYMBOL > 0
+                    ? MAX_MARKET_DATA_LINES / DATA_LINES_PER_SYMBOL
+                    : MAX_MARKET_DATA_LINES;
+                if (list.Count > slotCap)
+                {
+                    Console.WriteLine($"[CONFIG] Watchlist in config has {list.Count} symbols — trimming to {slotCap} to stay within data line budget.");
+                    list = list.Take(slotCap).ToList();
+                }
+                if (list.Count > 0) _watchlist = list.ToArray();
+            }
+
+            Console.WriteLine($"[CONFIG] Loaded from {CONFIG_FILE}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CONFIG] Load failed ({ex.Message}), using defaults.");
+        }
+    }
+
+    // ── Persist current configuration to bot-config.json ──────────────────────
+    private void SaveConfig()
+    {
+        try
+        {
+            File.WriteAllText(CONFIG_FILE, BuildConfigJson(pretty: true));
+            Console.WriteLine($"[CONFIG] Saved to {CONFIG_FILE}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CONFIG] Save failed: {ex.Message}");
+        }
+    }
+
+    // ── Serialise all runtime config to JSON ──────────────────────────────────
+    private string BuildConfigJson(bool pretty = false)
+    {
+        var wlJson = "[" + string.Join(",", _watchlist.Select(s => $"\"{s}\"")) + "]";
+        var indent = pretty ? "\n  " : "";
+        var nl = pretty ? "\n" : "";
+        var sep = pretty ? ",\n  " : ",";
+        return $"{{{nl}{indent}" + string.Join(sep, new[]
+        {
+            $"\"TOTAL_BUDGET\":{TOTAL_BUDGET:F2}",
+            $"\"MAX_POSITIONS\":{MAX_POSITIONS}",
+            $"\"POSITION_SIZE\":{POSITION_SIZE:F2}",
+            $"\"MIN_HOLD_SECONDS\":{MIN_HOLD_SECONDS}",
+            $"\"DAILY_PROFIT_GOAL\":{DAILY_PROFIT_GOAL:F2}",
+            $"\"MAX_DAILY_LOSS\":{MAX_DAILY_LOSS:F2}",
+            $"\"COOLDOWN_SECONDS\":{COOLDOWN_SECONDS}",
+            $"\"ATR_TRAIL_MULT\":{ATR_TRAIL_MULT:F2}",
+            $"\"SHORT_ATR_TRAIL\":{SHORT_ATR_TRAIL:F2}",
+            $"\"HARD_STOP_ATR_MULT\":{HARD_STOP_ATR_MULT:F2}",
+            $"\"MAX_LOSS_PER_TRADE\":{MAX_LOSS_PER_TRADE:F2}",
+            $"\"COMMISSION_PER_SIDE\":{COMMISSION_PER_SIDE:F2}",
+            $"\"MIN_STOP_DISTANCE\":{MIN_STOP_DISTANCE:F2}",
+            $"\"MAX_QTY_SANITY\":{MAX_QTY_SANITY}",
+            $"\"RISK_PCT\":{RISK_PCT:F4}",
+            $"\"ORB_MINUTES\":{ORB_MINUTES}",
+            $"\"VOL_EXPAND_MULT\":{VOL_EXPAND_MULT:F2}",
+            $"\"RSI_LONG_MIN\":{RSI_LONG_MIN:F1}",
+            $"\"RSI_SHORT_MAX\":{RSI_SHORT_MAX:F1}",
+            $"\"RSI_OVERSOLD\":{RSI_OVERSOLD:F1}",
+            $"\"RSI_OVERBOUGHT\":{RSI_OVERBOUGHT:F1}",
+            $"\"GAP_GO_MIN_PCT\":{GAP_GO_MIN_PCT:F4}",
+            $"\"GAP_GO_REL_VOL\":{GAP_GO_REL_VOL:F2}",
+            $"\"VWAP_CONFIRM_BARS\":{VWAP_CONFIRM_BARS}",
+            $"\"MAX_TRADES_PER_DAY\":{MAX_TRADES_PER_DAY}",
+            $"\"MIN_ATR_PCT\":{MIN_ATR_PCT:F4}",
+            $"\"ALLOW_SHORTS\":{(_allowShorts ? "true" : "false")}",
+            $"\"DATA_LINES_PER_SYMBOL\":{DATA_LINES_PER_SYMBOL}",
+            $"\"MAX_MARKET_DATA_LINES\":{MAX_MARKET_DATA_LINES}",
+            $"\"watchlist\":{wlJson}"
+        }) + $"{nl}}}";
+    }
+
     private HttpListener _httpListener;
 
     private void StartDashboardServer()
@@ -1441,14 +1707,30 @@ public class SimulatedBroker
         try
         {
             ctx.Response.Headers.Add("Access-Control-Allow-Origin", "*");
+            ctx.Response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            ctx.Response.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
             ctx.Response.ContentType = "application/json";
+
             var path = ctx.Request.Url.AbsolutePath.ToLower();
+            var method = ctx.Request.HttpMethod.ToUpper();
+
+            // CORS pre-flight
+            if (method == "OPTIONS")
+            {
+                ctx.Response.StatusCode = 204;
+                ctx.Response.OutputStream.Close();
+                return;
+            }
+
             string json;
+
             if (path == "/api/status")
+            {
                 json = BuildStatusJson();
+            }
             else if (path == "/api/candles")
             {
-                var qs = ctx.Request.Url.Query; // e.g. ?sym=AAPL
+                var qs = ctx.Request.Url.Query;
                 string sym = "";
                 if (qs.StartsWith("?"))
                     foreach (var part in qs.Substring(1).Split('&'))
@@ -1459,8 +1741,126 @@ public class SimulatedBroker
                     }
                 json = BuildCandlesJson(sym);
             }
+            else if (path == "/api/config" && method == "GET")
+            {
+                json = BuildConfigJson(pretty: true);
+            }
+            else if (path == "/api/config" && method == "POST")
+            {
+                try
+                {
+                    using var reader = new System.IO.StreamReader(ctx.Request.InputStream, System.Text.Encoding.UTF8);
+                    var body = reader.ReadToEnd();
+                    using var doc = System.Text.Json.JsonDocument.Parse(body);
+                    var root = doc.RootElement;
+
+                    // ── Password check ────────────────────────────────────────
+                    if (!root.TryGetProperty("password", out var pwEl) ||
+                        pwEl.GetString() != CONFIG_PASSWORD)
+                    {
+                        ctx.Response.StatusCode = 401;
+                        json = "{\"ok\":false,\"message\":\"Incorrect password.\"}";
+                        byte[] deny = System.Text.Encoding.UTF8.GetBytes(json);
+                        ctx.Response.ContentLength64 = deny.Length;
+                        ctx.Response.OutputStream.Write(deny, 0, deny.Length);
+                        return;
+                    }
+
+                    T Get<T>(string key, T fallback)
+                    {
+                        if (!root.TryGetProperty(key, out var el)) return fallback;
+                        try { return (T)Convert.ChangeType(el.GetRawText().Trim('"'), typeof(T)); } catch { return fallback; }
+                    }
+                    decimal GetD(string k, decimal fb) => Get<decimal>(k, fb);
+                    int GetI(string k, int fb) => Get<int>(k, fb);
+                    double GetF(string k, double fb) => Get<double>(k, fb);
+                    bool GetB(string k, bool fb) { if (!root.TryGetProperty(k, out var el)) return fb; return el.GetBoolean(); }
+
+                    string[] oldWatchlist;
+                    string[] newWatchlist = null;
+                    bool orbChanged;
+
+                    lock (_lock)
+                    {
+                        oldWatchlist = _watchlist.ToArray();
+                        int oldOrbMinutes = ORB_MINUTES;
+
+                        TOTAL_BUDGET = GetD("TOTAL_BUDGET", TOTAL_BUDGET);
+                        MAX_POSITIONS = GetI("MAX_POSITIONS", MAX_POSITIONS);
+                        POSITION_SIZE = GetD("POSITION_SIZE", POSITION_SIZE);
+                        MIN_HOLD_SECONDS = GetI("MIN_HOLD_SECONDS", MIN_HOLD_SECONDS);
+                        DAILY_PROFIT_GOAL = GetD("DAILY_PROFIT_GOAL", DAILY_PROFIT_GOAL);
+                        MAX_DAILY_LOSS = GetD("MAX_DAILY_LOSS", MAX_DAILY_LOSS);
+                        COOLDOWN_SECONDS = GetI("COOLDOWN_SECONDS", COOLDOWN_SECONDS);
+                        ATR_TRAIL_MULT = GetD("ATR_TRAIL_MULT", ATR_TRAIL_MULT);
+                        SHORT_ATR_TRAIL = GetD("SHORT_ATR_TRAIL", SHORT_ATR_TRAIL);
+                        HARD_STOP_ATR_MULT = GetD("HARD_STOP_ATR_MULT", HARD_STOP_ATR_MULT);
+                        MAX_LOSS_PER_TRADE = GetD("MAX_LOSS_PER_TRADE", MAX_LOSS_PER_TRADE);
+                        COMMISSION_PER_SIDE = GetD("COMMISSION_PER_SIDE", COMMISSION_PER_SIDE);
+                        MIN_STOP_DISTANCE = GetD("MIN_STOP_DISTANCE", MIN_STOP_DISTANCE);
+                        MAX_QTY_SANITY = GetI("MAX_QTY_SANITY", MAX_QTY_SANITY);
+                        RISK_PCT = GetD("RISK_PCT", RISK_PCT);
+                        ORB_MINUTES = GetI("ORB_MINUTES", ORB_MINUTES);
+                        VOL_EXPAND_MULT = GetD("VOL_EXPAND_MULT", VOL_EXPAND_MULT);
+                        RSI_LONG_MIN = GetF("RSI_LONG_MIN", RSI_LONG_MIN);
+                        RSI_SHORT_MAX = GetF("RSI_SHORT_MAX", RSI_SHORT_MAX);
+                        RSI_OVERSOLD = GetF("RSI_OVERSOLD", RSI_OVERSOLD);
+                        RSI_OVERBOUGHT = GetF("RSI_OVERBOUGHT", RSI_OVERBOUGHT);
+                        GAP_GO_MIN_PCT = GetD("GAP_GO_MIN_PCT", GAP_GO_MIN_PCT);
+                        GAP_GO_REL_VOL = GetD("GAP_GO_REL_VOL", GAP_GO_REL_VOL);
+                        VWAP_CONFIRM_BARS = GetI("VWAP_CONFIRM_BARS", VWAP_CONFIRM_BARS);
+                        MAX_TRADES_PER_DAY = GetI("MAX_TRADES_PER_DAY", MAX_TRADES_PER_DAY);
+                        MIN_ATR_PCT = GetD("MIN_ATR_PCT", MIN_ATR_PCT);
+                        _allowShorts = GetB("ALLOW_SHORTS", _allowShorts);
+                        DATA_LINES_PER_SYMBOL = GetI("DATA_LINES_PER_SYMBOL", DATA_LINES_PER_SYMBOL);
+                        MAX_MARKET_DATA_LINES = GetI("MAX_MARKET_DATA_LINES", MAX_MARKET_DATA_LINES);
+
+                        orbChanged = ORB_MINUTES != oldOrbMinutes;
+
+                        if (root.TryGetProperty("watchlist", out var wlEl) && wlEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+                        {
+                            var list = new List<string>();
+                            foreach (var item in wlEl.EnumerateArray())
+                            {
+                                var s = item.GetString();
+                                if (!string.IsNullOrWhiteSpace(s)) list.Add(s.Trim().ToUpper());
+                            }
+                            if (list.Count > 0)
+                            {
+                                newWatchlist = list.ToArray();
+                                _watchlist = newWatchlist;
+                            }
+                        }
+                    }
+
+                    // ── Re-evaluate halt conditions with new limits ────────────
+                    ReevaluateHalt();
+
+                    // ── Clear stale ORB ranges if the window size changed ──────
+                    if (orbChanged)
+                    {
+                        _orbRanges.Clear();
+                        LogMessage($"[CONFIG] ORB_MINUTES changed — cleared all opening ranges, will recompute.");
+                    }
+
+                    // ── Subscribe/unsubscribe symbols diff (async, outside lock) ──
+                    if (newWatchlist != null)
+                        _ = Task.Run(() => ApplyWatchlistDiff(oldWatchlist, newWatchlist));
+
+                    SaveConfig();
+                    json = "{\"ok\":true,\"message\":\"Configuration saved and applied live.\"}";
+                }
+                catch (Exception ex)
+                {
+                    ctx.Response.StatusCode = 400;
+                    json = $"{{\"ok\":false,\"message\":\"{ex.Message.Replace("\"", "\\\"").Replace("\n", " ")}\"}}";
+                }
+            }
             else
+            {
                 json = "{}";
+            }
+
             byte[] buf = System.Text.Encoding.UTF8.GetBytes(json);
             ctx.Response.ContentLength64 = buf.Length;
             ctx.Response.OutputStream.Write(buf, 0, buf.Length);
