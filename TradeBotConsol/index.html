@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>IBKR Bot — Live Dashboard</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
     <style>
@@ -32,28 +33,36 @@
 
         html, body {
             height: 100%;
-            overflow: hidden
         }
 
         body {
-            font-family: 'Segoe UI',system-ui,sans-serif;
+            font-family: 'Segoe UI', system-ui, sans-serif;
             background: var(--bg);
             color: var(--text);
             font-size: 12px;
             display: flex;
-            flex-direction: column
+            flex-direction: column;
+            overflow: hidden;
+            height: 100dvh;
+            height: 100vh;
         }
 
-        /* TOPBAR */
+        /* ── TOPBAR ── */
         #top {
             display: flex;
             align-items: center;
-            gap: 14px;
+            gap: 10px;
             padding: 6px 14px;
             background: var(--panel);
             border-bottom: 1px solid var(--border);
-            flex-shrink: 0
+            flex-shrink: 0;
+            overflow-x: auto;
+            scrollbar-width: none;
         }
+
+            #top::-webkit-scrollbar {
+                display: none;
+            }
 
             #top h1 {
                 font-size: 13px;
@@ -72,7 +81,8 @@
         .tstat {
             display: flex;
             flex-direction: column;
-            align-items: flex-end
+            align-items: flex-end;
+            flex-shrink: 0
         }
 
             .tstat .lbl {
@@ -95,7 +105,8 @@
             font-size: 9px;
             font-weight: 700;
             letter-spacing: .6px;
-            text-transform: uppercase
+            text-transform: uppercase;
+            flex-shrink: 0
         }
 
         #status {
@@ -103,7 +114,8 @@
             align-items: center;
             gap: 5px;
             font-size: 11px;
-            font-weight: 600
+            font-weight: 600;
+            flex-shrink: 0
         }
 
         .dot {
@@ -143,10 +155,19 @@
             line-height: 1.5;
             color: var(--muted);
             font-size: 10px;
-            white-space: nowrap
+            white-space: nowrap;
+            flex-shrink: 0
         }
 
-        /* LAYOUT */
+        /* ── LAYOUT WRAPPER ── */
+        #layout {
+            display: flex;
+            flex: 1;
+            min-height: 0;
+            overflow: hidden;
+        }
+
+        /* ── MAIN GRID ── */
         #main {
             display: grid;
             grid-template-columns: 240px 1fr 310px;
@@ -155,10 +176,164 @@
             padding: 7px;
             flex: 1;
             min-height: 0;
+            overflow: hidden;
+            transition: flex 0.3s ease;
+        }
+
+        /* ── DETAIL PANEL ── */
+        #detail {
+            width: 0;
+            flex-shrink: 0;
+            background: var(--panel);
+            border-left: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            transition: width 0.3s ease;
+        }
+
+            #detail.open {
+                width: 440px;
+            }
+
+        .detail-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .detail-sym {
+            font-size: 18px;
+            font-weight: 800;
+            letter-spacing: .5px
+        }
+
+        .detail-close {
+            background: none;
+            border: 1px solid var(--border);
+            color: var(--muted);
+            border-radius: 4px;
+            padding: 3px 8px;
+            cursor: pointer;
+            font-size: 11px;
+            transition: color .15s, border-color .15s;
+        }
+
+            .detail-close:hover {
+                color: var(--text);
+                border-color: var(--subtle)
+            }
+
+        #detail-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .d-section {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            overflow: visible;
+        }
+
+        .d-section-head {
+            padding: 5px 10px;
+            font-size: 9px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .6px;
+            color: var(--muted);
+            border-bottom: 1px solid var(--border);
+            border-radius: 6px 6px 0 0;
+            background: var(--bg);
+        }
+
+        .d-section-body {
+            padding: 8px 10px 10px;
+        }
+
+        /* Stats grid */
+        .stat-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 6px;
+        }
+
+        .stat-item {
+            display: flex;
+            flex-direction: column;
+            gap: 2px
+        }
+
+        .stat-lbl {
+            font-size: 9px;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: .4px
+        }
+
+        .stat-val {
+            font-size: 13px;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums
+        }
+
+        /* Chart canvases */
+        .chart-canvas-wrap {
+            position: relative;
+        }
+
+            .chart-canvas-wrap canvas {
+                width: 100% !important;
+                display: block;
+            }
+
+        /* RSI gauge */
+        .rsi-gauge-wrap {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 0
+        }
+
+        .rsi-gauge-bar {
+            flex: 1;
+            height: 8px;
+            background: var(--subtle);
+            border-radius: 4px;
             overflow: hidden
         }
 
-        /* PANEL */
+        .rsi-gauge-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width .3s
+        }
+
+        .rsi-gauge-val {
+            font-size: 14px;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+            width: 36px;
+            text-align: right
+        }
+
+        .rsi-zones {
+            display: flex;
+            justify-content: space-between;
+            font-size: 9px;
+            color: var(--muted);
+            margin-top: 2px
+        }
+
+        /* ── PANEL ── */
         .panel {
             background: var(--panel);
             border: 1px solid var(--border);
@@ -284,7 +459,14 @@
         }
 
             #ep .pb {
-                padding: 5px 9px 8px
+                padding: 5px 9px 8px;
+                min-height: 0;
+            }
+
+            #ep canvas {
+                display: block;
+                width: 100% !important;
+                height: 128px !important;
             }
 
         /* POSITIONS */
@@ -368,7 +550,7 @@
             font-size: 11px
         }
 
-        /* SCANNER — spans full width bottom row */
+        /* SCANNER */
         #sp {
             grid-column: 1/-1;
             grid-row: 2
@@ -416,7 +598,8 @@
             }
 
         tbody tr {
-            border-bottom: 1px solid rgba(33,38,45,.7)
+            border-bottom: 1px solid rgba(33,38,45,.7);
+            cursor: pointer;
         }
 
             tbody tr:last-child {
@@ -424,11 +607,16 @@
             }
 
             tbody tr:hover {
-                background: rgba(255,255,255,.025)
+                background: rgba(255,255,255,.04)
             }
 
             tbody tr.hot {
                 background: rgba(255,166,87,.04)
+            }
+
+            tbody tr.selected {
+                background: rgba(88,166,255,.08) !important;
+                outline: 1px solid rgba(88,166,255,.2)
             }
 
         td {
@@ -444,12 +632,18 @@
             text-align: right
         }
 
+        /* Symbol cell */
         .sym-cell {
             font-weight: 700;
             font-size: 12px;
             display: flex;
             align-items: center;
-            gap: 3px
+            gap: 3px;
+            color: inherit;
+        }
+
+        tbody tr.selected .sym-cell {
+            color: var(--blue);
         }
 
         .hot-arrow {
@@ -531,7 +725,6 @@
             vertical-align: middle
         }
 
-        /* Trend */
         .t-up {
             color: var(--green);
             font-weight: 700
@@ -587,6 +780,165 @@
             text-align: center;
             flex-shrink: 0
         }
+
+        /* ════════════════════════════════════
+           MOBILE STYLES
+        ════════════════════════════════════ */
+        @media (max-width: 900px) {
+            /* Body scrolls naturally; layout stacks */
+            html, body {
+                height: auto;
+                min-height: 100%;
+                overflow: auto;
+            }
+
+            #layout {
+                flex-direction: column;
+                overflow: visible;
+                flex: none;
+                min-height: 0;
+            }
+
+            #main {
+                grid-template-columns: 1fr;
+                grid-template-rows: auto auto auto auto;
+                overflow: visible;
+                flex: none;
+                height: auto;
+                min-height: 0;
+            }
+
+            #pp {
+                grid-column: 1;
+                grid-row: 1;
+                height: auto;
+            }
+
+            #ep {
+                grid-column: 1;
+                grid-row: 2;
+                height: auto;
+            }
+
+            #posp {
+                grid-column: 1;
+                grid-row: 3;
+                height: auto;
+            }
+
+            #sp {
+                grid-column: 1;
+                grid-row: 4;
+                height: 400px;
+            }
+
+            /* On mobile the detail panel is a fixed full-screen overlay
+               that slides in from the right like a native drawer */
+            #detail {
+                position: fixed !important;
+                top: 0;
+                right: -100%;
+                width: 100% !important;
+                height: 100% !important;
+                border-left: none;
+                border: none;
+                z-index: 999;
+                transition: right 0.32s cubic-bezier(.4,0,.2,1);
+                overflow: hidden;
+            }
+
+                #detail.open {
+                    right: 0 !important;
+                    width: 100% !important;
+                }
+
+            /* Bigger close button on mobile */
+            .detail-close {
+                padding: 6px 14px;
+                font-size: 13px;
+            }
+
+            .tstat {
+                align-items: flex-start
+            }
+        }
+
+        @media (max-width: 600px) {
+            #top {
+                padding: 6px 10px;
+                gap: 8px
+            }
+
+                #top h1 {
+                    font-size: 12px
+                }
+
+            .tstat .val {
+                font-size: 13px
+            }
+
+            #main {
+                padding: 5px;
+                gap: 5px
+            }
+
+            .pnl-n {
+                font-size: 22px
+            }
+        }
+
+        /* Candle chart container */
+        .candle-chart-outer {
+            position: relative;
+            height: 180px;
+            width: 100%;
+        }
+
+        /* Volume chart */
+        .vol-chart-outer {
+            position: relative;
+            height: 60px;
+            margin-top: 4px;
+        }
+
+        /* Badge row */
+        .badge-row {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+
+        .badge {
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 10px;
+            font-weight: 700;
+            border: 1px solid var(--border);
+        }
+
+        /* ORB levels */
+        .orb-levels {
+            display: flex;
+            gap: 10px;
+        }
+
+        .orb-item {
+            flex: 1;
+            background: var(--subtle);
+            border-radius: 4px;
+            padding: 5px 8px;
+        }
+
+        .orb-lbl {
+            font-size: 9px;
+            color: var(--muted);
+            margin-bottom: 2px
+        }
+
+        .orb-val {
+            font-size: 13px;
+            font-weight: 700
+        }
     </style>
 </head>
 <body>
@@ -606,74 +958,180 @@
         <div id="clock"><div id="c-pt">—</div><div id="c-et">—</div></div>
     </div>
 
-    <!-- MAIN GRID -->
-    <div id="main">
+    <!-- LAYOUT FLEX: main + detail side by side on desktop -->
+    <div id="layout">
 
-        <!-- PNL GAUGES -->
-        <div class="panel" id="pp">
-            <div class="ph">Daily P&amp;L</div>
-            <div class="pb">
-                <div class="pnl-n" id="pnl-n">$0.00</div>
-                <div class="pnl-h" id="pnl-h">Goal — / Stop —</div>
-                <div class="brow">
-                    <div class="blbl"><span>Profit Goal</span><span id="gp">0%</span></div>
-                    <div class="btrack"><div class="bfill bg" id="gb" style="width:0%"></div></div>
-                </div>
-                <div class="brow">
-                    <div class="blbl"><span>Max Loss Used</span><span id="lp">0%</span></div>
-                    <div class="btrack"><div class="bfill br" id="lb" style="width:0%"></div></div>
-                </div>
-                <div class="s4">
-                    <div class="sb"><div class="sl">Wins</div><div class="sv g" id="sw">0</div></div>
-                    <div class="sb"><div class="sl">Losses</div><div class="sv r" id="sl">0</div></div>
-                    <div class="sb"><div class="sl">Trades</div><div class="sv" id="std">—</div></div>
-                    <div class="sb"><div class="sl">Win Rate</div><div class="sv b" id="swr">—</div></div>
+        <!-- MAIN GRID -->
+        <div id="main">
+
+            <!-- PNL GAUGES -->
+            <div class="panel" id="pp">
+                <div class="ph">Daily P&amp;L</div>
+                <div class="pb">
+                    <div class="pnl-n" id="pnl-n">$0.00</div>
+                    <div class="pnl-h" id="pnl-h">Goal — / Stop —</div>
+                    <div class="brow">
+                        <div class="blbl"><span>Profit Goal</span><span id="gp">0%</span></div>
+                        <div class="btrack"><div class="bfill bg" id="gb" style="width:0%"></div></div>
+                    </div>
+                    <div class="brow">
+                        <div class="blbl"><span>Max Loss Used</span><span id="lp">0%</span></div>
+                        <div class="btrack"><div class="bfill br" id="lb" style="width:0%"></div></div>
+                    </div>
+                    <div class="s4">
+                        <div class="sb"><div class="sl">Wins</div><div class="sv g" id="sw">0</div></div>
+                        <div class="sb"><div class="sl">Losses</div><div class="sv r" id="sl">0</div></div>
+                        <div class="sb"><div class="sl">Trades</div><div class="sv" id="std">—</div></div>
+                        <div class="sb"><div class="sl">Win Rate</div><div class="sv b" id="swr">—</div></div>
+                    </div>
                 </div>
             </div>
-        </div>
 
-        <!-- EQUITY CURVE -->
-        <div class="panel" id="ep">
-            <div class="ph">Equity Curve <span class="m" style="font-weight:400;font-size:8px">today</span></div>
-            <div class="pb"><canvas id="ec" style="width:100%;height:128px"></canvas></div>
-        </div>
-
-        <!-- POSITIONS -->
-        <div class="panel" id="posp">
-            <div class="ph">Open Positions <span id="pcnt" class="m">0</span></div>
-            <div class="pb" id="pbody"><div class="nop m">No open positions</div></div>
-        </div>
-
-        <!-- FULL-WIDTH SCANNER -->
-        <div class="panel" id="sp">
-            <div class="ph">
-                Market Scanner — all symbols
-                <span class="m" style="font-size:8px;font-weight:400">▶ = hot (price&gt;VWAP &amp; RSI&gt;55) · click column to sort</span>
+            <!-- EQUITY CURVE -->
+            <div class="panel" id="ep">
+                <div class="ph">Equity Curve <span class="m" style="font-weight:400;font-size:8px">today</span></div>
+                <div class="pb"><canvas id="ec" style="width:100%;height:128px"></canvas></div>
             </div>
-            <div class="pb0">
-                <div class="tbl-wrap">
-                    <table id="tbl">
-                        <thead>
-                            <tr>
-                                <th data-k="s">Symbol</th>
-                                <th data-k="price" class="tr">Price</th>
-                                <th data-k="vwap" class="tr">VWAP</th>
-                                <th data-k="sma20" class="tr">SMA20</th>
-                                <th data-k="sma50" class="tr">SMA50</th>
-                                <th data-k="rsi" class="tr">RSI</th>
-                                <th data-k="gap" class="tr">Gap %</th>
-                                <th data-k="vol" class="tr">Vol K</th>
-                                <th data-k="atr" class="tr">ATR %</th>
-                                <th data-k="orbHi" class="tr">ORB Hi</th>
-                                <th data-k="orbLo" class="tr">ORB Lo</th>
-                                <th data-k="trend" class="tc">Trend</th>
-                                <th data-k="abvVwap" class="tc">VW↕</th>
-                                <th data-k="sig" class="tc">Signal</th>
-                            </tr>
-                        </thead>
-                        <tbody id="tbody"></tbody>
-                    </table>
+
+            <!-- POSITIONS -->
+            <div class="panel" id="posp">
+                <div class="ph">Open Positions <span id="pcnt" class="m">0</span></div>
+                <div class="pb" id="pbody"><div class="nop m">No open positions</div></div>
+            </div>
+
+            <!-- FULL-WIDTH SCANNER -->
+            <div class="panel" id="sp">
+                <div class="ph">
+                    Market Scanner — all symbols
+                    <span class="m" style="font-size:8px;font-weight:400">▶ = hot · click symbol for details · click column to sort</span>
                 </div>
+                <div class="pb0">
+                    <div class="tbl-wrap">
+                        <table id="tbl">
+                            <thead>
+                                <tr>
+                                    <th data-k="s">Symbol</th>
+                                    <th data-k="price" class="tr">Price</th>
+                                    <th data-k="vwap" class="tr">VWAP</th>
+                                    <th data-k="sma20" class="tr">SMA20</th>
+                                    <th data-k="sma50" class="tr">SMA50</th>
+                                    <th data-k="rsi" class="tr">RSI</th>
+                                    <th data-k="gap" class="tr">Gap %</th>
+                                    <th data-k="vol" class="tr">Vol K</th>
+                                    <th data-k="atr" class="tr">ATR %</th>
+                                    <th data-k="orbHi" class="tr">ORB Hi</th>
+                                    <th data-k="orbLo" class="tr">ORB Lo</th>
+                                    <th data-k="trend" class="tc">Trend</th>
+                                    <th data-k="abvVwap" class="tc">VW↕</th>
+                                    <th data-k="sig" class="tc">Signal</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- DETAIL PANEL -->
+        <div id="detail">
+            <div class="detail-header">
+                <div>
+                    <div class="detail-sym" id="d-sym">—</div>
+                    <div style="font-size:10px;color:var(--muted);margin-top:2px" id="d-sub">Select a symbol</div>
+                </div>
+                <button class="detail-close" onclick="closeDetail()">← Back</button>
+            </div>
+            <div id="detail-body">
+
+                <!-- Price + SMA + VWAP chart -->
+                <div class="d-section">
+                    <div class="d-section-head">Price · SMA20 · SMA50 · VWAP</div>
+                    <div class="d-section-body" style="padding:8px 6px 8px">
+                        <div style="position:relative;height:180px;width:100%">
+                            <canvas id="price-chart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- RSI chart -->
+                <div class="d-section">
+                    <div class="d-section-head">RSI (14)</div>
+                    <div class="d-section-body" style="padding:8px 6px 12px">
+                        <div style="position:relative;height:80px">
+                            <canvas id="rsi-chart"></canvas>
+                        </div>
+                        <div class="rsi-gauge-wrap" style="margin-top:10px">
+                            <div style="font-size:9px;color:var(--muted);width:24px">0</div>
+                            <div class="rsi-gauge-bar">
+                                <div class="rsi-gauge-fill" id="d-rsi-fill" style="width:50%;background:var(--blue)"></div>
+                            </div>
+                            <div style="font-size:9px;color:var(--muted);width:28px;text-align:right">100</div>
+                            <div class="rsi-gauge-val" id="d-rsi-val">50.0</div>
+                        </div>
+                        <div class="rsi-zones" style="padding:4px 52px 0 24px;margin-top:2px">
+                            <span>Oversold 30</span><span>Neutral</span><span>70 Overbought</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Volume + ATR stats -->
+                <div class="d-section">
+                    <div class="d-section-head">Volume History</div>
+                    <div class="d-section-body" style="padding:8px 6px 8px">
+                        <div style="position:relative;height:60px;width:100%">
+                            <canvas id="vol-chart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Key stats -->
+                <div class="d-section">
+                    <div class="d-section-head">Key Metrics</div>
+                    <div class="d-section-body">
+                        <div class="stat-grid">
+                            <div class="stat-item"><span class="stat-lbl">Price</span><span class="stat-val" id="d-price">—</span></div>
+                            <div class="stat-item"><span class="stat-lbl">VWAP</span><span class="stat-val m" id="d-vwap">—</span></div>
+                            <div class="stat-item"><span class="stat-lbl">Gap %</span><span class="stat-val" id="d-gap">—</span></div>
+                            <div class="stat-item"><span class="stat-lbl">SMA 20</span><span class="stat-val" id="d-sma20">—</span></div>
+                            <div class="stat-item"><span class="stat-lbl">SMA 50</span><span class="stat-val" id="d-sma50">—</span></div>
+                            <div class="stat-item"><span class="stat-lbl">ATR %</span><span class="stat-val" id="d-atr">—</span></div>
+                            <div class="stat-item"><span class="stat-lbl">Volume</span><span class="stat-val" id="d-vol">—</span></div>
+                            <div class="stat-item"><span class="stat-lbl">Trend</span><span class="stat-val" id="d-trend">—</span></div>
+                            <div class="stat-item"><span class="stat-lbl">Signal</span><span class="stat-val" id="d-sig">—</span></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ORB Levels -->
+                <div class="d-section">
+                    <div class="d-section-head">ORB Levels</div>
+                    <div class="d-section-body">
+                        <div class="orb-levels">
+                            <div class="orb-item">
+                                <div class="orb-lbl">ORB High</div>
+                                <div class="orb-val g" id="d-orb-hi">—</div>
+                            </div>
+                            <div class="orb-item">
+                                <div class="orb-lbl">ORB Low</div>
+                                <div class="orb-val r" id="d-orb-lo">—</div>
+                            </div>
+                        </div>
+                        <!-- ORB position indicator -->
+                        <div style="margin-top:10px">
+                            <div style="font-size:9px;color:var(--muted);margin-bottom:4px">Price vs ORB Range</div>
+                            <div id="orb-bar-wrap" style="background:var(--subtle);border-radius:4px;height:10px;position:relative">
+                                <div id="orb-range-fill" style="position:absolute;top:0;height:100%;background:rgba(88,166,255,.3);border-radius:4px"></div>
+                                <div id="orb-price-tick" style="position:absolute;top:-3px;width:2px;height:16px;background:var(--orange);border-radius:1px;transform:translateX(-50%)"></div>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--muted);margin-top:2px">
+                                <span id="orb-bar-lo">Lo</span><span id="orb-bar-hi">Hi</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
             </div>
         </div>
 
@@ -683,8 +1141,287 @@
         const API = `http://${window.location.hostname}:5003/api/status`;
         let chart = null, cLabels = [], cData = [];
         let sortKey = 'atr', sortDir = -1, rawWL = [];
+        let selectedSym = null;
+        // Refresh charts every 30s while detail panel is open
+        let chartRefreshTimer = null;
 
-        // ── Chart ────────────────────────────────────────────────────
+        // ── Detail panel charts ──
+        let priceChartInst = null, rsiChartInst = null, volChartInst = null;
+
+        function initDetailCharts() {
+            const priceCtx = document.getElementById('price-chart').getContext('2d');
+            const rsiCtx = document.getElementById('rsi-chart').getContext('2d');
+            const volCtx = document.getElementById('vol-chart').getContext('2d');
+
+            const chartDefaults = {
+                responsive: true, maintainAspectRatio: false,
+                animation: { duration: 0 },
+                plugins: {
+                    legend: { display: false }, tooltip: {
+                        backgroundColor: '#1c2128', borderColor: '#21262d', borderWidth: 1,
+                        titleColor: '#7d8590', bodyColor: '#e6edf3'
+                    }
+                },
+            };
+
+            priceChartInst = new Chart(priceCtx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        { label: 'Price', data: [], borderColor: '#e6edf3', backgroundColor: 'transparent', borderWidth: 1.8, pointRadius: 0, tension: 0.2, order: 1, spanGaps: true },
+                        { label: 'VWAP', data: [], borderColor: '#d29922', backgroundColor: 'transparent', borderWidth: 1.4, pointRadius: 0, tension: 0.2, borderDash: [4, 3], order: 2, spanGaps: true },
+                        { label: 'SMA20', data: [], borderColor: '#58a6ff', backgroundColor: 'transparent', borderWidth: 1.4, pointRadius: 0, tension: 0.2, order: 3, spanGaps: true },
+                        { label: 'SMA50', data: [], borderColor: '#bc8cff', backgroundColor: 'transparent', borderWidth: 1.4, pointRadius: 0, tension: 0.2, order: 4, spanGaps: true },
+                    ]
+                },
+                options: {
+                    ...chartDefaults,
+                    scales: {
+                        x: { grid: { color: 'rgba(33,38,45,.5)' }, ticks: { color: '#7d8590', maxTicksLimit: 6, font: { size: 8 } } },
+                        y: {
+                            grid: { color: 'rgba(33,38,45,.5)' },
+                            ticks: { color: '#7d8590', font: { size: 8 }, callback: v => '$' + v.toFixed(2) },
+                            position: 'right'
+                        }
+                    },
+                    plugins: {
+                        ...chartDefaults.plugins,
+                        legend: {
+                            display: true, position: 'top',
+                            labels: { color: '#7d8590', font: { size: 9 }, boxWidth: 14, padding: 10 }
+                        }
+                    }
+                }
+            });
+
+            rsiChartInst = new Chart(rsiCtx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        { data: [], borderColor: '#ffa657', backgroundColor: 'rgba(255,166,87,.05)', borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill: true, spanGaps: true },
+                    ]
+                },
+                options: {
+                    ...chartDefaults,
+                    scales: {
+                        x: { display: false },
+                        y: {
+                            min: 0, max: 100,
+                            grid: { color: 'rgba(33,38,45,.5)' },
+                            ticks: { color: '#7d8590', font: { size: 8 }, callback: v => v },
+                            position: 'right'
+                        }
+                    },
+                    plugins: {
+                        ...chartDefaults.plugins,
+                        annotation: undefined
+                    }
+                }
+            });
+
+            volChartInst = new Chart(volCtx, {
+                type: 'bar',
+                data: { labels: [], datasets: [{ data: [], backgroundColor: 'rgba(88,166,255,.4)', borderRadius: 2 }] },
+                options: {
+                    ...chartDefaults,
+                    scales: {
+                        x: { display: false },
+                        y: { grid: { color: 'rgba(33,38,45,.5)' }, ticks: { color: '#7d8590', font: { size: 8 }, callback: v => v >= 1000 ? (v / 1000).toFixed(0) + 'M' : v + 'K' }, position: 'right' }
+                    }
+                }
+            });
+        }
+
+        // ── Detail panel ──
+        function openDetail(sym, data) {
+            selectedSym = sym;
+            const detailEl = document.getElementById('detail');
+            detailEl.classList.add('open');
+            document.getElementById('d-sym').textContent = sym;
+            updateDetailStats(sym, data);
+            renderScanner();
+            clearInterval(chartRefreshTimer);
+            setTimeout(() => {
+                if (priceChartInst) priceChartInst.resize();
+                if (rsiChartInst) rsiChartInst.resize();
+                if (volChartInst) volChartInst.resize();
+                fetchAndRenderCandles(sym);
+                // Refresh charts every 30s so new candles appear
+                chartRefreshTimer = setInterval(() => {
+                    if (selectedSym) fetchAndRenderCandles(selectedSym);
+                }, 30000);
+            }, 380);
+        }
+
+        function closeDetail() {
+            selectedSym = null;
+            clearInterval(chartRefreshTimer);
+            document.getElementById('detail').classList.remove('open');
+            renderScanner();
+        }
+
+        // Fetch /api/candles?sym=X, compute indicators, render charts
+        async function fetchAndRenderCandles(sym) {
+            try {
+                const res = await fetch(`http://${window.location.hostname}:5003/api/candles?sym=${sym}`, { cache: 'no-store' });
+                if (!res.ok) return;
+                const d = await res.json();
+                if (!d.candles || d.candles.length < 2) return;
+
+                const candles = d.candles;
+                const closes = candles.map(c => c.c);
+                const labels = candles.map(c => c.t);
+                const vols = candles.map(c => c.v / 1000); // → K
+
+                // ── Compute SMA ──────────────────────────────────
+                function sma(arr, period) {
+                    return arr.map((_, i) => {
+                        if (i < period - 1) return null;
+                        let sum = 0;
+                        for (let j = i - period + 1; j <= i; j++) sum += arr[j];
+                        return sum / period;
+                    });
+                }
+
+                // ── Compute RSI(14) ──────────────────────────────
+                function rsi(arr, period = 14) {
+                    const result = new Array(arr.length).fill(null);
+                    if (arr.length < period + 1) return result;
+                    let gain = 0, loss = 0;
+                    for (let i = 1; i <= period; i++) {
+                        const diff = arr[i] - arr[i - 1];
+                        if (diff > 0) gain += diff; else loss -= diff;
+                    }
+                    let avgGain = gain / period, avgLoss = loss / period;
+                    result[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+                    for (let i = period + 1; i < arr.length; i++) {
+                        const diff = arr[i] - arr[i - 1];
+                        avgGain = (avgGain * (period - 1) + Math.max(diff, 0)) / period;
+                        avgLoss = (avgLoss * (period - 1) + Math.max(-diff, 0)) / period;
+                        result[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+                    }
+                    return result;
+                }
+
+                // ── Compute VWAP ─────────────────────────────────
+                function vwap(candles) {
+                    let sumPV = 0, sumV = 0;
+                    return candles.map(c => {
+                        const typical = (c.h + c.l + c.c) / 3;
+                        sumPV += typical * c.v;
+                        sumV += c.v;
+                        return sumV > 0 ? sumPV / sumV : null;
+                    });
+                }
+
+                const sma20 = sma(closes, 20);
+                const sma50 = sma(closes, 50);
+                const rsiArr = rsi(closes, 14);
+                const vwapArr = d.vwap > 0
+                    ? new Array(closes.length).fill(d.vwap)   // server has live VWAP
+                    : vwap(candles);                           // fallback: compute from candles
+
+                // Thin out labels so x-axis isn't overcrowded
+                const step = Math.max(1, Math.floor(labels.length / 8));
+                const sparseLabels = labels.map((l, i) => i % step === 0 ? l : '');
+
+                // ── Price chart ──────────────────────────────────
+                priceChartInst.data.labels = sparseLabels;
+                priceChartInst.data.datasets[0].data = closes;
+                priceChartInst.data.datasets[1].data = vwapArr;
+                priceChartInst.data.datasets[2].data = sma20;
+                priceChartInst.data.datasets[3].data = sma50;
+                priceChartInst.update('none');
+
+                // ── RSI chart ────────────────────────────────────
+                rsiChartInst.data.labels = sparseLabels;
+                rsiChartInst.data.datasets[0].data = rsiArr;
+                rsiChartInst.update('none');
+
+                // ── Volume chart ─────────────────────────────────
+                volChartInst.data.labels = sparseLabels;
+                volChartInst.data.datasets[0].data = vols;
+                // Colour bars by up/down candle
+                volChartInst.data.datasets[0].backgroundColor = candles.map(c =>
+                    c.c >= c.o ? 'rgba(63,185,80,.5)' : 'rgba(248,81,73,.4)');
+                volChartInst.update('none');
+
+                // Also update current RSI gauge from computed value (more accurate)
+                const lastRsi = rsiArr.filter(v => v !== null).slice(-1)[0];
+                if (lastRsi != null) {
+                    const rsiEl = document.getElementById('d-rsi-fill');
+                    const rsiValEl = document.getElementById('d-rsi-val');
+                    rsiEl.style.width = Math.min(lastRsi, 100).toFixed(0) + '%';
+                    const rsiColor = lastRsi > 70 ? 'var(--red)' : lastRsi < 30 ? 'var(--green)' : lastRsi > 60 ? 'var(--orange)' : 'var(--blue)';
+                    rsiEl.style.background = rsiColor;
+                    rsiValEl.textContent = lastRsi.toFixed(1);
+                    rsiValEl.style.color = rsiColor;
+                }
+            } catch (e) {
+                console.warn('fetchAndRenderCandles error', e);
+            }
+        }
+
+        function updateDetailStats(sym, data) {
+            if (!data) return;
+
+            // Update sub-title
+            const subParts = [];
+            if (data.sig) subParts.push(data.sig);
+            if (data.trend) subParts.push(data.trend === 'UP' ? '▲ Trending Up' : '— Neutral');
+            document.getElementById('d-sub').textContent = subParts.join(' · ') || 'Live Data';
+
+            // RSI gauge (from poll data; fetchAndRenderCandles will override with computed value)
+            const rsi = data.rsi || 50;
+            const rsiEl = document.getElementById('d-rsi-fill');
+            const rsiValEl = document.getElementById('d-rsi-val');
+            rsiEl.style.width = Math.min(rsi, 100).toFixed(0) + '%';
+            rsiEl.style.background = rsi > 70 ? 'var(--red)' : rsi < 30 ? 'var(--green)' : rsi > 60 ? 'var(--orange)' : 'var(--blue)';
+            rsiValEl.textContent = rsi.toFixed(1);
+            rsiValEl.style.color = rsi > 70 ? 'var(--red)' : rsi < 30 ? 'var(--green)' : rsi > 60 ? 'var(--orange)' : 'var(--blue)';
+
+            // Key stats
+            const pct = v => (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+            document.getElementById('d-price').textContent = '$' + data.price.toFixed(2);
+            document.getElementById('d-price').className = 'stat-val ' + (data.abvVwap ? 'g' : 'r');
+            document.getElementById('d-vwap').textContent = data.vwap > 0 ? '$' + data.vwap.toFixed(2) : '—';
+            document.getElementById('d-gap').textContent = data.gap !== 0 ? pct(data.gap) : '—';
+            document.getElementById('d-gap').className = 'stat-val ' + (data.gap >= 0 ? 'g' : 'r');
+            document.getElementById('d-sma20').textContent = data.sma20 > 0 ? '$' + data.sma20.toFixed(2) : '—';
+            document.getElementById('d-sma20').className = 'stat-val ' + (data.price > data.sma20 ? 'g' : 'r');
+            document.getElementById('d-sma50').textContent = data.sma50 > 0 ? '$' + data.sma50.toFixed(2) : '—';
+            document.getElementById('d-sma50').className = 'stat-val ' + (data.price > data.sma50 ? 'g' : 'r');
+            document.getElementById('d-atr').textContent = data.atr.toFixed(2) + '%';
+            document.getElementById('d-atr').className = 'stat-val ' + (data.atr >= 0.4 ? 'g' : data.atr >= 0.2 ? 'y' : 'm');
+            document.getElementById('d-vol').textContent = data.vol >= 1000 ? (data.vol / 1000).toFixed(1) + 'M' : data.vol > 0 ? data.vol + 'K' : '—';
+            document.getElementById('d-trend').innerHTML = data.trend === 'UP' ? '<span class="t-up">▲ UP</span>' : '<span class="t-neu">— NEUT</span>';
+            document.getElementById('d-sig').innerHTML = data.sig ? `<span class="sig ${({
+                'ORB↑': 'sig-orb-u', 'ORB↓': 'sig-orb-d', 'VWAP↑': 'sig-vw-u', 'VWAP↓': 'sig-vw-d', 'MR↑': 'sig-mr-u', 'MR↓': 'sig-mr-d'
+            }[data.sig] || '')}">${data.sig}</span>` : '<span class="m">—</span>';
+
+            // ORB levels
+            document.getElementById('d-orb-hi').textContent = data.orbHi > 0 ? '$' + data.orbHi.toFixed(2) : '—';
+            document.getElementById('d-orb-lo').textContent = data.orbLo > 0 ? '$' + data.orbLo.toFixed(2) : '—';
+            document.getElementById('orb-bar-hi').textContent = data.orbHi > 0 ? '$' + data.orbHi.toFixed(2) : 'Hi';
+            document.getElementById('orb-bar-lo').textContent = data.orbLo > 0 ? '$' + data.orbLo.toFixed(2) : 'Lo';
+
+            // ORB position bar
+            if (data.orbHi > 0 && data.orbLo > 0) {
+                const range = data.orbHi - data.orbLo;
+                const extended = range * 0.5;
+                const total = range + 2 * extended;
+                const rangeStart = extended / total * 100;
+                const rangeWidth = range / total * 100;
+                const pricePos = ((data.price - (data.orbLo - extended)) / total) * 100;
+                document.getElementById('orb-range-fill').style.left = rangeStart.toFixed(1) + '%';
+                document.getElementById('orb-range-fill').style.width = rangeWidth.toFixed(1) + '%';
+                document.getElementById('orb-price-tick').style.left = Math.min(Math.max(pricePos, 0), 100).toFixed(1) + '%';
+            }
+        }
+
+        // ── Main equity chart ──
         function initChart() {
             chart = new Chart(document.getElementById('ec').getContext('2d'), {
                 type: 'line',
@@ -700,7 +1437,7 @@
             });
         }
 
-        // ── Helpers ──────────────────────────────────────────────────
+        // ── Helpers ──
         const $ = id => document.getElementById(id);
         const fmtS = v => (v >= 0 ? '+' : '') + ' $' + Math.abs(v).toFixed(2);
         const fmtD = v => '$' + Math.abs(v).toFixed(2);
@@ -729,7 +1466,7 @@
 
         function volFmt(k) { return k >= 1000 ? (k / 1000).toFixed(1) + 'M' : k > 0 ? k + 'K' : '—' }
 
-        // ── Scanner render ────────────────────────────────────────────
+        // ── Scanner render ──
         function renderScanner() {
             const sorted = [...rawWL].sort((a, b) => {
                 const va = a[sortKey], vb = b[sortKey];
@@ -742,30 +1479,40 @@
                 const oLo = w.orbLo > 0 ? `$${w.orbLo.toFixed(2)}` : '<span class="m">—</span>';
                 const ledC = w.abvVwap ? 'var(--green)' : 'var(--red)';
                 const trH = w.trend === 'UP' ? '<span class="t-up">▲ UP</span>' : '<span class="t-neu">— NEUT</span>';
-                // Price vs SMA coloring
                 const s20C = w.price > w.sma20 ? 'g' : w.price < w.sma20 ? 'r' : 'm';
                 const s50C = w.price > w.sma50 ? 'g' : w.price < w.sma50 ? 'r' : 'm';
                 const atrC = w.atr >= 0.4 ? 'g' : w.atr >= 0.2 ? 'y' : 'm';
-                return `<tr class="${w.hot ? 'hot' : ''}">
-              <td><div class="sym-cell">${w.hot ? '<span class="hot-arrow">►</span>' : ''}<span style="font-weight:700">${w.s}</span></div></td>
-              <td class="tr ${pC}">$${w.price.toFixed(2)}</td>
-              <td class="tr m">$${w.vwap > 0 ? w.vwap.toFixed(2) : '—'}</td>
-              <td class="tr ${s20C}">$${w.sma20 > 0 ? w.sma20.toFixed(2) : '—'}</td>
-              <td class="tr ${s50C}">$${w.sma50 > 0 ? w.sma50.toFixed(2) : '—'}</td>
-              <td class="tr">${rsiHtml(w.rsi)}</td>
-              <td class="tr ${gC}">${w.gap !== 0 ? pct(w.gap) : '<span class="m">—</span>'}</td>
-              <td class="tr m">${volFmt(w.vol)}</td>
-              <td class="tr ${atrC}">${w.atr.toFixed(2)}%</td>
-              <td class="tr m">${oHi}</td>
-              <td class="tr m">${oLo}</td>
-              <td class="tc">${trH}</td>
-              <td class="tc"><span class="led" style="background:${ledC}"></span></td>
-              <td class="tc">${sigBadge(w.sig)}</td>
-            </tr>`;
+                const isSelected = w.s === selectedSym;
+                return `<tr class="${w.hot ? 'hot' : ''} ${isSelected ? 'selected' : ''}" onclick="onSymClick('${w.s}')">
+                  <td><div class="sym-cell">${w.hot ? '<span class="hot-arrow">►</span>' : ''}<span>${w.s}</span></div></td>
+                  <td class="tr ${pC}">$${w.price.toFixed(2)}</td>
+                  <td class="tr m">$${w.vwap > 0 ? w.vwap.toFixed(2) : '—'}</td>
+                  <td class="tr ${s20C}">$${w.sma20 > 0 ? w.sma20.toFixed(2) : '—'}</td>
+                  <td class="tr ${s50C}">$${w.sma50 > 0 ? w.sma50.toFixed(2) : '—'}</td>
+                  <td class="tr">${rsiHtml(w.rsi)}</td>
+                  <td class="tr ${gC}">${w.gap !== 0 ? pct(w.gap) : '<span class="m">—</span>'}</td>
+                  <td class="tr m">${volFmt(w.vol)}</td>
+                  <td class="tr ${atrC}">${w.atr.toFixed(2)}%</td>
+                  <td class="tr m">${oHi}</td>
+                  <td class="tr m">${oLo}</td>
+                  <td class="tc">${trH}</td>
+                  <td class="tc"><span class="led" style="background:${ledC}"></span></td>
+                  <td class="tc">${sigBadge(w.sig)}</td>
+                </tr>`;
             }).join('');
         }
 
-        // Sort click
+        // ── Symbol click handler ──
+        function onSymClick(sym) {
+            if (selectedSym === sym) {
+                closeDetail();
+                return;
+            }
+            const data = rawWL.find(w => w.s === sym);
+            openDetail(sym, data);
+        }
+
+        // ── Sort click ──
         document.querySelectorAll('thead th[data-k]').forEach(th => {
             th.addEventListener('click', () => {
                 const k = th.dataset.k;
@@ -781,10 +1528,9 @@
                 renderScanner();
             });
         });
-        // init sort indicator
         document.querySelector('th[data-k="atr"]').classList.add('desc');
 
-        // ── Main render ───────────────────────────────────────────────
+        // ── Main render ──
         function render(d) {
             // Topbar
             $('t-pnl').textContent = fmtS(d.pnl); $('t-pnl').className = 'val ' + clr(d.pnl);
@@ -830,20 +1576,26 @@
                     const pp = (p.pct >= 0 ? '+' : '') + p.pct.toFixed(2) + '%';
                     const [pbg, pfg] = p.unrl >= 0 ? ['var(--dg)', 'var(--green)'] : ['var(--dr)', 'var(--red)'];
                     return `<div class="pc">
-                <div class="pct"><span class="pcsym">${p.sym}</span><span class="pcside ${p.side === 'LONG' ? 'ls' : 'ss'}">${p.side}</span></div>
-                <div class="pcrow"><span class="m">Qty <b style="color:var(--text)">${p.qty}</b></span><span class="pcpnl ${pc}">${fmtS(p.unrl)}</span></div>
-                <div class="pcrow"><span class="m">$${p.avg.toFixed(2)} → $${p.cur.toFixed(2)}</span><span class="ppill" style="background:${pbg};color:${pfg}">${pp}</span></div>
-                <div class="pcm">${p.strat} · ${p.min.toFixed(0)}m held</div>
-              </div>`;
+                    <div class="pct"><span class="pcsym">${p.sym}</span><span class="pcside ${p.side === 'LONG' ? 'ls' : 'ss'}">${p.side}</span></div>
+                    <div class="pcrow"><span class="m">Qty <b style="color:var(--text)">${p.qty}</b></span><span class="pcpnl ${pc}">${fmtS(p.unrl)}</span></div>
+                    <div class="pcrow"><span class="m">$${p.avg.toFixed(2)} → $${p.cur.toFixed(2)}</span><span class="ppill" style="background:${pbg};color:${pfg}">${pp}</span></div>
+                    <div class="pcm">${p.strat} · ${p.min.toFixed(0)}m held</div>
+                  </div>`;
                 }).join('');
             }
 
             // Scanner
             rawWL = d.watchlist;
             renderScanner();
+
+            // Update detail stats if open (charts refresh every 30s via their own fetch)
+            if (selectedSym) {
+                const symData = rawWL.find(w => w.s === selectedSym);
+                if (symData) updateDetailStats(selectedSym, symData);
+            }
         }
 
-        // ── Poll ──────────────────────────────────────────────────────
+        // ── Poll ──
         async function poll() {
             try {
                 const res = await fetch(API, { cache: 'no-store' });
@@ -856,7 +1608,11 @@
                 $('sdot').className = 'dot halt'; $('stxt').textContent = 'OFFLINE'; $('stxt').style.color = 'var(--red)';
             }
         }
-        initChart(); poll(); setInterval(poll, 1000);
+
+        initChart();
+        initDetailCharts();
+        poll();
+        setInterval(poll, 1000);
     </script>
 </body>
 </html>
