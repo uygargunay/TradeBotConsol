@@ -1401,6 +1401,158 @@ public class SimulatedBroker
     //  DASHBOARD
     // ══════════════════════════════════════════════════════════
 
+    // ══════════════════════════════════════════════════════════
+    //  HTTP DASHBOARD SERVER  →  http://localhost:5000/api/status
+    //  Open dashboard.html in any browser — auto-refreshes every second.
+    // ══════════════════════════════════════════════════════════
+
+    private HttpListener _httpListener;
+
+    private void StartDashboardServer()
+    {
+        try
+        {
+            _httpListener = new HttpListener();
+            _httpListener.Prefixes.Add("http://*:5003/");
+            _httpListener.Start();
+            Task.Run(() => HandleDashboardRequests());
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[DASHBOARD] Failed to start HTTP server: {ex.Message}");
+        }
+    }
+
+    private async Task HandleDashboardRequests()
+    {
+        while (_httpListener?.IsListening == true)
+        {
+            try
+            {
+                var ctx = await _httpListener.GetContextAsync();
+                _ = Task.Run(() => ServeRequest(ctx));
+            }
+            catch { }
+        }
+    }
+
+    private void ServeRequest(HttpListenerContext ctx)
+    {
+        try
+        {
+            ctx.Response.Headers.Add("Access-Control-Allow-Origin", "*");
+            ctx.Response.ContentType = "application/json";
+            string json = ctx.Request.Url.AbsolutePath.ToLower() == "/api/status"
+                ? BuildStatusJson() : "{}";
+            byte[] buf = System.Text.Encoding.UTF8.GetBytes(json);
+            ctx.Response.ContentLength64 = buf.Length;
+            ctx.Response.OutputStream.Write(buf, 0, buf.Length);
+        }
+        catch { }
+        finally { try { ctx.Response.OutputStream.Close(); } catch { } }
+    }
+
+    private string BuildStatusJson()
+    {
+        lock (_lock)
+        {
+            var now = GetPacificTime();
+            var et  = GetEasternTime();
+            int total  = _winCount + _lossCount;
+            double wr  = total > 0 ? (double)_winCount / total * 100 : 0;
+
+            // ── Positions ────────────────────────────────────────
+            var posArr = new StringBuilder("[");
+            bool first = true;
+            foreach (var kv in _positions)
+            {
+                var p = kv.Value;
+                decimal px    = _latestTick.TryGetValue(p.Symbol, out var tp) ? tp : p.CurrentPrice;
+                decimal unrl  = p.UnrealizedPnL(px);
+                decimal pnlPt = p.AvgPrice > 0
+                    ? (px - p.AvgPrice) / p.AvgPrice * (p.IsShort ? -1 : 1) * 100 : 0;
+                double heldMin = (DateTime.UtcNow - p.EntryTime).TotalMinutes;
+                if (!first) posArr.Append(",");
+                posArr.Append($@"{{""sym"":""{p.Symbol}"",""qty"":{p.Quantity},""side"":""{(p.IsShort?"SHORT":"LONG")}"",""avg"":{p.AvgPrice:F2},""cur"":{px:F2},""unrl"":{unrl:F2},""pct"":{pnlPt:F2},""min"":{heldMin:F1},""strat"":""{p.StrategyTag}""}}");
+                first = false;
+            }
+            posArr.Append("]");
+
+            // ── Equity curve (last 390 pts = full day at 1/min) ───
+            var curve    = _equityCurve.TakeLast(390).ToList();
+            var curveArr = new StringBuilder("[");
+            for (int i = 0; i < curve.Count; i++)
+            {
+                if (i > 0) curveArr.Append(",");
+                curveArr.Append($@"{{""t"":""{curve[i].time:HH:mm}"",""v"":{curve[i].equity:F2}}}");
+            }
+            curveArr.Append("]");
+
+            // ── Watchlist — every console column ─────────────────
+            // SYM | PRICE | VWAP | SMA20 | SMA50 | RSI | GAP% | VOL K | ATR% | ORB HI | ORB LO | TREND | SIGNAL | HOT
+            var wlArr   = new StringBuilder("[");
+            bool wfirst = true;
+            foreach (var sym in _watchlist)
+            {
+                if (!_marketData.TryGetValue(sym, out var candles)) continue;
+                decimal price = candles.LastOrDefault()?.Close ?? 0m;
+                if (price == 0m) continue;
+
+                decimal sma20  = SafeSMA(candles, 20);
+                decimal sma50  = SafeSMA(candles, 50);
+                double  rsi    = SafeRSI(candles, 7);
+                decimal atr    = SafeATR(candles, 14);
+                decimal atrPct = price > 0 ? atr / price * 100 : 0;
+                _vwap.TryGetValue(sym, out decimal vwap);
+                _prevDayClose.TryGetValue(sym, out decimal prevClose);
+                decimal gapPct  = prevClose > 0 ? (price - prevClose) / prevClose * 100 : 0;
+                long    volK    = _dailyVolume.GetValueOrDefault(sym) / 1000;
+                bool    abvVwap = vwap > 0 && price > vwap;
+                string  trend   = price > sma50 ? "UP" : "NEUT";
+
+                _orbRanges.TryGetValue(sym, out var orb);
+                decimal orbHi = orb?.High ?? 0m;
+                decimal orbLo = orb?.Low  ?? 0m;
+
+                string sig = "";
+                if (orb != null && orb.IsSet)
+                {
+                    if      (price > orbHi) sig = "ORB↑";
+                    else if (price < orbLo) sig = "ORB↓";
+                }
+                if (sig == "" && rsi < RSI_OVERSOLD  && price > sma50) sig = "MR↑";
+                if (sig == "" && rsi > RSI_OVERBOUGHT && price < sma50) sig = "MR↓";
+                if (sig == "" && vwap > 0)
+                {
+                    bool above = price > vwap;
+                    _prevBarAboveVwap.TryGetValue(sym, out bool wasAbove);
+                    if      (!wasAbove && above)  sig = "VWAP↑";
+                    else if ( wasAbove && !above) sig = "VWAP↓";
+                }
+                bool hot = vwap > 0 && price > vwap && rsi > 55;
+
+                if (!wfirst) wlArr.Append(",");
+                wlArr.Append($@"{{""s"":""{sym}"",""price"":{price:F2},""vwap"":{vwap:F2},""sma20"":{sma20:F2},""sma50"":{sma50:F2},""rsi"":{rsi:F1},""gap"":{gapPct:F2},""vol"":{volK},""atr"":{atrPct:F2},""orbHi"":{orbHi:F2},""orbLo"":{orbLo:F2},""trend"":""{trend}"",""sig"":""{sig}"",""hot"":{(hot?"true":"false")},""abvVwap"":{(abvVwap?"true":"false")}}}");
+                wfirst = false;
+            }
+            wlArr.Append("]");
+
+            // ── Recent trades (last 20, newest first) ─────────────
+            var recentTrades = _tradeHistoryLog.TakeLast(20).Reverse().ToList();
+            var tradeArr     = new StringBuilder("[");
+            for (int i = 0; i < recentTrades.Count; i++)
+            {
+                if (i > 0) tradeArr.Append(",");
+                tradeArr.Append($@"""{recentTrades[i].Replace("\"","\\\"").Replace("\r","").Replace("\n","")}""");
+            }
+            tradeArr.Append("]");
+
+            decimal cash = TOTAL_BUDGET - _positions.Values.Sum(p => p.AvgPrice * p.Quantity);
+
+            return $@"{{""time"":""{now:yyyy-MM-dd HH:mm:ss} PT"",""et"":""{et:HH:mm:ss} ET"",""regime"":""{_marketRegime}"",""halted"":{(_haltTrading?"true":"false")},""reconciled"":{(_reconciled?"true":"false")},""pnl"":{_totalRealizedPnL:F2},""goal"":{DAILY_PROFIT_GOAL:F2},""maxLoss"":{MAX_DAILY_LOSS:F2},""trades"":{_tradesToday},""maxTrades"":{MAX_TRADES_PER_DAY},""wins"":{_winCount},""losses"":{_lossCount},""wr"":{wr:F1},""cash"":{cash:F2},""budget"":{TOTAL_BUDGET:F2},""positions"":{posArr},""curve"":{curveArr},""watchlist"":{wlArr},""feed"":{tradeArr}}}";
+        }
+    }
+
     private const int LOG_LINES = 8;
     private readonly Queue<string> _logQueue = new Queue<string>();
     private int _dashTick = 0;
@@ -1410,6 +1562,7 @@ public class SimulatedBroker
         Console.CursorVisible = false;
         Console.OutputEncoding = System.Text.Encoding.UTF8;
         _dashboardTimer = new Timer(_ => PrintDetailedDashboard(), null, 0, 1000);
+        StartDashboardServer();
     }
 
     public void LogMessage(string msg)
