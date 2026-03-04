@@ -37,9 +37,12 @@ class Program
             {
                 await Task.Delay(200);
                 reconWaitMs += 200;
-                if (reconWaitMs >= 10_000) // 10s safety timeout — don't hang forever
+                if (reconWaitMs >= 30_000) // 30s — TWS can take 15-25s after a restart before responding to reqPositions()
                 {
-                    Console.WriteLine("[STARTUP] WARNING: Reconciliation timed out after 10s — proceeding anyway.");
+                    Console.WriteLine("[STARTUP] WARNING: Reconciliation timed out after 10s — forcing reconcile so trading can start.");
+                    // Without this call, _reconciled stays false and ExecuteStrategy()
+                    // returns early on every tick for the entire session — bot never trades.
+                    broker.ForceReconcile();
                     break;
                 }
             }
@@ -78,8 +81,43 @@ class Program
         {
             while (true)
             {
-                broker.CheckEndOfDay();
+                try { broker.CheckEndOfDay(); }
+                catch (Exception ex) { Console.WriteLine($"[EOD LOOP] Exception: {ex.Message}"); }
                 await Task.Delay(1000);
+            }
+        });
+
+        // ── Connection watchdog — reconnects if IBKR drops the socket ───────────
+        // TWS restarts nightly around 11:45 PM ET. Without this, the bot sits
+        // silently dead for the rest of the session with no ticks and no trades.
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(30_000); // let startup settle
+            while (true)
+            {
+                try
+                {
+                    if (!client.IsConnected())
+                    {
+                        Console.WriteLine("[WATCHDOG] IBKR connection lost — attempting reconnect...");
+                        _ = broker.SendEmail("⚠️ Bot Disconnected", "IBKR socket dropped. Attempting reconnect.");
+                        client.Connect();
+                        int waitMs = 0;
+                        while (!client._isReady && waitMs < 15_000)
+                        { await Task.Delay(500); waitMs += 500; }
+                        if (client._isReady)
+                        {
+                            Console.WriteLine("[WATCHDOG] Reconnected successfully.");
+                            _ = broker.SendEmail("✅ Bot Reconnected", "IBKR socket restored.");
+                            // Re-verify positions — IBKR state may have changed while disconnected
+                            broker.RequestRereconcile();
+                        }
+                        else
+                            Console.WriteLine("[WATCHDOG] Reconnect failed — will retry in 30s.");
+                    }
+                }
+                catch (Exception ex) { Console.WriteLine($"[WATCHDOG] {ex.Message}"); }
+                await Task.Delay(30_000);
             }
         });
 

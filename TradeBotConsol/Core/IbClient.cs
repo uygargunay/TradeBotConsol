@@ -18,6 +18,12 @@ public class IbClient : EWrapper, IBroker
     private readonly ConcurrentDictionary<string, int> _symToLiveReqId = new();     // symbol → active reqMktData reqId
     private readonly HashSet<string> _subscribedLive = new(StringComparer.OrdinalIgnoreCase); // dedup guard
 
+    // Daily historical data reqIds use a separate range (30000+) so historicalData()
+    // and historicalDataEnd() can distinguish daily bars from 1-min bars and route them
+    // to AddDailyCandle() instead of AddHistoricalCandle(), without affecting live subs.
+    private int _dailyReqId = 30000;
+    private readonly ConcurrentDictionary<int, string> _dailyReqIdToSymbol = new();
+
     // Hard cap enforced inside Subscribe() — set this before calling Subscribe().
     // Every reqMktData call goes through Subscribe(), so this is the single
     // chokepoint that no other code path can bypass.
@@ -55,7 +61,9 @@ public class IbClient : EWrapper, IBroker
             Action = side == TradeSide.Buy ? "BUY" : "SELL",
             OrderType = orderType,
             TotalQuantity = qty,
-            Tif = "GTC"
+            // MKT orders use DAY so an unfilled EOD liquidation order expires
+            // at close rather than carrying over to the next morning open (GTC).
+            Tif = orderType == "MKT" ? "DAY" : "GTC"
         };
 
         if (orderType == "LMT")
@@ -160,7 +168,7 @@ public class IbClient : EWrapper, IBroker
     }
 
 
-    // --- HISTORICAL DATA REQUEST ---
+    // --- HISTORICAL DATA REQUEST (1-min, 3 days) ---
     // FIX: was _liveReqId++ (not thread-safe). Now uses Interlocked.Increment.
     public void RequestHistoricalData(string symbol)
     {
@@ -176,6 +184,28 @@ public class IbClient : EWrapper, IBroker
         };
 
         _client.reqHistoricalData(id, contract, "", "3 D", "1 min", "TRADES", 0, 1, false, null);
+    }
+
+    // --- HISTORICAL DATA REQUEST (daily bars, 1 year) ---
+    // Uses a separate reqId range (30000+) so historicalData() routes these bars
+    // to AddDailyCandle() for the SMA200 / prev day H/L filters.
+    // Does NOT start a live market data subscription on completion.
+    public void RequestDailyHistoricalData(string symbol)
+    {
+        int id = Interlocked.Increment(ref _dailyReqId);
+        _dailyReqIdToSymbol[id] = symbol;
+
+        Contract contract = new Contract
+        {
+            Symbol = symbol,
+            SecType = "STK",
+            Exchange = "SMART",
+            Currency = "USD"
+        };
+
+        // "1 Y" of "1 day" bars. useRTH=1 so only regular session closes are used —
+        // overnight gaps don't distort the SMA200 calculation.
+        _client.reqHistoricalData(id, contract, "", "1 Y", "1 day", "TRADES", 1, 1, false, null);
     }
 
     // --- TICK CALLBACKS ---
@@ -195,9 +225,14 @@ public class IbClient : EWrapper, IBroker
         _tickVolume[symbol] = 0;
     }
 
-    // Accumulate trade size per symbol between ticks
+    // Accumulate trade size per symbol between ticks.
+    // Only field 8 (LAST_SIZE) represents actual trades. Ignoring bid (0)
+    // and ask (3) size changes which are quote updates, not executions.
+    // Without this filter, bid/ask quote churn inflates volume counts and
+    // causes CheckVolumeExpansion to fire on non-trade activity.
     public void tickSize(int tickerId, int field, int size)
     {
+        if (field != 8) return;  // 8 = LAST_SIZE only
         if (!_reqIdToSymbol.TryGetValue(tickerId, out string symbol)) return;
         _tickVolume.AddOrUpdate(symbol, size, (_, old) => old + size);
     }
@@ -215,7 +250,13 @@ public class IbClient : EWrapper, IBroker
         if (status == "Filled")
         {
             if (_filledOrders.TryAdd(orderId, true))
+            {
                 _broker.OnOrderFilled(orderId, (int)filled, (decimal)avgFillPrice);
+                // Clean up immediately after processing — _filledOrders is only
+                // needed to deduplicate the orderStatus/execDetails double-fire.
+                // Keeping entries forever is a memory leak on a long-running bot.
+                _filledOrders.TryRemove(orderId, out _);
+            }
         }
     }
 
@@ -230,7 +271,11 @@ public class IbClient : EWrapper, IBroker
     // --- HISTORICAL DATA CALLBACKS ---
     public void historicalData(int reqId, IBApi.Bar bar)
     {
-        if (!_reqIdToSymbol.TryGetValue(reqId, out string symbol)) return;
+        // Determine if this is a daily-bar request (reqId >= 30000)
+        // or a 1-min request, and route accordingly.
+        bool isDaily = _dailyReqIdToSymbol.TryGetValue(reqId, out string dailySymbol);
+        string symbol = isDaily ? dailySymbol : null;
+        if (!isDaily && !_reqIdToSymbol.TryGetValue(reqId, out symbol)) return;
 
         DateTime time;
 
@@ -251,18 +296,42 @@ public class IbClient : EWrapper, IBroker
             }
         }
 
-        _broker.AddHistoricalCandle(
-            symbol, time,
-            (decimal)bar.Open,
-            (decimal)bar.High,
-            (decimal)bar.Low,
-            (decimal)bar.Close,
-            bar.Volume
-        );
+        if (isDaily)
+        {
+            // Route to daily candle cache — used for SMA200 and prev day H/L
+            _broker.AddDailyCandle(
+                symbol, time,
+                (decimal)bar.Open,
+                (decimal)bar.High,
+                (decimal)bar.Low,
+                (decimal)bar.Close,
+                bar.Volume
+            );
+        }
+        else
+        {
+            _broker.AddHistoricalCandle(
+                symbol, time,
+                (decimal)bar.Open,
+                (decimal)bar.High,
+                (decimal)bar.Low,
+                (decimal)bar.Close,
+                bar.Volume
+            );
+        }
     }
 
     public void historicalDataEnd(int reqId, string start, string end)
     {
+        // Daily bar request completed — clean up reqId, do NOT start a live subscription.
+        // Daily bars are for SMA200 / S/R calculations only, not a streaming data feed.
+        if (_dailyReqIdToSymbol.TryRemove(reqId, out string dailySymbol))
+        {
+            Console.WriteLine($"[IBKR] Daily history loaded for {dailySymbol} — SMA200/S/R ready.");
+            return;
+        }
+
+        // 1-min request completed — start live tick subscription as before.
         if (!_reqIdToSymbol.TryRemove(reqId, out string symbol)) return;
 
         Console.WriteLine($"[IBKR] History loaded for {symbol} — starting live tick subscription.");
@@ -275,7 +344,7 @@ public class IbClient : EWrapper, IBroker
     // --- EWRAPPER CORE CALLBACKS ---
     void EWrapper.nextValidId(int orderId)
     {
-        _currentOrderId = orderId;
+        Interlocked.Exchange(ref _currentOrderId, orderId);
         _client.reqMarketDataType(1); // 1 = Live data
         _isReady = true;
         Console.WriteLine("[IBKR] Connected and Ready.");
@@ -302,6 +371,18 @@ public class IbClient : EWrapper, IBroker
         // Ignore routine farm connection messages
         if (errorCode == 2104 || errorCode == 2106 || errorCode == 2158) return;
         Console.WriteLine($"[IB ERROR] {errorCode}: {errorMsg}");
+
+        // ── Order rejection / cancellation ────────────────────────────────
+        // Codes that mean IBKR will never fill this order:
+        //   103 = duplicate order id   110 = bad price tick
+        //   201 = order rejected       202 = order cancelled
+        // Without this block, SimulatedBroker._pendingEntryCount is never
+        // decremented → the bot thinks MAX_POSITIONS is permanently full
+        // → no new trades ever enter for the rest of the session.
+        if (errorCode == 201 || errorCode == 202 || errorCode == 103 || errorCode == 110)
+        {
+            _broker.OnOrderRejected(id);
+        }
     }
 
     // --- EWRAPPER STUBS (required by interface) ---
