@@ -116,6 +116,14 @@ public class TradeRecord
     public string Time { get; set; }        // ET close time HH:mm
 }
 
+// One data point in the lifetime equity history — one entry per trading day
+public class LifetimeEquityPoint
+{
+    public string Date { get; set; }         // "yyyy-MM-dd"
+    public decimal AccountValue { get; set; } // TOTAL_BUDGET + cumulative PnL at close
+    public decimal DailyPnL { get; set; }    // that day's realized PnL
+}
+
 // Tracks the Opening Range (first 30 min high/low) per symbol
 public class OpeningRange
 {
@@ -136,7 +144,7 @@ public class SimulatedBroker
     // ── TRADING RULES ──────────────────────────────────────
     // ── Runtime-configurable fields (loaded from bot-config.json on startup) ──
     private decimal TOTAL_BUDGET = 4000m;
-    private int MAX_POSITIONS = 3;
+    private int MAX_POSITIONS = 2;
     private decimal POSITION_SIZE = 2000m;
     private int MIN_HOLD_SECONDS = 600;          // 10 min
     private decimal DAILY_PROFIT_GOAL = 300m;
@@ -182,6 +190,8 @@ public class SimulatedBroker
     private readonly ConcurrentDictionary<string, decimal> _latestTick = new();
     private readonly ConcurrentDictionary<string, Candle> _currentMinuteCandle = new();
     private readonly List<(DateTime time, decimal equity)> _equityCurve = new();
+    private readonly List<LifetimeEquityPoint> _lifetimeEquity = new();
+    private const string LIFETIME_EQUITY_FILE = "lifetime_equity.json";
 
     // Opening Range per symbol (resets daily)
     private readonly ConcurrentDictionary<string, OpeningRange> _orbRanges = new();
@@ -1319,6 +1329,9 @@ public class SimulatedBroker
             _haltTrading = true;
             _eodSent = true;
 
+            // Snapshot today's closing account value into the lifetime equity file
+            SnapshotLifetimeEquity();
+
             foreach (var p in _positions.Values.ToList())
             {
                 TradeSide exitSide = p.IsShort ? TradeSide.Buy : TradeSide.Sell;
@@ -1838,6 +1851,67 @@ public class SimulatedBroker
         catch { }
     }
 
+    // Records today's closing account value. Called once at EOD.
+    // Upserts by date so restarting on the same day doesn't duplicate.
+    private void SnapshotLifetimeEquity()
+    {
+        try
+        {
+            var etDate = GetEasternTime().Date.ToString("yyyy-MM-dd");
+            decimal accountValue = TOTAL_BUDGET + _totalRealizedPnL;
+
+            lock (_lifetimeEquity)
+            {
+                var existing = _lifetimeEquity.FirstOrDefault(p => p.Date == etDate);
+                if (existing != null)
+                {
+                    existing.AccountValue = accountValue;
+                    existing.DailyPnL = _totalRealizedPnL;
+                }
+                else
+                {
+                    _lifetimeEquity.Add(new LifetimeEquityPoint
+                    {
+                        Date = etDate,
+                        AccountValue = accountValue,
+                        DailyPnL = _totalRealizedPnL
+                    });
+                }
+            }
+            SaveLifetimeEquity();
+        }
+        catch (Exception ex) { LogError("SnapshotLifetimeEquity", ex.Message); }
+    }
+
+    private void SaveLifetimeEquity()
+    {
+        try
+        {
+            lock (_lifetimeEquity)
+                File.WriteAllText(LIFETIME_EQUITY_FILE,
+                    JsonSerializer.Serialize(_lifetimeEquity));
+        }
+        catch { }
+    }
+
+    public void LoadLifetimeEquity()
+    {
+        try
+        {
+            if (!File.Exists(LIFETIME_EQUITY_FILE)) return;
+            var data = JsonSerializer.Deserialize<List<LifetimeEquityPoint>>(
+                File.ReadAllText(LIFETIME_EQUITY_FILE));
+            if (data == null) return;
+            lock (_lifetimeEquity)
+            {
+                _lifetimeEquity.Clear();
+                _lifetimeEquity.AddRange(data.OrderBy(p => p.Date));
+            }
+            LogMessage($"[LIFETIME] Loaded {_lifetimeEquity.Count} daily equity points.");
+        }
+        catch (Exception ex) { LogError("LoadLifetimeEquity", ex.Message); }
+    }
+
     private void LogTradeAnalytics(string symbol, decimal entry, decimal exit,
         decimal pnl, decimal holdMinutes, decimal atr, double rsi,
         string strategy = "", bool isShort = false)
@@ -2352,7 +2426,20 @@ public class SimulatedBroker
 
             decimal cash = TOTAL_BUDGET - _positions.Values.Sum(p => p.AvgPrice * p.Quantity);
 
-            return $@"{{""time"":""{now:yyyy-MM-dd HH:mm:ss} PT"",""et"":""{et:HH:mm:ss} ET"",""regime"":""{_marketRegime}"",""halted"":{(_haltTrading ? "true" : "false")},""reconciled"":{(_reconciled ? "true" : "false")},""pnl"":{_totalRealizedPnL:F2},""goal"":{DAILY_PROFIT_GOAL:F2},""maxLoss"":{MAX_DAILY_LOSS:F2},""trades"":{_tradesToday},""maxTrades"":{MAX_TRADES_PER_DAY},""wins"":{_winCount},""losses"":{_lossCount},""wr"":{wr:F1},""cash"":{cash:F2},""budget"":{TOTAL_BUDGET:F2},""positions"":{posArr},""curve"":{curveArr},""watchlist"":{wlArr},""feed"":{tradeArr},""hist"":{histArr}}}";
+            // ── Lifetime equity (all daily snapshots) ────────────
+            var ltArr = new StringBuilder("[");
+            lock (_lifetimeEquity)
+            {
+                for (int i = 0; i < _lifetimeEquity.Count; i++)
+                {
+                    if (i > 0) ltArr.Append(",");
+                    var pt = _lifetimeEquity[i];
+                    ltArr.Append($@"{{""d"":""{pt.Date}"",""v"":{pt.AccountValue:F2},""p"":{pt.DailyPnL:F2}}}");
+                }
+            }
+            ltArr.Append("]");
+
+            return $@"{{""time"":""{now:yyyy-MM-dd HH:mm:ss} PT"",""et"":""{et:HH:mm:ss} ET"",""regime"":""{_marketRegime}"",""halted"":{(_haltTrading ? "true" : "false")},""reconciled"":{(_reconciled ? "true" : "false")},""pnl"":{_totalRealizedPnL:F2},""goal"":{DAILY_PROFIT_GOAL:F2},""maxLoss"":{MAX_DAILY_LOSS:F2},""trades"":{_tradesToday},""maxTrades"":{MAX_TRADES_PER_DAY},""wins"":{_winCount},""losses"":{_lossCount},""wr"":{wr:F1},""cash"":{cash:F2},""budget"":{TOTAL_BUDGET:F2},""initialBudget"":{TOTAL_BUDGET:F2},""positions"":{posArr},""curve"":{curveArr},""watchlist"":{wlArr},""feed"":{tradeArr},""hist"":{histArr},""lifetimeCurve"":{ltArr}}}";
         }
     }
 

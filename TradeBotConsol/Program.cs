@@ -15,6 +15,7 @@ class Program
         // Load state BEFORE connecting — sets _needsReconciliation = true so
         // nextValidId() fires reqPositions() the moment the socket is live.
         broker.LoadMarketMemory();
+        broker.LoadLifetimeEquity();
         broker.LoadState();
 
         try
