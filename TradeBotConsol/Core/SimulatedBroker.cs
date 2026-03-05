@@ -94,6 +94,9 @@ public class BotPersistData
     public Dictionary<string, DateTime> LastTradeTime { get; set; } = new();
     public Dictionary<string, bool> LastTradeWasLoss { get; set; } = new();
     public Dictionary<string, int> DailyEntryCount { get; set; } = new();
+    // Persisted so the hourly rate limiter survives same-day restarts
+    public int TradesThisHour { get; set; }
+    public DateTime TradeHourSlot { get; set; } = DateTime.MinValue;
     // Persisted so the UI history panel survives same-day restarts and matches _totalRealizedPnL
     public List<TradeRecord> CompletedTrades { get; set; } = new();
     // Persisted so CheckDailyReset() detects a new trading day on restart
@@ -149,7 +152,7 @@ public class SimulatedBroker
     private int MIN_HOLD_SECONDS = 600;          // 10 min
     private decimal DAILY_PROFIT_GOAL = 300m;
     private decimal MAX_DAILY_LOSS = -150m;
-    private int COOLDOWN_SECONDS = 1800;         // 30 min
+    private int COOLDOWN_SECONDS = 3600;         // 60 min
     private decimal ATR_TRAIL_MULT = 2.5m;
     private decimal SHORT_ATR_TRAIL = 2.0m;
     private decimal HARD_STOP_ATR_MULT = 2.5m;  // raised from 2.0 — gives more room on high-beta stocks at open
@@ -158,7 +161,7 @@ public class SimulatedBroker
     private decimal MIN_STOP_DISTANCE = 0.10m;
     private int MAX_QTY_SANITY = 500;
     private decimal RISK_PCT = 0.015m;
-    private int ORB_MINUTES = 30;
+    private int ORB_MINUTES = 45;  // range builds 9:30–10:15 ET, aligns with the 10:15 trading start
     private decimal VOL_EXPAND_MULT = 1.2m;
     private double RSI_LONG_MIN = 55.0;
     private double RSI_SHORT_MAX = 43.0;
@@ -191,7 +194,12 @@ public class SimulatedBroker
     private readonly ConcurrentDictionary<string, Candle> _currentMinuteCandle = new();
     private readonly List<(DateTime time, decimal equity)> _equityCurve = new();
     private readonly List<LifetimeEquityPoint> _lifetimeEquity = new();
-    private const string LIFETIME_EQUITY_FILE = "lifetime_equity.json";
+
+    // ── Absolute state directory — pinned to the executable folder so all
+    // .json files are found regardless of which directory the bot is launched from.
+    private static readonly string STATE_DIR = AppDomain.CurrentDomain.BaseDirectory;
+    private static string StatePath(string filename) => Path.Combine(STATE_DIR, filename);
+    private static readonly string LIFETIME_EQUITY_FILE = StatePath("lifetime_equity.json");
 
     // Opening Range per symbol (resets daily)
     private readonly ConcurrentDictionary<string, OpeningRange> _orbRanges = new();
@@ -239,6 +247,10 @@ public class SimulatedBroker
 
     private decimal _totalRealizedPnL = 0m;
     private int _tradesToday = 0;
+    // ── Per-hour rate limiter — prevents burning all MAX_TRADES_PER_DAY slots in one burst ──
+    private int _tradesThisHour = 0;
+    private int MAX_TRADES_PER_HOUR = 3;        // at most 3 new entries per clock-hour
+    private DateTime _currentTradeHour = DateTime.MinValue;
     private bool _haltTrading = false;
     private bool _eodSent = false;
     private DateTime _lastVolumeResetEt = DateTime.MinValue;
@@ -545,6 +557,14 @@ public class SimulatedBroker
         lock (_lock)
         {
             if (_tradesToday >= MAX_TRADES_PER_DAY) return;
+
+            // ── Hourly rate limit — resets at the top of each clock-hour ──────
+            // Prevents burning all daily slots in the first 90 minutes.
+            // 3 entries/hour × 5.5 trading hours ≥ 10 max daily — pace is sustainable.
+            var hourSlot = new DateTime(nowEt.Year, nowEt.Month, nowEt.Day, nowEt.Hour, 0, 0);
+            if (hourSlot != _currentTradeHour) { _currentTradeHour = hourSlot; _tradesThisHour = 0; }
+            if (_tradesThisHour >= MAX_TRADES_PER_HOUR) return;
+
             if (_positions.ContainsKey(symbol)) return;
             // Include pending (submitted but unfilled) orders in the cap
             if (_positions.Count + _pendingEntryCount >= MAX_POSITIONS) return;
@@ -563,8 +583,8 @@ public class SimulatedBroker
                     : COOLDOWN_SECONDS;
                 if ((DateTime.UtcNow - lastTime).TotalSeconds < cooldown) return;
             }
-            // Max 2 entries per symbol per day
-            if (_dailyEntryCount.GetValueOrDefault(symbol) >= 2) return;
+            // Max 1 entry per symbol per day — if it lost once, conditions haven't changed enough to retry
+            if (_dailyEntryCount.GetValueOrDefault(symbol) >= 1) return;
 
             int minutesSinceOpen = (nowEt.Hour - 9) * 60 + nowEt.Minute - 30;
 
@@ -636,7 +656,7 @@ public class SimulatedBroker
 
         TryShortOrb:
         // ── SHORT: price breaks below ORB low ──────────────────
-        if (close < orb.Low && lastBarVolOk && rsi < RSI_SHORT_MAX)
+        if (close < orb.Low && lastBarVolOk && rsi < RSI_SHORT_MAX && _allowShorts)
         {
             // Skip if price is within 0.25% ABOVE prev day low — too close to
             // support floor. A real breakdown holds convincingly below prev day low.
@@ -689,7 +709,7 @@ public class SimulatedBroker
         decimal atr = SafeATR(candles, 14);
         bool volExp = CheckVolumeExpansion(candles);
         if (close > 0 && atr / close < MIN_ATR_PCT) return false;
-        if (gapPct > 0 && rsi > RSI_LONG_MIN && volExp && (_marketRegime != "SELL-OFF" || CheckStrongRelativeStrength(symbol, candles)))
+        if (gapPct > 0 && rsi > RSI_LONG_MIN && (_marketRegime != "SELL-OFF" || CheckStrongRelativeStrength(symbol, candles)))
         {
             // SMA200: allow within 3% below — only block deep structural downtrends
             decimal sma200 = GetDailySma200(symbol);
@@ -704,7 +724,7 @@ public class SimulatedBroker
         }
 
         // Gap DOWN → short
-        if (gapPct < 0 && rsi < RSI_SHORT_MAX && volExp)
+        if (gapPct < 0 && rsi < RSI_SHORT_MAX && _allowShorts)
         {
             // Daily SMA200: prefer stocks already in downtrends for shorts.
             // Exception: in SELL-OFF regime stocks above SMA200 can still crash hard
@@ -807,9 +827,11 @@ public class SimulatedBroker
         }
 
         // ── OVERBOUGHT FADE → short ───────────────────────────
-        // Stock is in downtrend (below SMA50) and RSI has spiked — fade the rally
-        bool overboughtInDowntrend = close < sma50 && rsi > RSI_OVERBOUGHT;
-        if (overboughtInDowntrend)
+        // Stock is in downtrend (below SMA50) and RSI has spiked — fade the rally.
+        // Only fire in SELL-OFF or CHOPPY — fading rallies on TRENDING/NORMAL days loses money.
+        bool shortRegimeOk = _marketRegime == "SELL-OFF" || _marketRegime == "CHOPPY";
+        bool overboughtInDowntrend = close < sma50 && rsi > RSI_OVERBOUGHT && shortRegimeOk;
+        if (overboughtInDowntrend && _allowShorts)
         {
             decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
             int qty = CalcQty(close, stopDistance);
@@ -957,10 +979,11 @@ public class SimulatedBroker
 
         // Reserve a slot immediately so concurrent candle events can't over-enter
         Interlocked.Increment(ref _pendingEntryCount);
-        // Track how many times this symbol has been entered today
+        // Track how many times this symbol has been entered today + hourly pace
         lock (_lock)
         {
             _dailyEntryCount[symbol] = _dailyEntryCount.GetValueOrDefault(symbol) + 1;
+            _tradesThisHour++;
         }
 
         SubmitOrder(symbol, qty, price, side, strategyTag);
@@ -1044,26 +1067,39 @@ public class SimulatedBroker
             else
                 pos.HighWaterMark = Math.Max(pos.HighWaterMark, currentPrice);
 
-            // ── PARTIAL 1: net +1.5% → sell half ──────────────
-            if (gainPct >= 0.015m && !pos.PartialExitDone && pos.Quantity >= 2)
+            // ── PARTIAL 1: net +1% → sell half ────────────────
+            // Lock in half the position the moment we hit 1% net gain.
+            // Do NOT decrement pos.Quantity here — OnOrderFilled does it when the fill
+            // arrives. Pre-decrementing caused isFullClose to be true for even-size
+            // positions, removing them before the second half could be sold.
+            if (gainPct >= 0.01m && !pos.PartialExitDone && pos.Quantity >= 2)
             {
                 int halfQty = pos.Quantity / 2;
-                // Do NOT decrement pos.Quantity here — OnOrderFilled does it when
-                // the fill arrives. Pre-decrementing caused isFullClose to be true
-                // for any even-size position, removing it before the other half sold.
                 pos.PartialExitDone = true;
                 SubmitOrder(symbol, halfQty, currentPrice, exitSide, "PARTIAL_TP_1");
                 return;
             }
 
-            // ── PARTIAL 2: net +2.5% → sell another quarter ───
-            if (gainPct >= 0.025m && !pos.PartialExitDone2 && pos.Quantity >= 2)
+            // ── PARTIAL 2: remaining half exits at +1.5% OR if price retreats to +1% ──
+            // PartialExitDone2 is reused here as a "price ever reached 1.5%" flag.
+            // Once that level is tagged, we trail the stop down to 1% so we keep as
+            // much gain as possible without giving it all back.
+            if (pos.PartialExitDone && !pos.ExitSubmitted)
             {
-                int quarterQty = Math.Max(1, pos.Quantity / 2);
-                // Same: let OnOrderFilled handle the quantity decrement on fill.
-                pos.PartialExitDone2 = true;
-                SubmitOrder(symbol, quarterQty, currentPrice, exitSide, "PARTIAL_TP_2");
-                return;
+                // Mark if we've ever touched the 1.5% level
+                if (gainPct >= 0.015m)
+                    pos.PartialExitDone2 = true;
+
+                bool takeAt1_5pct = gainPct >= 0.015m;
+                bool retreatTo1pct = pos.PartialExitDone2 && gainPct <= 0.01m;
+
+                if (takeAt1_5pct || retreatTo1pct)
+                {
+                    pos.ExitSubmitted = true;
+                    string reason = takeAt1_5pct ? "PARTIAL_TP_2" : "TRAIL_BACK_TO_1PCT";
+                    SubmitOrder(symbol, pos.Quantity, currentPrice, exitSide, reason);
+                    return;
+                }
             }
 
             // ── TIME STOP: 60 min, net gain < 0.5% ────────────
@@ -1315,6 +1351,8 @@ public class SimulatedBroker
         _eodSent = false;
         _haltTrading = false;
         _tradesToday = 0;
+        _tradesThisHour = 0;
+        _currentTradeHour = DateTime.MinValue;
         _winCount = 0;
         _lossCount = 0;
         _totalRealizedPnL = 0m;
@@ -1357,7 +1395,7 @@ public class SimulatedBroker
     {
         try
         {
-            File.WriteAllText("bot_state.json", JsonSerializer.Serialize(new BotPersistData
+            File.WriteAllText(StatePath("bot_state.json"), JsonSerializer.Serialize(new BotPersistData
             {
                 Positions = _positions,
                 TotalPnL = _totalRealizedPnL,
@@ -1368,6 +1406,8 @@ public class SimulatedBroker
                 LastTradeTime = _lastTradeTime,
                 LastTradeWasLoss = _lastTradeWasLoss,
                 DailyEntryCount = _dailyEntryCount,
+                TradesThisHour = _tradesThisHour,
+                TradeHourSlot = _currentTradeHour,
                 CompletedTrades = _completedTrades.ToList(),
                 LastVolumeResetDate = _lastVolumeResetEt
             }));
@@ -1376,7 +1416,7 @@ public class SimulatedBroker
     }
     public void LoadState()
     {
-        if (!File.Exists("bot_state.json"))
+        if (!File.Exists(StatePath("bot_state.json")))
         {
             // No state file — still query IBKR positions on startup.
             // The file may have been deleted, or IBKR may hold positions from a previous session.
@@ -1389,7 +1429,7 @@ public class SimulatedBroker
         try
         {
             var data = JsonSerializer.Deserialize<BotPersistData>(
-                           File.ReadAllText("bot_state.json"));
+                           File.ReadAllText(StatePath("bot_state.json")));
             if (data == null) { _reconciled = true; return; }
 
             _positions = data.Positions;
@@ -1402,6 +1442,9 @@ public class SimulatedBroker
             foreach (var kv in data.LastTradeTime) _lastTradeTime[kv.Key] = kv.Value;
             foreach (var kv in data.LastTradeWasLoss) _lastTradeWasLoss[kv.Key] = kv.Value;
             foreach (var kv in data.DailyEntryCount) _dailyEntryCount[kv.Key] = kv.Value;
+            // Restore hourly rate limiter so it counts correctly after a same-day restart
+            _tradesThisHour = data.TradesThisHour;
+            if (data.TradeHourSlot != DateTime.MinValue) _currentTradeHour = data.TradeHourSlot;
             // Restore trade history so the dashboard stays consistent with _totalRealizedPnL
             // after a same-day restart (without this the header total and history panel diverge).
             if (data.CompletedTrades?.Count > 0)
@@ -1422,7 +1465,8 @@ public class SimulatedBroker
                 if (pos.HighWaterMark <= 0) pos.HighWaterMark = pos.AvgPrice;
             }
 
-            LogMessage($"[RESUME] Loaded {_positions.Count} positions, PnL={_totalRealizedPnL:C2}");
+            LogMessage($"[RESUME] State file: {StatePath("bot_state.json")}");
+            LogMessage($"[RESUME] Loaded {_positions.Count} positions | PnL={_totalRealizedPnL:C2} | Trades today={_tradesToday} | Wins={_winCount} Losses={_lossCount} | ThisHour={_tradesThisHour}");
             // Restore runtime config (DAILY_PROFIT_GOAL, POSITION_SIZE, etc.) from
             // bot-config.json before CheckDailyReset so limits are correct.
             LoadConfig();
@@ -1625,18 +1669,18 @@ public class SimulatedBroker
             var dict = _marketData.ToDictionary(k => k.Key, v => v.Value);
             foreach (var kv in dict)
                 lock (kv.Value) { kv.Value.RemoveAll(c => c.Time < cutoff); }
-            File.WriteAllText("market_memory.json", JsonSerializer.Serialize(dict));
+            File.WriteAllText(StatePath("market_memory.json"), JsonSerializer.Serialize(dict));
         }
         catch (Exception ex) { LogError("SaveMarketMemory", ex.Message); }
     }
 
     public void LoadMarketMemory()
     {
-        if (!File.Exists("market_memory.json")) return;
+        if (!File.Exists(StatePath("market_memory.json"))) return;
         try
         {
             var data = JsonSerializer.Deserialize<ConcurrentDictionary<string, List<Candle>>>(
-                           File.ReadAllText("market_memory.json"));
+                           File.ReadAllText(StatePath("market_memory.json")));
             if (data != null)
                 foreach (var kv in data)
                     _marketData[kv.Key] = kv.Value;
@@ -1934,7 +1978,7 @@ public class SimulatedBroker
     //  Open dashboard.html in any browser — auto-refreshes every second.
     // ══════════════════════════════════════════════════════════
 
-    private const string CONFIG_FILE = "bot-config.json";
+    private static readonly string CONFIG_FILE = StatePath("bot-config.json");
     private const string CONFIG_PASSWORD = "Efmukl123!";
 
     // ── Load configuration from bot-config.json (called at bot startup) ───────
