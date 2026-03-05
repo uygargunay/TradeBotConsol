@@ -16,6 +16,7 @@ class Program
         // nextValidId() fires reqPositions() the moment the socket is live.
         broker.LoadMarketMemory();
         broker.LoadLifetimeEquity();
+        broker.LoadAllTrades();
         broker.LoadState();
 
         try

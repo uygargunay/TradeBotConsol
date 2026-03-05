@@ -117,6 +117,7 @@ public class TradeRecord
     public decimal HoldMinutes { get; set; }
     public string ExitReason { get; set; }
     public string Time { get; set; }        // ET close time HH:mm
+    public string Date { get; set; } = ""; // ET date yyyy-MM-dd — empty on old records
 }
 
 // One data point in the lifetime equity history — one entry per trading day
@@ -194,6 +195,12 @@ public class SimulatedBroker
     private readonly ConcurrentDictionary<string, Candle> _currentMinuteCandle = new();
     private readonly List<(DateTime time, decimal equity)> _equityCurve = new();
     private readonly List<LifetimeEquityPoint> _lifetimeEquity = new();
+
+    // ── Cross-day trade log — never cleared by CheckDailyReset ───────────────
+    // Survives daily resets so the "All-time" history panel in the dashboard
+    // shows trades from all previous sessions, not just today.
+    private readonly List<TradeRecord> _allTrades = new();
+    private static readonly string ALL_TRADES_FILE = StatePath("all_trades.json");
 
     // ── Absolute state directory — pinned to the executable folder so all
     // .json files are found regardless of which directory the bot is launched from.
@@ -1507,9 +1514,32 @@ public class SimulatedBroker
                     NetPnL = recordedNetPnl,
                     HoldMinutes = holdMinutes,
                     ExitReason = exitReason,
-                    Time = GetEasternTime().ToString("HH:mm")
+                    Time = GetEasternTime().ToString("HH:mm"),
+                    Date = GetEasternTime().Date.ToString("yyyy-MM-dd")
                 });
                 if (_completedTrades.Count > 50) _completedTrades.RemoveAt(0);
+
+                // Mirror to the persistent all-time log (survives daily resets)
+                var allTradeRecord = new TradeRecord
+                {
+                    Symbol = order.Symbol,
+                    Side = pos.IsShort ? "SHORT" : "LONG",
+                    Strategy = pos.StrategyTag,
+                    Qty = fillQty,
+                    Entry = pos.AvgPrice,
+                    Exit = fillPrice,
+                    NetPnL = recordedNetPnl,
+                    HoldMinutes = holdMinutes,
+                    ExitReason = exitReason,
+                    Time = GetEasternTime().ToString("HH:mm"),
+                    Date = GetEasternTime().Date.ToString("yyyy-MM-dd")
+                };
+                lock (_allTrades)
+                {
+                    _allTrades.Add(allTradeRecord);
+                    if (_allTrades.Count > 2000) _allTrades.RemoveAt(0);
+                }
+                Task.Run(() => SaveAllTrades());
 
                 if (isFullClose)
                 {
@@ -1622,11 +1652,53 @@ public class SimulatedBroker
     //  PERSISTENCE
     // ══════════════════════════════════════════════════════════
 
+    // ── Safe JSON file reader — tries primary then .bak ─────────────────────
+    // Returns the raw JSON string, or null if both files are absent/corrupt.
+    private static string SafeReadJson(string path)
+    {
+        foreach (var candidate in new[] { path, path + ".bak" })
+        {
+            if (!File.Exists(candidate)) continue;
+            try
+            {
+                var raw = File.ReadAllText(candidate);
+                if (!string.IsNullOrWhiteSpace(raw) && (raw[0] == '{' || raw[0] == '['))
+                    return raw;
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    // ── Atomic file write ─────────────────────────────────────────────────────
+    // File.WriteAllText truncates THEN writes — two-step, not atomic.
+    // If the process dies or a second thread races between those steps, the
+    // file ends up empty or corrupt (the "'F' is an invalid start" error).
+    //
+    // Fix: write to a .tmp file, then File.Replace() it into place.
+    // File.Replace is OS-atomic: the old file becomes .bak (our fallback),
+    // and the .tmp becomes the new primary — all in one kernel call.
+    private static void AtomicWrite(string path, string content)
+    {
+        string tmp = path + ".tmp";
+        // Write to .tmp first — if this fails, the primary is untouched
+        File.WriteAllText(tmp, content);
+        string bak = path + ".bak";
+        if (File.Exists(path))
+            // Replace primary with .tmp, saving old primary as .bak
+            File.Replace(tmp, path, bak);
+        else
+        {
+            // First-ever write — no primary exists yet, just rename .tmp
+            File.Move(tmp, path);
+        }
+    }
+
     public void SaveState()
     {
         try
         {
-            File.WriteAllText(StatePath("bot_state.json"), JsonSerializer.Serialize(new BotPersistData
+            var json = JsonSerializer.Serialize(new BotPersistData
             {
                 Positions = _positions,
                 TotalPnL = _totalRealizedPnL,
@@ -1641,26 +1713,53 @@ public class SimulatedBroker
                 TradeHourSlot = _currentTradeHour,
                 CompletedTrades = _completedTrades.ToList(),
                 LastVolumeResetDate = _lastVolumeResetEt
-            }));
+            });
+            AtomicWrite(StatePath("bot_state.json"), json);
         }
         catch (Exception ex) { LogError("SaveState", ex.Message); }
     }
     public void LoadState()
     {
-        if (!File.Exists(StatePath("bot_state.json")))
+        // Try primary file first, then .bak if primary is corrupt/missing.
+        // The .bak is written by AtomicWrite as the previous-known-good file.
+        string primaryPath = StatePath("bot_state.json");
+        string bakPath = primaryPath + ".bak";
+
+        string raw = null;
+        if (File.Exists(primaryPath))
         {
-            // No state file — still query IBKR positions on startup.
-            // The file may have been deleted, or IBKR may hold positions from a previous session.
-            // Keep _reconciled = false so ExecuteStrategy() is blocked until positionEnd() confirms.
+            try { raw = File.ReadAllText(primaryPath); } catch { }
+            // Validate — a truncated/corrupt file may start with garbage
+            if (string.IsNullOrWhiteSpace(raw) || raw[0] != '{')
+            {
+                LogMessage($"[LoadState] Primary state file corrupt (first char='{(raw?.Length > 0 ? raw[0] : '?')}') — trying backup.");
+                raw = null;
+            }
+        }
+        if (raw == null && File.Exists(bakPath))
+        {
+            try { raw = File.ReadAllText(bakPath); } catch { }
+            if (string.IsNullOrWhiteSpace(raw) || raw[0] != '{')
+            {
+                LogMessage("[LoadState] Backup state file also corrupt — starting fresh.");
+                raw = null;
+            }
+            else
+                LogMessage("[LoadState] Loaded state from backup file.");
+        }
+
+        if (raw == null)
+        {
+            // No valid state file at all — still query IBKR positions on startup.
             _needsReconciliation = true;
             if (RealBroker?.IsReady == true)
                 RealBroker.RequestPositions();
             return;
         }
+
         try
         {
-            var data = JsonSerializer.Deserialize<BotPersistData>(
-                           File.ReadAllText(StatePath("bot_state.json")));
+            var data = JsonSerializer.Deserialize<BotPersistData>(raw);
             if (data == null) { _reconciled = true; return; }
 
             _positions = data.Positions;
@@ -1673,20 +1772,13 @@ public class SimulatedBroker
             foreach (var kv in data.LastTradeTime) _lastTradeTime[kv.Key] = kv.Value;
             foreach (var kv in data.LastTradeWasLoss) _lastTradeWasLoss[kv.Key] = kv.Value;
             foreach (var kv in data.DailyEntryCount) _dailyEntryCount[kv.Key] = kv.Value;
-            // Restore hourly rate limiter so it counts correctly after a same-day restart
             _tradesThisHour = data.TradesThisHour;
             if (data.TradeHourSlot != DateTime.MinValue) _currentTradeHour = data.TradeHourSlot;
-            // Restore trade history so the dashboard stays consistent with _totalRealizedPnL
-            // after a same-day restart (without this the header total and history panel diverge).
             if (data.CompletedTrades?.Count > 0)
             {
                 _completedTrades.Clear();
                 foreach (var t in data.CompletedTrades) _completedTrades.Add(t);
             }
-
-            // Restore last reset date so CheckDailyReset() correctly detects a new
-            // day on restart and clears yesterday's halt. Without this it initialises
-            // to DateTime.MinValue → sets to today → returns early → halt never clears.
             if (data.LastVolumeResetDate != DateTime.MinValue)
                 _lastVolumeResetEt = data.LastVolumeResetDate;
 
@@ -1696,17 +1788,10 @@ public class SimulatedBroker
                 if (pos.HighWaterMark <= 0) pos.HighWaterMark = pos.AvgPrice;
             }
 
-            LogMessage($"[RESUME] State file: {StatePath("bot_state.json")}");
+            LogMessage($"[RESUME] State file: {primaryPath}");
             LogMessage($"[RESUME] Loaded {_positions.Count} positions | PnL={_totalRealizedPnL:C2} | Trades today={_tradesToday} | Wins={_winCount} Losses={_lossCount} | ThisHour={_tradesThisHour}");
-            // Restore runtime config (DAILY_PROFIT_GOAL, POSITION_SIZE, etc.) from
-            // bot-config.json before CheckDailyReset so limits are correct.
             LoadConfig();
             CheckDailyReset();
-            // --- Reconciliation trigger (handles both startup orderings) ---
-            // Case A: LoadState runs BEFORE Connect() / nextValidId fires.
-            //         Set the flag; IbClient.nextValidId() will call reqPositions().
-            // Case B: LoadState runs AFTER Connect() (nextValidId already fired).
-            //         IsReady is already true — call RequestPositions() right now.
             _needsReconciliation = true;
             if (RealBroker?.IsReady == true)
             {
@@ -1721,9 +1806,8 @@ public class SimulatedBroker
         catch (Exception ex)
         {
             LogError("LoadState", ex.Message);
-            _reconciled = true; // don't leave the bot permanently blocked on a bad file
+            _reconciled = true;
         }
-
     }
 
     // ══════════════════════════════════════════════════════════
@@ -1900,18 +1984,18 @@ public class SimulatedBroker
             var dict = _marketData.ToDictionary(k => k.Key, v => v.Value);
             foreach (var kv in dict)
                 lock (kv.Value) { kv.Value.RemoveAll(c => c.Time < cutoff); }
-            File.WriteAllText(StatePath("market_memory.json"), JsonSerializer.Serialize(dict));
+            AtomicWrite(StatePath("market_memory.json"), JsonSerializer.Serialize(dict));
         }
         catch (Exception ex) { LogError("SaveMarketMemory", ex.Message); }
     }
 
     public void LoadMarketMemory()
     {
-        if (!File.Exists(StatePath("market_memory.json"))) return;
+        string raw = SafeReadJson(StatePath("market_memory.json"));
+        if (raw == null) return;
         try
         {
-            var data = JsonSerializer.Deserialize<ConcurrentDictionary<string, List<Candle>>>(
-                           File.ReadAllText(StatePath("market_memory.json")));
+            var data = JsonSerializer.Deserialize<ConcurrentDictionary<string, List<Candle>>>(raw);
             if (data != null)
                 foreach (var kv in data)
                     _marketData[kv.Key] = kv.Value;
@@ -2120,8 +2204,8 @@ public class SimulatedBroker
     {
         try
         {
-            File.WriteAllLines("equity_curve.csv",
-                _equityCurve.Select(e => $"{e.time:O},{e.equity}"));
+            var lines = string.Join("\n", _equityCurve.Select(e => $"{e.time:O},{e.equity}"));
+            AtomicWrite(StatePath("equity_curve.csv"), lines);
         }
         catch { }
     }
@@ -2162,20 +2246,52 @@ public class SimulatedBroker
     {
         try
         {
+            string json;
             lock (_lifetimeEquity)
-                File.WriteAllText(LIFETIME_EQUITY_FILE,
-                    JsonSerializer.Serialize(_lifetimeEquity));
+                json = JsonSerializer.Serialize(_lifetimeEquity);
+            AtomicWrite(LIFETIME_EQUITY_FILE, json);
+        }
+        catch { }
+    }
+
+    // ── Cross-day trade history ────────────────────────────────────────────────
+    public void LoadAllTrades()
+    {
+        string raw = SafeReadJson(ALL_TRADES_FILE);
+        if (raw == null) return;
+        try
+        {
+            var data = JsonSerializer.Deserialize<List<TradeRecord>>(raw);
+            if (data == null) return;
+            lock (_allTrades)
+            {
+                _allTrades.Clear();
+                _allTrades.AddRange(data);
+            }
+            LogMessage($"[ALL TRADES] Loaded {_allTrades.Count} historical trade records.");
+        }
+        catch (Exception ex) { LogError("LoadAllTrades", ex.Message); }
+    }
+
+    private void SaveAllTrades()
+    {
+        try
+        {
+            string json;
+            lock (_allTrades)
+                json = JsonSerializer.Serialize(_allTrades);
+            AtomicWrite(ALL_TRADES_FILE, json);
         }
         catch { }
     }
 
     public void LoadLifetimeEquity()
     {
+        string raw = SafeReadJson(LIFETIME_EQUITY_FILE);
+        if (raw == null) return;
         try
         {
-            if (!File.Exists(LIFETIME_EQUITY_FILE)) return;
-            var data = JsonSerializer.Deserialize<List<LifetimeEquityPoint>>(
-                File.ReadAllText(LIFETIME_EQUITY_FILE));
+            var data = JsonSerializer.Deserialize<List<LifetimeEquityPoint>>(raw);
             if (data == null) return;
             lock (_lifetimeEquity)
             {
@@ -2296,7 +2412,7 @@ public class SimulatedBroker
     {
         try
         {
-            File.WriteAllText(CONFIG_FILE, BuildConfigJson(pretty: true));
+            AtomicWrite(CONFIG_FILE, BuildConfigJson(pretty: true));
             Console.WriteLine($"[CONFIG] Saved to {CONFIG_FILE}");
         }
         catch (Exception ex)
@@ -2701,20 +2817,56 @@ public class SimulatedBroker
 
             decimal cash = TOTAL_BUDGET - _positions.Values.Sum(p => p.AvgPrice * p.Quantity);
 
-            // ── Lifetime equity (all daily snapshots) ────────────
+            // ── Lifetime equity (all daily snapshots + today's live value) ────
+            // Today's point is injected live on every poll so the Portfolio Growth
+            // chart shows current-day P&L without waiting for EOD snapshot.
             var ltArr = new StringBuilder("[");
             lock (_lifetimeEquity)
             {
-                for (int i = 0; i < _lifetimeEquity.Count; i++)
+                var pts = _lifetimeEquity.ToList();
+                var todayStr = et.Date.ToString("yyyy-MM-dd");
+                // Upsert today's live value — don't persist, just inject for the chart
+                bool todayExists = pts.Any(p => p.Date == todayStr);
+                if (!todayExists)
+                    pts.Add(new LifetimeEquityPoint
+                    {
+                        Date = todayStr,
+                        AccountValue = TOTAL_BUDGET + _totalRealizedPnL,
+                        DailyPnL = _totalRealizedPnL
+                    });
+                else
+                {
+                    var todayPt = pts.First(p => p.Date == todayStr);
+                    todayPt.AccountValue = TOTAL_BUDGET + _totalRealizedPnL;
+                    todayPt.DailyPnL = _totalRealizedPnL;
+                }
+                for (int i = 0; i < pts.Count; i++)
                 {
                     if (i > 0) ltArr.Append(",");
-                    var pt = _lifetimeEquity[i];
+                    var pt = pts[i];
                     ltArr.Append($@"{{""d"":""{pt.Date}"",""v"":{pt.AccountValue:F2},""p"":{pt.DailyPnL:F2}}}");
                 }
             }
             ltArr.Append("]");
 
-            return $@"{{""time"":""{now:yyyy-MM-dd HH:mm:ss} PT"",""et"":""{et:HH:mm:ss} ET"",""regime"":""{_marketRegime}"",""halted"":{(_haltTrading ? "true" : "false")},""reconciled"":{(_reconciled ? "true" : "false")},""pnl"":{_totalRealizedPnL:F2},""goal"":{DAILY_PROFIT_GOAL:F2},""maxLoss"":{MAX_DAILY_LOSS:F2},""trades"":{_tradesToday},""maxTrades"":{MAX_TRADES_PER_DAY},""wins"":{_winCount},""losses"":{_lossCount},""wr"":{wr:F1},""cash"":{cash:F2},""budget"":{TOTAL_BUDGET:F2},""initialBudget"":{TOTAL_BUDGET:F2},""positions"":{posArr},""curve"":{curveArr},""watchlist"":{wlArr},""feed"":{tradeArr},""hist"":{histArr},""lifetimeCurve"":{ltArr}}}";
+            // ── All-time trade history (newest first, last 500) ───────────────
+            var allArr = new StringBuilder("[");
+            lock (_allTrades)
+            {
+                var all = _allTrades.ToList();
+                int start = Math.Max(0, all.Count - 500);
+                bool firstAt = true;
+                for (int i = all.Count - 1; i >= start; i--)
+                {
+                    var t = all[i];
+                    if (!firstAt) allArr.Append(",");
+                    allArr.Append($@"{{""sym"":""{t.Symbol}"",""side"":""{t.Side}"",""strat"":""{t.Strategy}"",""qty"":{t.Qty},""entry"":{t.Entry:F2},""exit"":{t.Exit:F2},""pnl"":{t.NetPnL:F2},""min"":{t.HoldMinutes:F0},""reason"":""{t.ExitReason}"",""time"":""{t.Time}"",""date"":""{t.Date}""}}");
+                    firstAt = false;
+                }
+            }
+            allArr.Append("]");
+
+            return $@"{{""time"":""{now:yyyy-MM-dd HH:mm:ss} PT"",""et"":""{et:HH:mm:ss} ET"",""regime"":""{_marketRegime}"",""halted"":{(_haltTrading ? "true" : "false")},""reconciled"":{(_reconciled ? "true" : "false")},""pnl"":{_totalRealizedPnL:F2},""goal"":{DAILY_PROFIT_GOAL:F2},""maxLoss"":{MAX_DAILY_LOSS:F2},""trades"":{_tradesToday},""maxTrades"":{MAX_TRADES_PER_DAY},""wins"":{_winCount},""losses"":{_lossCount},""wr"":{wr:F1},""cash"":{cash:F2},""budget"":{TOTAL_BUDGET:F2},""initialBudget"":{TOTAL_BUDGET:F2},""positions"":{posArr},""curve"":{curveArr},""watchlist"":{wlArr},""feed"":{tradeArr},""hist"":{histArr},""lifetimeCurve"":{ltArr},""allTrades"":{allArr}}}";
         }
     }
 
