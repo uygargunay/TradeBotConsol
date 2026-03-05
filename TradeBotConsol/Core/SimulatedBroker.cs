@@ -607,7 +607,13 @@ public class SimulatedBroker
             if (TryMeanReversionStrategy(symbol, candles)) return;
 
             // 5. Momentum Breakout + Continuation (original, now relaxed)
-            TryMomentumStrategy(symbol, candles);
+            if (TryMomentumStrategy(symbol, candles)) return;
+
+            // 6. EMA Pocket — price resting between 9 EMA / 21 EMA at a key S/R level
+            if (TryEmaPocketStrategy(symbol, candles)) return;
+
+            // 7. Outside Candle — engulfing bar swallows 3 prior candles, filtered by 30-min 50 EMA trend
+            TryOutsideCandleStrategy(symbol, candles);
         }
     }
 
@@ -957,6 +963,214 @@ public class SimulatedBroker
     }
 
     // ══════════════════════════════════════════════════════════
+    //  STRATEGY 6 — EMA POCKET (Triple Line Setup)
+    // ══════════════════════════════════════════════════════════
+    // Based on the "triple line" concept: price resting in the pocket between
+    // the 9 EMA and 21 EMA near a key S/R level creates a trampoline-like rejection.
+    //
+    // Rules (long):
+    //   • 9 EMA > 21 EMA  (uptrend — EMAs in bullish order)
+    //   • EMAs are sloping (not flat) — slope checked over last 5 bars
+    //   • Price closed BETWEEN 9 EMA and 21 EMA (the "pocket")
+    //   • A key S/R level is within 1 ATR of current price (prev-day high/low or VWAP)
+    //   • RSI > 50 (momentum tiebreaker)
+    //   • Volume confirms (last bar ≥ avg)
+    // Rules (short): mirror image with EMAs inverted, RSI < 50
+    // ──────────────────────────────────────────────────────────
+    private bool TryEmaPocketStrategy(string symbol, List<Candle> candles)
+    {
+        if (candles.Count < 30) return false;
+
+        var closes = candles.Select(c => (double)c.Close).ToArray();
+
+        // ── EMA values now and 5 bars ago (slope check) ──────
+        double ema9 = CalcEMA(closes, 9);
+        double ema21 = CalcEMA(closes, 21);
+        var closesPrev = closes.Take(closes.Length - 5).ToArray();
+        if (closesPrev.Length < 21) return false;
+        double ema9Prev = CalcEMA(closesPrev, 9);
+        double ema21Prev = CalcEMA(closesPrev, 21);
+
+        decimal close = candles.Last().Close;
+        decimal atr = SafeATR(candles, 14);
+        double rsi = SafeRSI(candles, 14);
+        _vwap.TryGetValue(symbol, out decimal vwapVal);
+        var (pdHigh, pdLow) = GetPrevDayHL(symbol);
+
+        // EMA slope — must be moving, not flat. Require at least 0.05% move over 5 bars.
+        double slopeThreshold = ema21Prev * 0.0005;
+        bool ema9Rising = ema9 > ema9Prev + slopeThreshold;
+        bool ema9Falling = ema9 < ema9Prev - slopeThreshold;
+        bool ema21Rising = ema21 > ema21Prev + slopeThreshold;
+        bool ema21Falling = ema21 < ema21Prev - slopeThreshold;
+
+        // Volume: last bar must be at or above 10-bar average
+        long avgVol = (long)candles.TakeLast(10).Average(c => c.Volume);
+        bool volOk = candles.Last().Volume >= avgVol;
+
+        // Key S/R proximity — at least one level within 1.0 × ATR of current price
+        // Levels used: prev-day high, prev-day low, VWAP
+        bool nearLevel = false;
+        if (pdHigh > 0 && Math.Abs(close - pdHigh) <= atr) nearLevel = true;
+        if (pdLow > 0 && Math.Abs(close - pdLow) <= atr) nearLevel = true;
+        if (vwapVal > 0 && Math.Abs(close - vwapVal) <= atr * 0.5m) nearLevel = true;
+        if (!nearLevel) return false;
+
+        if (!volOk) return false;
+
+        // ── LONG: 9 EMA > 21 EMA, price pulled back into pocket ─
+        bool bullishOrder = ema9 > ema21;
+        bool inLongPocket = (double)close < ema9 && (double)close > ema21;
+
+        if (bullishOrder && inLongPocket && ema9Rising && ema21Rising && rsi > 50)
+        {
+            if (_marketRegime == "SELL-OFF" && !CheckStrongRelativeStrength(symbol, candles))
+                return false;
+
+            decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
+            int qty = CalcQty(close, stopDistance);
+            if (qty <= 0) return false;
+
+            OpenPosition(symbol, qty, close, TradeSide.Buy, false, "EMA_POCKET_LONG");
+            return true;
+        }
+
+        // ── SHORT: 9 EMA < 21 EMA, price bounced up into pocket ─
+        bool bearishOrder = ema9 < ema21;
+        bool inShortPocket = (double)close > ema9 && (double)close < ema21;
+
+        if (bearishOrder && inShortPocket && ema9Falling && ema21Falling && rsi < 50 && _allowShorts)
+        {
+            decimal sma200 = GetDailySma200(symbol);
+            if (sma200 > 0 && close > sma200 && _marketRegime != "SELL-OFF") return false;
+
+            decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
+            int qty = CalcQty(close, stopDistance);
+            if (qty <= 0) return false;
+
+            OpenPosition(symbol, qty, close, TradeSide.Sell, true, "EMA_POCKET_SHORT");
+            return true;
+        }
+
+        return false;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  STRATEGY 7 — OUTSIDE CANDLE (Engulfing 3-Bar)
+    // ══════════════════════════════════════════════════════════
+    // An outside (engulfing) candle that completely swallows the prior THREE candles
+    // signals institutional participation. The close position within the candle's
+    // range confirms direction (top 25% = bullish, bottom 25% = bearish).
+    // Trend filter: 30-min 50 EMA — only longs above it, only shorts below it.
+    // Location filter: highest-probability near prev-day H/L, VWAP, or ORB levels.
+    // ──────────────────────────────────────────────────────────
+    private bool TryOutsideCandleStrategy(string symbol, List<Candle> candles)
+    {
+        if (candles.Count < 10) return false;
+
+        var last4 = candles.TakeLast(4).ToList();
+        var outside = last4[3];  // most recent (just closed) candle
+        var prior3 = last4.Take(3).ToList();
+
+        // ── Outside candle: must completely engulf all 3 prior candles ────
+        decimal outerHigh = prior3.Max(c => c.High);
+        decimal outerLow = prior3.Min(c => c.Low);
+        bool isOutside = outside.High > outerHigh && outside.Low < outerLow;
+        if (!isOutside) return false;
+
+        // Candle must have meaningful range (at least 0.3% of price) — filters doji noise
+        decimal range = outside.High - outside.Low;
+        if (range < outside.Close * 0.003m) return false;
+
+        // ── Close position within range ───────────────────────
+        decimal closePosition = range > 0 ? (outside.Close - outside.Low) / range : 0.5m;
+        bool bullishClose = closePosition >= 0.75m;  // closed in top 25%
+        bool bearishClose = closePosition <= 0.25m;  // closed in bottom 25%
+        if (!bullishClose && !bearishClose) return false;
+
+        decimal close = outside.Close;
+        decimal atr = SafeATR(candles, 14);
+        double rsi = SafeRSI(candles, 14);
+        _vwap.TryGetValue(symbol, out decimal vwapVal);
+        var (pdHigh, pdLow) = GetPrevDayHL(symbol);
+
+        // ── 30-min 50 EMA trend filter ────────────────────────
+        // Aggregate 1-min candles into 30-min bars and compute EMA(50) over those bars.
+        double ema50_30min = Calc30MinEma(candles, 50);
+
+        // ── Location filter — near meaningful S/R ─────────────
+        // Outside candles "in the middle of nowhere" are lower probability.
+        bool nearSR = false;
+        if (pdHigh > 0 && Math.Abs(close - pdHigh) <= atr * 1.5m) nearSR = true;
+        if (pdLow > 0 && Math.Abs(close - pdLow) <= atr * 1.5m) nearSR = true;
+        if (vwapVal > 0 && Math.Abs(close - vwapVal) <= atr) nearSR = true;
+        if (_orbRanges.TryGetValue(symbol, out var orb) && orb.IsSet)
+        {
+            if (Math.Abs(close - orb.High) <= atr || Math.Abs(close - orb.Low) <= atr)
+                nearSR = true;
+        }
+        if (!nearSR) return false;
+
+        // ── LONG: bullish outside candle, price above 30-min 50 EMA ──
+        if (bullishClose && ema50_30min > 0 && (double)close > ema50_30min && rsi > 50)
+        {
+            if (_marketRegime == "SELL-OFF" && !CheckStrongRelativeStrength(symbol, candles))
+                return false;
+
+            // Stop goes below the low of the outside candle — per video rules
+            decimal stopDistance = Math.Max(close - outside.Low, atr * HARD_STOP_ATR_MULT);
+            stopDistance = Math.Max(stopDistance, MIN_STOP_DISTANCE);
+            // Require at least 2:1 R:R — if target (next S/R or VWAP) is too close, skip
+            decimal target = vwapVal > close ? vwapVal : (pdHigh > close ? pdHigh : close + atr * 2);
+            if (target - close < stopDistance * 2m) return false;
+
+            int qty = CalcQty(close, stopDistance);
+            if (qty <= 0) return false;
+
+            OpenPosition(symbol, qty, close, TradeSide.Buy, false, "OUTSIDE_CANDLE_LONG");
+            return true;
+        }
+
+        // ── SHORT: bearish outside candle, price below 30-min 50 EMA ──
+        if (bearishClose && ema50_30min > 0 && (double)close < ema50_30min && rsi < 50 && _allowShorts)
+        {
+            decimal sma200 = GetDailySma200(symbol);
+            if (sma200 > 0 && close > sma200 && _marketRegime != "SELL-OFF") return false;
+
+            decimal stopDistance = Math.Max(outside.High - close, atr * HARD_STOP_ATR_MULT);
+            stopDistance = Math.Max(stopDistance, MIN_STOP_DISTANCE);
+            decimal target = vwapVal > 0 && vwapVal < close ? vwapVal : (pdLow > 0 && pdLow < close ? pdLow : close - atr * 2);
+            if (close - target < stopDistance * 2m) return false;
+
+            int qty = CalcQty(close, stopDistance);
+            if (qty <= 0) return false;
+
+            OpenPosition(symbol, qty, close, TradeSide.Sell, true, "OUTSIDE_CANDLE_SHORT");
+            return true;
+        }
+
+        return false;
+    }
+
+    // ── Helper: aggregate 1-min candles into 30-min bars and compute EMA(period) ──
+    // Used by TryOutsideCandleStrategy for the 30-min 50 EMA trend filter.
+    // Returns 0 if not enough 30-min bars have formed yet.
+    private double Calc30MinEma(List<Candle> candles, int period)
+    {
+        // Group 1-min candles into 30-minute buckets
+        var bars30 = candles
+            .GroupBy(c => new DateTime(c.Time.Year, c.Time.Month, c.Time.Day,
+                                       c.Time.Hour, (c.Time.Minute / 30) * 30, 0))
+            .OrderBy(g => g.Key)
+            .Select(g => g.Last().Close)   // use close of each 30-min bar
+            .Select(c => (double)c)
+            .ToArray();
+
+        if (bars30.Length < period) return 0;
+        return CalcEMA(bars30, period);
+    }
+
+    // ══════════════════════════════════════════════════════════
     //  POSITION OPENING HELPER
     // ══════════════════════════════════════════════════════════
 
@@ -1250,7 +1464,7 @@ public class SimulatedBroker
                 // Determine exit reason (sniff from last log line)
                 string exitReason = isFullClose ? "EXIT" : "PARTIAL";
                 foreach (var tag in new[]{ "ATR_TRAIL_EXIT","TIME_STOP","HARD_STOP",
-                                           "MAX_LOSS_STOP","PARTIAL_TP_1","PARTIAL_TP_2","EOD_LIQUIDATE" })
+                                           "MAX_LOSS_STOP","PARTIAL_TP_1","PARTIAL_TP_2","TRAIL_BACK_TO_1PCT","EOD_LIQUIDATE" })
                     if (_tradeHistoryLog.LastOrDefault()?.Contains(tag) == true)
                     { exitReason = tag; break; }
 
