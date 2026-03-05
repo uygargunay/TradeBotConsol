@@ -205,7 +205,7 @@ public class SimulatedBroker
     // ── Absolute state directory — pinned to the executable folder so all
     // .json files are found regardless of which directory the bot is launched from.
     private static readonly string STATE_DIR = AppDomain.CurrentDomain.BaseDirectory;
-    private static string StatePath(string filename) => Path.Combine(STATE_DIR, filename);
+    private static string StatePath(string filename) => Path.Combine(AppDomain.CurrentDomain.BaseDirectory, filename);
     private static readonly string LIFETIME_EQUITY_FILE = StatePath("lifetime_equity.json");
 
     // Opening Range per symbol (resets daily)
