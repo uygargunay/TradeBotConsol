@@ -595,9 +595,11 @@ public class SimulatedBroker
             if (minutesSinceOpen > ORB_MINUTES)
                 if (TryOrbStrategy(symbol, candles, nowEt)) return;
 
-            // 2. Gap-and-Go (10:15–11:00 ET only — starts after new 15-min buffer, ends before mid-session)
-            // Was minutesSinceOpen <= 60 which fired right at 10:00 ET (worst minute of the day).
-            if (minutesSinceOpen >= 45 && minutesSinceOpen <= 90)
+            // 2. Gap-and-Go (10:15–12:00 ET)
+            // Extended from 11:00 ET — confirmed gap setups sometimes develop momentum
+            // into mid-morning. The relative volume filter already gates quality.
+            // Lower bound stays at minutesSinceOpen >= 45 (10:15 ET) per the hard entry gate.
+            if (minutesSinceOpen >= 45 && minutesSinceOpen <= 150)
                 if (TryGapAndGoStrategy(symbol, candles)) return;
 
             // 3. VWAP Bounce / Reclaim
@@ -623,6 +625,11 @@ public class SimulatedBroker
 
     private bool TryOrbStrategy(string symbol, List<Candle> candles, DateTime nowEt)
     {
+        // ORB relies on follow-through after a breakout — exactly what doesn't happen
+        // in choppy conditions. False breakouts above ORB high (and fake breakdowns
+        // below ORB low) are the most common loss pattern on non-trending days.
+        if (_marketRegime == "CHOPPY") return false;
+
         if (!_orbRanges.TryGetValue(symbol, out var orb) || !orb.IsSet) return false;
         if (orb.High <= orb.Low) return false;
 
@@ -772,8 +779,10 @@ public class SimulatedBroker
         bool volExp = CheckVolumeExpansion(candles);
         if (close > 0 && atr / close < MIN_ATR_PCT) return false;
         bool vwapReclaim = !prevAbove && allRecentAbove;
-        // VWAP reclaim long: the crossover is itself the signal — volExp not required
-        if (vwapReclaim && rsi > RSI_LONG_MIN && (_marketRegime != "SELL-OFF" || CheckStrongRelativeStrength(symbol, candles)))
+        // VWAP reclaim long: now requires volume confirmation.
+        // A reclaim on light volume reverses just as fast — it was producing
+        // 1-2 bar fake-outs that hit the hard stop right after min-hold expired.
+        if (vwapReclaim && volExp && rsi > RSI_LONG_MIN && (_marketRegime != "SELL-OFF" || CheckStrongRelativeStrength(symbol, candles)))
         {
             // Skip if price is pinned just under prev day high — VWAP reclaim into
             // overhead resistance is a low-probability long setup.
@@ -893,15 +902,23 @@ public class SimulatedBroker
                               && rsi > 55 && volExp;
         bool breakoutSignal = !choppyMode && expansion && volExp && close > recentHigh;
 
-        // trendContinuation: no volExp required — grinding days don't spike volume.
-        // UNKNOWN included so it works during startup before SPY builds 30 bars.
-        bool trendContinuation = (_marketRegime == "NORMAL" || _marketRegime == "TRENDING" || _marketRegime == "UNKNOWN")
+        // trendContinuation: requires volExp now — removed the "no volExp" exception.
+        // Also removed UNKNOWN regime: firing before SPY has 30 bars (first ~30 min)
+        // means regime isn't known yet, which produced unreliable entries early in the session.
+        bool trendContinuation = (_marketRegime == "NORMAL" || _marketRegime == "TRENDING")
                                && close > sma20 && close > sma50
-                               && rsi > 58 && relativeStrength;
+                               && rsi > 58 && relativeStrength && volExp;
 
         bool hasSignal = breakoutSignal || pullbackEntry || trendContinuation;
 
-        int required = (_marketRegime == "CHOPPY" || _marketRegime == "TRENDING") ? 3 : 4;
+        // TRENDING: only 3/5 needed — trend confirmed, fewer false signals.
+        // NORMAL:   4/5 — standard selectivity.
+        // CHOPPY:   5/5 — unanimous; false breakouts dominate choppy sessions.
+        //           (Was 3, which was backwards — causing excess entries on whipsaw days.)
+        // UNKNOWN:  4/5 — conservative until regime resolves.
+        int required = _marketRegime == "TRENDING" ? 3
+                     : _marketRegime == "CHOPPY" ? 5
+                     : 4;
 
         // Score: max 5 points
         int score = (regimeStrong ? 1 : 0)
@@ -910,7 +927,7 @@ public class SimulatedBroker
                   + (aboveVwap ? 1 : 0)
                   + (macdBullish ? 1 : 0);
 
-        // trendContinuation bypasses volExp — designed for low-volume grind days
+        // trendContinuation now requires volExp (see fix above) — this condition always includes it
         if (score >= required && hasSignal && (volExp || trendContinuation))
         {
             // SMA200: allow within 3% below — only block deep structural downtrends
@@ -3029,22 +3046,45 @@ public class SimulatedBroker
 
     public double SafeRSI(List<Candle> candles, int period)
     {
-        if (candles == null || candles.Count < period + 1) return 50;
+        // Require enough candles for a proper seed period + at least one smoothed step.
+        // period * 2 gives a clean seed window — the strategy gate (50 candles) already
+        // ensures this passes for period=14 (needs 28).
+        if (candles == null || candles.Count < period * 2) return 50;
 
-        double gain = 0, loss = 0;
-        for (int i = candles.Count - period; i < candles.Count; i++)
+        // ── Wilder's Smoothed RSI ─────────────────────────────────────────────
+        // Step 1: seed with the simple average of the first `period` price changes.
+        // Step 2: apply Wilder's exponential smoothing for all remaining bars.
+        // This matches TradingView / Bloomberg / most platforms exactly.
+        // The old simple-average version was noisier and gave systematically
+        // different values than the thresholds (55, 43, 35, 65) were calibrated for.
+
+        int seedStart = candles.Count - period * 2;
+        double avgGain = 0, avgLoss = 0;
+
+        for (int i = seedStart + 1; i <= seedStart + period; i++)
         {
             double diff = (double)(candles[i].Close - candles[i - 1].Close);
-            if (diff > 0) gain += diff;
-            else if (diff < 0) loss -= diff;
+            if (diff > 0) avgGain += diff;
+            else avgLoss -= diff;
+        }
+        avgGain /= period;
+        avgLoss /= period;
+
+        // Wilder's smoothing over the second half of the window
+        for (int i = seedStart + period + 1; i < candles.Count; i++)
+        {
+            double diff = (double)(candles[i].Close - candles[i - 1].Close);
+            double g = diff > 0 ? diff : 0;
+            double l = diff < 0 ? -diff : 0;
+            avgGain = (avgGain * (period - 1) + g) / period;
+            avgLoss = (avgLoss * (period - 1) + l) / period;
         }
 
-        // If there is literally no movement, return neutral 50
-        if (gain == 0 && loss == 0) return 50;
-        if (loss == 0) return 100;
-        if (gain == 0) return 0;
+        if (avgGain == 0 && avgLoss == 0) return 50;
+        if (avgLoss == 0) return 100;
+        if (avgGain == 0) return 0;
 
-        return 100 - 100 / (1 + gain / loss);
+        return 100 - 100 / (1 + avgGain / avgLoss);
     }
 
     private decimal SafeATR(List<Candle> candles, int period)
