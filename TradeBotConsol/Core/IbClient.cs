@@ -34,6 +34,12 @@ public class IbClient : EWrapper, IBroker
     // NEW: track filled orderIds to prevent double-fire between orderStatus and execDetails
     private readonly ConcurrentDictionary<int, bool> _filledOrders = new();
 
+    // ── Bid/Ask spread tracking — fields 1 (BID) and 2 (ASK) ──
+    // Stored per symbol so SimulatedBroker can check spread before entering a trade.
+    // Both must be positive before UpdateBidAsk is called to avoid partial/stale data.
+    private readonly ConcurrentDictionary<string, decimal> _latestBid = new();
+    private readonly ConcurrentDictionary<string, decimal> _latestAsk = new();
+
     public IbClient(SimulatedBroker broker)
     {
         _signal = new EReaderMonitorSignal();
@@ -212,12 +218,31 @@ public class IbClient : EWrapper, IBroker
 
     // FIX: was processing all tick fields (bid, ask, last).
     // Now filters to field 4 (LAST traded price) only so candles reflect real trades.
+    // Fields 1 (BID) and 2 (ASK) are also captured for the spread filter.
     public void tickPrice(int tickerId, int field, double price, TickAttrib attribs)
     {
         if (!_reqIdToSymbol.TryGetValue(tickerId, out string symbol)) return;
         if (price <= 0) return;
 
-        // field 4 = LAST traded price. Ignore bid (1) and ask (2).
+        // field 1 = BID, field 2 = ASK — store for spread filter
+        if (field == 1)
+        {
+            _latestBid[symbol] = (decimal)price;
+            // If we already have a valid ask, push both to the broker
+            if (_latestAsk.TryGetValue(symbol, out decimal ask) && ask > 0)
+                _broker.UpdateBidAsk(symbol, (decimal)price, ask);
+            return;
+        }
+        if (field == 2)
+        {
+            _latestAsk[symbol] = (decimal)price;
+            // If we already have a valid bid, push both to the broker
+            if (_latestBid.TryGetValue(symbol, out decimal bid) && bid > 0)
+                _broker.UpdateBidAsk(symbol, bid, (decimal)price);
+            return;
+        }
+
+        // field 4 = LAST traded price. Ignore all other fields.
         if (field != 4) return;
 
         _tickVolume.TryGetValue(symbol, out long vol);

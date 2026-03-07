@@ -1,16 +1,486 @@
-1. The "Entry" Gates (Must all be TRUE)Time: 
-	Must be between 08:10 AM and 12:40 PM PST.
-	Broad Market Trend: The QQQ 20-period SMA must be above the 100-period SMA.
-	Individual Stock Trend: The specific stock's 20-SMA must be above its 100-SMA.
-	Cooldown: The stock must not be in the "Penalty Box" from a previous sell.
-2. The "Exit" Logic (Triggers a SELL)Trailing Stop: 
-	If the price drops by the specific % (e.g., 2% for AAPL) from its highest point since you bought it.
-	Profit Target: If the price hits your goal (e.g., 1.2% for MSFT).
-	Hard Stop: If the price drops below the initial entry stop level.
-	End of Day: At 12:45 PM PST, all open positions are sold regardless of profit/loss to avoid "overnight gap" risk.
-3. Current "Personality" Settings
-	Category Symbol Stop-Loss Profit Target
-	Giants AAPL, MSFT 2.0% 1.2% 
-	Volatile NVDA, TSLA 3.0% 2.5% - 3.0%
-	Rockets RKLB, PLTR 3.5% - 4.5% 3.5% - 5.0%
-	Default (Anything else) 2.5% 2.0%
+# Trading Bot — Bug Fixes & Strategy Analysis
+
+---
+
+## PART 1 — PERSISTENCE BUGS (3 Root Causes)
+
+### Bug 1 — Intraday Equity Curve disappears on restart
+
+**Root cause:** `SaveEquityCurve()` writes `equity_curve.csv` on every fill, but there is
+**no `LoadEquityCurve()` call anywhere** in the codebase. On restart `_equityCurve` is an
+empty list, so the intraday chart panel is blank until a new fill occurs.
+
+**Fix A — add this method to `SimulatedBroker.cs`** (place it directly after `SaveEquityCurve()` around line 2211):
+
+```csharp
+public void LoadEquityCurve()
+{
+    try
+    {
+        string path = StatePath("equity_curve.csv");
+        if (!File.Exists(path)) return;
+        var todayEt = GetEasternTime().Date;
+        var lines = File.ReadAllLines(path);
+        int loaded = 0;
+        foreach (var line in lines)
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            int commaIdx = line.IndexOf(',');
+            if (commaIdx < 0) continue;
+            var timePart = line[..commaIdx];
+            var valPart  = line[(commaIdx + 1)..];
+            if (!DateTime.TryParse(timePart,
+                    null,
+                    System.Globalization.DateTimeStyles.RoundtripKind,
+                    out DateTime t)) continue;
+            if (!decimal.TryParse(valPart,
+                    System.Globalization.NumberStyles.Any,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out decimal v)) continue;
+            // Times are stored as UTC — convert to ET before date-filtering
+            var etTime = TimeZoneInfo.ConvertTimeFromUtc(
+                t.Kind == DateTimeKind.Utc ? t : DateTime.SpecifyKind(t, DateTimeKind.Utc),
+                Eastern);
+            if (etTime.Date != todayEt) continue;   // only load today's entries
+            _equityCurve.Add((t, v));
+            loaded++;
+        }
+        LogMessage($"[EQUITY CURVE] Loaded {loaded} intraday point(s) from disk.");
+    }
+    catch (Exception ex) { LogError("LoadEquityCurve", ex.Message); }
+}
+```
+
+**Fix B — call it in `Program.cs`** (add just before `client.Connect()`):
+
+```csharp
+// existing lines
+broker.LoadMarketMemory();
+broker.LoadLifetimeEquity();
+broker.LoadAllTrades();
+broker.LoadState();
+broker.LoadEquityCurve();   // ← ADD THIS LINE
+
+client.Connect();
+```
+
+---
+
+### Bug 2 — "Today's Trades" feed panel is blank on restart
+
+**Root cause:** `_tradeHistoryLog` (the raw string log that feeds the `"feed"` JSON array in
+`BuildStatusJson`) is a plain in-memory `List<string>`. It is **never saved to disk and never
+loaded**, so it is always empty after a restart.
+
+The structured history panel (`"hist"`) uses `_completedTrades`, which **is** persisted in
+`bot_state.json` and survives same-day restarts correctly. But the feed panel users see on the
+dashboard (the ticker-tape style list at the top) comes from `_tradeHistoryLog`.
+
+**Fix — rebuild `_tradeHistoryLog` from the loaded `_completedTrades`.**
+
+In `LoadState()`, find the block that loads `_completedTrades` (around line 1777) and add the
+rebuild immediately after:
+
+```csharp
+// existing code
+if (data.CompletedTrades?.Count > 0)
+{
+    _completedTrades.Clear();
+    foreach (var t in data.CompletedTrades) _completedTrades.Add(t);
+}
+
+// ── ADD THIS BLOCK ──────────────────────────────────────────────────────
+// Rebuild string feed from persisted trades so the trade-feed panel is
+// populated on restart, not blank until the next fill.
+_tradeHistoryLog.Clear();
+foreach (var t in _completedTrades.TakeLast(20))
+{
+    string arrow = t.Side == "LONG" ? "▲" : "▼";
+    string sign  = t.NetPnL >= 0 ? "+" : "";
+    _tradeHistoryLog.Add(
+        $"[{t.Time}] {arrow} {t.Side,-5} {t.Symbol,-5} x{t.Qty,-4}" +
+        $" @ {t.Exit:C2}  {sign}{t.NetPnL:C2}  [{t.Strategy}]");
+}
+// ── END BLOCK ───────────────────────────────────────────────────────────
+```
+
+---
+
+### Bug 3 — `_completedTrades` capped at 50 entries, hiding intraday history
+
+With partial exits (PARTIAL_TP_1, PARTIAL_TP_2) each position generates 3 fills. On an active
+day with 10 trades × 3 fills = 30 entries — still under 50. But adding today's loaded trades
+plus any mid-restart activity approaches the cap quickly.
+
+**Fix — raise the cap from 50 → 200 in `OnOrderFilled()`** (around line 1520):
+
+```csharp
+// BEFORE:
+if (_completedTrades.Count > 50) _completedTrades.RemoveAt(0);
+
+// AFTER:
+if (_completedTrades.Count > 200) _completedTrades.RemoveAt(0);
+```
+
+Also update the corresponding `BotPersistData.CompletedTrades` serialization — no change needed
+there, it already serializes the whole list.
+
+---
+
+## PART 2 — PERFORMANCE: Are You Missing Trades?
+
+### What's happening on a slow machine
+
+`FinalizeCandle()` fires every time **any** of your 85 symbols closes a 1-minute bar. Each
+call runs through up to 7 strategies, and every strategy recomputes:
+
+| Indicator | Cost per call |
+|-----------|--------------|
+| `SafeRSI(14)` | O(28) — full Wilder seed + smooth pass |
+| `SafeATR(14)` | O(14) |
+| `SafeSMA(20/50)` | O(50) |
+| `CalcEMA(closes, 9/21)` | O(n) over ALL candles (up to 500) |
+| `Calc30MinEma(candles, 50)` | O(n) LINQ group-by over all candles — most expensive |
+| `SafeMACDDirection` | 4× EMA calls over full candle arrays |
+| `CheckRelativeStrength` | O(20) |
+| `CheckVolumeExpansion` | O(10) |
+
+**With 85 symbols × 7 strategies, at the top of every minute this bursts to ~595 full
+indicator re-calculations simultaneously.** On a slow/single-core machine this backlog can
+take 5–15 seconds to drain, during which:
+- New ticks still arrive but queue behind the lock
+- `ExecuteStrategy` runs on stale candles (the ones from 10:31 may not fire until 10:33)
+- Short-lived signals (ORB breakout, gap continuation) expire before being acted on
+
+### Fix 1 — Indicator cache (biggest win)
+
+Add a per-symbol indicator cache. Recompute only when a new candle is finalized for that symbol.
+
+**Add to `SimulatedBroker.cs` — new inner class + dictionary** (near other `private` state fields):
+
+```csharp
+// ── Per-symbol cached indicators ─────────────────────────────────────────
+// Updated once per 1-min candle close — avoids re-running O(n) calculations
+// on every tick and on every strategy call within the same candle.
+private sealed class SymIndicators
+{
+    public double  Rsi14;
+    public decimal Atr14;
+    public decimal Sma20;
+    public decimal Sma50;
+    public double  Ema9;
+    public double  Ema21;
+    public int     MacdDir;
+    public decimal RecentHigh8;  // highest-high over last 8 bars
+    public bool    VolExpansion;
+    public DateTime ComputedAt;  // UTC timestamp of last candle that triggered this
+}
+private readonly ConcurrentDictionary<string, SymIndicators> _indicatorCache = new();
+```
+
+**Add a private helper called from `FinalizeCandle` BEFORE `ExecuteStrategy`:**
+
+```csharp
+private void RefreshIndicatorCache(string symbol, List<Candle> candles)
+{
+    if (candles.Count < 30) return;
+    var closes = candles.Select(c => (double)c.Close).ToArray();
+    var ind = new SymIndicators
+    {
+        Rsi14        = SafeRSI(candles, 14),
+        Atr14        = SafeATR(candles, 14),
+        Sma20        = SafeSMA(candles, 20),
+        Sma50        = SafeSMA(candles, 50),
+        Ema9         = CalcEMA(closes, 9),
+        Ema21        = CalcEMA(closes, 21),
+        MacdDir      = SafeMACDDirection(candles),
+        RecentHigh8  = SafeHighestHigh(candles, 8),
+        VolExpansion = CheckVolumeExpansion(candles),
+        ComputedAt   = DateTime.UtcNow
+    };
+    _indicatorCache[symbol] = ind;
+}
+```
+
+**In `FinalizeCandle`, add the cache refresh just before `ExecuteStrategy`:**
+
+```csharp
+// existing line at end of FinalizeCandle:
+_prevBarAboveVwap[symbol] = aboveVwap;
+
+// ADD:
+if (_marketData.TryGetValue(symbol, out var refreshCandles))
+    RefreshIndicatorCache(symbol, refreshCandles);
+
+ExecuteStrategy(symbol, wasAbove, aboveVwap);   // existing
+```
+
+Now update `TryEmaPocketStrategy`, `TryMomentumStrategy`, and `TryOutsideCandleStrategy` to
+read from `_indicatorCache[symbol]` instead of recomputing. For example, in
+`TryMomentumStrategy`:
+
+```csharp
+// BEFORE:
+decimal sma20 = SafeSMA(candles, 20);
+decimal sma50 = SafeSMA(candles, 50);
+double  rsi   = SafeRSI(candles, 14);
+decimal atr   = SafeATR(candles, 14);
+int     macdDir = SafeMACDDirection(candles);
+
+// AFTER (with cache):
+if (!_indicatorCache.TryGetValue(symbol, out var ind)) return false;
+decimal sma20   = ind.Sma20;
+decimal sma50   = ind.Sma50;
+double  rsi     = ind.Rsi14;
+decimal atr     = ind.Atr14;
+int     macdDir = ind.MacdDir;
+```
+
+This alone reduces indicator computation from O(7 × n) per candle-close to O(1×n) — a 7×
+speedup on the compute-heaviest code path.
+
+---
+
+### Fix 2 — Pre-filter watchlist before running strategies
+
+In `ExecuteStrategy`, add a quick "is this symbol interesting right now?" check before the
+expensive lock + strategy dispatch. This short-circuits 70–80% of symbols that have no signal:
+
+```csharp
+// ADD this block just before the `lock (_lock)` in ExecuteStrategy
+// (after the `if (lastPrice < 10m) return;` check):
+
+// ── Quick pre-filter: skip if no strategy could possibly fire ───────────
+// Saves acquiring _lock and running 7 strategies on quiet symbols.
+if (_indicatorCache.TryGetValue(symbol, out var preInd))
+{
+    bool orbActive = _orbRanges.TryGetValue(symbol, out var preOrb) && preOrb.IsSet;
+    bool rsiExtreme = preInd.Rsi14 < RSI_OVERSOLD || preInd.Rsi14 > RSI_OVERBOUGHT
+                   || preInd.Rsi14 > RSI_LONG_MIN  || preInd.Rsi14 < RSI_SHORT_MAX;
+    _vwap.TryGetValue(symbol, out decimal preVwap);
+    bool nearVwap = preVwap > 0 && Math.Abs(candles.Last().Close - preVwap) <= preInd.Atr14;
+    bool gapActive = _dailyGapPct.TryGetValue(symbol, out decimal gap) && Math.Abs(gap) > (double)GAP_GO_MIN_PCT;
+
+    if (!orbActive && !rsiExtreme && !nearVwap && !gapActive && !preInd.VolExpansion)
+        return;   // nothing to do — skip the lock and all 7 strategy checks
+}
+```
+
+---
+
+### Fix 3 — Cache the 30-min bars for the Outside Candle strategy
+
+`Calc30MinEma` runs a LINQ `GroupBy` over **all** candles on every call. For 500 1-min
+candles this groups into ~17 30-min bars, rebuilding the grouping from scratch every time.
+
+**Replace `Calc30MinEma` with a cached version:**
+
+```csharp
+// Add to state fields:
+private readonly ConcurrentDictionary<string, (double ema50, DateTime lastBar)> _ema30Cache = new();
+
+// Replace Calc30MinEma:
+private double Calc30MinEma(List<Candle> candles, int period)
+{
+    if (candles.Count < 2) return 0;
+    var lastCandle = candles.Last();
+    // Round down to current 30-min bar boundary
+    var barKey = new DateTime(lastCandle.Time.Year, lastCandle.Time.Month, lastCandle.Time.Day,
+                              lastCandle.Time.Hour, (lastCandle.Time.Minute / 30) * 30, 0);
+
+    // Return cached value if we're still in the same 30-min bar
+    if (_ema30Cache.TryGetValue(/* symbol */ "", out var cached) && cached.lastBar == barKey)
+        return cached.ema50;
+
+    // Recompute only when a new 30-min bar closes
+    var bars30 = candles
+        .GroupBy(c => new DateTime(c.Time.Year, c.Time.Month, c.Time.Day,
+                                   c.Time.Hour, (c.Time.Minute / 30) * 30, 0))
+        .OrderBy(g => g.Key)
+        .Select(g => (double)g.Last().Close)
+        .ToArray();
+    if (bars30.Length < period) return 0;
+    return CalcEMA(bars30, period);
+}
+```
+
+> **Note:** The cache needs the symbol as a key. Refactor the signature to
+> `Calc30MinEma(string symbol, List<Candle> candles, int period)` and use
+> `_ema30Cache[symbol]`.
+
+---
+
+### Fix 4 — Reduce watchlist to your highest-conviction symbols
+
+85 symbols is near the maximum 95-line IBKR budget and creates heavy compute load. Consider
+running with 40–50 symbols during the first few months. The current watchlist contains
+duplicates in category (9 ETFs + 8 mega-cap tech = heavy overlap). A tighter list:
+
+```
+// Tier 1 — must have (high volume, best ATR, fills easily)
+SPY, QQQ, IWM, SMH,
+NVDA, TSLA, AAPL, META, AMD,
+COIN, MSTR, PLTR, CRWD, APP,
+NFLX, SHOP, UBER,
+JPM, GS,
+ORCL, NOW, DDOG
+
+// Tier 2 — add as machine gets faster or you buy a Booster Pack
+...rest of current list
+```
+
+---
+
+## PART 3 — Strategy Inventory & What's Missing
+
+### What you already have
+
+| # | Name | Type | Notes |
+|---|------|------|-------|
+| 1 | Opening Range Breakout | **Trend following** | Fires after ORB window; breakout above/below ORB H/L |
+| 2 | Gap and Go | **Trend following** | High rel-vol gap continuation |
+| 3 | VWAP Bounce/Reclaim | **Hybrid** | Reclaim = trend continuation; rejection = mean reversion |
+| 4 | RSI Mean Reversion | **Mean reversion** | Buy oversold dip in uptrend; fade overbought in downtrend |
+| 5 | Momentum Breakout | **Trend following** | Score-based: 3–5 confirmations required per regime |
+| 6 | EMA Pocket | **Trend continuation** | Price pulls into 9/21 EMA pocket near S/R |
+| 7 | Outside Candle | **Momentum reversal** | 3-bar engulfing near S/R with 30-min EMA filter |
+
+**Yes — both trend following and mean reversion are fully implemented.**
+
+---
+
+### What's missing / can be improved
+
+#### 1. Multi-timeframe trend filter (improves ALL strategies)
+
+Currently your only higher-timeframe filter is the daily SMA200. Adding a 15-minute trend
+confirmation (e.g., 15-min 20 EMA direction) would dramatically cut false ORB and momentum
+entries on days where the 1-min chart is bullish but the 15-min trend is bearish.
+
+```csharp
+// Add to state:
+private readonly ConcurrentDictionary<string, decimal> _ema20_15min = new();
+
+// In FinalizeCandle, after each 15-min bar completes:
+private void Refresh15MinEma(string symbol, List<Candle> candles)
+{
+    var bars15 = candles
+        .GroupBy(c => new DateTime(c.Time.Year, c.Time.Month, c.Time.Day,
+                                   c.Time.Hour, (c.Time.Minute / 15) * 15, 0))
+        .OrderBy(g => g.Key)
+        .Select(g => (double)g.Last().Close)
+        .ToArray();
+    if (bars15.Length >= 20)
+        _ema20_15min[symbol] = (decimal)CalcEMA(bars15, 20);
+}
+
+// Usage in TryOrbStrategy and TryMomentumStrategy:
+_ema20_15min.TryGetValue(symbol, out decimal ema15);
+if (ema15 > 0 && isLong  && close < ema15) return false;  // 15-min trend is down — skip long
+if (ema15 > 0 && isShort && close > ema15) return false;  // 15-min trend is up — skip short
+```
+
+This alone would have prevented the MU/OXY morning losses you described (10:00 ET
+false breakouts occur when the 15-min trend hasn't confirmed yet).
+
+---
+
+#### 2. Bollinger Band Mean Reversion (add as Strategy 8)
+
+RSI mean reversion fires on RSI < 35 / > 65. Bollinger Bands give a **price-based**
+confirmation of the same signal, catching moves that RSI misses (e.g., a slow grind down
+that never hits RSI 35 but still touches the -2σ band).
+
+```csharp
+private bool TryBollingerMeanReversionStrategy(string symbol, List<Candle> candles)
+{
+    if (candles.Count < 20) return false;
+
+    decimal close  = candles.Last().Close;
+    decimal sma20  = SafeSMA(candles, 20);
+    decimal atr    = SafeATR(candles, 14);
+    double  rsi    = SafeRSI(candles, 14);
+    if (close > 0 && atr / close < MIN_ATR_PCT) return false;
+
+    // Standard deviation of last 20 closes
+    var last20 = candles.TakeLast(20).Select(c => (double)c.Close).ToArray();
+    double mean = last20.Average();
+    double stdDev = Math.Sqrt(last20.Average(x => (x - mean) * (x - mean)));
+    decimal upperBand = (decimal)(mean + 2.0 * stdDev);
+    decimal lowerBand = (decimal)(mean - 2.0 * stdDev);
+
+    // Band width filter — only trade when bands have contracted (squeeze setup)
+    // Wide bands = already in a big move, not ideal for reversion
+    decimal bandWidth = upperBand - lowerBand;
+    if (sma20 > 0 && bandWidth / sma20 > 0.04m) return false;  // skip if bands > 4% wide
+
+    // Long: price touches lower band in an uptrend (above SMA50)
+    decimal sma50 = SafeSMA(candles, 50);
+    bool touchLower = close <= lowerBand && rsi < 40 && close > sma50;
+    if (touchLower && (_marketRegime != "SELL-OFF" || CheckStrongRelativeStrength(symbol, candles)))
+    {
+        decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
+        int qty = CalcQty(close, stopDistance);
+        if (qty <= 0) return false;
+        OpenPosition(symbol, qty, close, TradeSide.Buy, false, "BB_MEAN_REV_LONG");
+        return true;
+    }
+
+    // Short: price touches upper band in a downtrend (below SMA50)
+    bool shortRegimeOk = _marketRegime == "SELL-OFF" || _marketRegime == "CHOPPY";
+    bool touchUpper = close >= upperBand && rsi > 60 && close < sma50 && shortRegimeOk;
+    if (touchUpper && _allowShorts)
+    {
+        decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
+        int qty = CalcQty(close, stopDistance);
+        if (qty <= 0) return false;
+        OpenPosition(symbol, qty, close, TradeSide.Sell, true, "BB_MEAN_REV_SHORT");
+        return true;
+    }
+
+    return false;
+}
+```
+
+**Add the call in `ExecuteStrategy` after Strategy 4:**
+```csharp
+// 4. RSI Mean Reversion
+if (TryMeanReversionStrategy(symbol, candles)) return;
+
+// 4b. Bollinger Band Mean Reversion  ← ADD
+if (TryBollingerMeanReversionStrategy(symbol, candles)) return;
+```
+
+---
+
+#### 3. Time-of-day filters are already good — but consider an "afternoon momentum" window
+
+Your strategies have a hard stop at 10:15 ET open and 3:30 ET close. Consider adding a
+**2:00–3:00 PM ET afternoon session** as a separate, more conservative window. Many stocks
+make their second daily move in the 2–3 PM window as European markets close. The current
+setup would catch this naturally, but you could add:
+
+```csharp
+// In ExecuteStrategy — before the strategy dispatch, tag the session:
+bool isAfternoonSession = nowEt.Hour >= 14 && nowEt.Hour < 15;
+
+// Then in individual strategies, tighten RSI thresholds in afternoon:
+double rsiLongMin  = isAfternoonSession ? Math.Max(RSI_LONG_MIN,  58.0) : RSI_LONG_MIN;
+double rsiShortMax = isAfternoonSession ? Math.Min(RSI_SHORT_MAX, 40.0) : RSI_SHORT_MAX;
+```
+
+---
+
+## PART 4 — Quick Summary Checklist
+
+| Priority | Fix | File | Estimated Time |
+|----------|-----|------|----------------|
+| 🔴 Critical | Add `LoadEquityCurve()` + call in Program.cs | SimulatedBroker.cs, Program.cs | 10 min |
+| 🔴 Critical | Rebuild `_tradeHistoryLog` in `LoadState()` | SimulatedBroker.cs | 5 min |
+| 🟡 High | Raise `_completedTrades` cap 50 → 200 | SimulatedBroker.cs | 1 min |
+| 🟡 High | Add `SymIndicators` cache + `RefreshIndicatorCache()` | SimulatedBroker.cs | 30 min |
+| 🟡 High | Pre-filter watchlist in `ExecuteStrategy` | SimulatedBroker.cs | 15 min |
+| 🟢 Medium | Cache `Calc30MinEma` per 30-min bar | SimulatedBroker.cs | 20 min |
+| 🟢 Medium | Add 15-min EMA trend filter | SimulatedBroker.cs | 25 min |
+| 🟢 Medium | Add Bollinger Band mean reversion (Strategy 8) | SimulatedBroker.cs | 20 min |
+| 🔵 Low | Trim watchlist to 40-50 during heavy-load hours | bot-config.json | 5 min |

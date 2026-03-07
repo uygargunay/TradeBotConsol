@@ -18,6 +18,7 @@ class Program
         broker.LoadLifetimeEquity();
         broker.LoadAllTrades();
         broker.LoadState();
+        broker.LoadEquityCurve();   // restores intraday equity chart after restart
 
         try
         {

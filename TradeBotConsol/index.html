@@ -170,8 +170,8 @@
         /* ── MAIN GRID ── */
         #main {
             display: grid;
-            grid-template-columns: 240px 1fr 1fr 310px;
-            grid-template-rows: 190px 1fr;
+            grid-template-columns: 240px 1fr 1fr 330px;
+            grid-template-rows: 160px 1fr;
             gap: 7px;
             padding: 7px;
             flex: 1;
@@ -466,7 +466,7 @@
             #ep canvas {
                 display: block;
                 width: 100% !important;
-                height: 128px !important;
+                height: 100px !important;
             }
 
         /* PORTFOLIO GROWTH */
@@ -486,7 +486,7 @@
         /* POSITIONS */
         #posp {
             grid-column: 4;
-            grid-row: 1
+            grid-row: 1 / 3
         }
 
         .pc {
@@ -606,7 +606,7 @@
 
         /* SCANNER */
         #sp {
-            grid-column: 1/-1;
+            grid-column: 1 / 4;
             grid-row: 2
         }
 
@@ -1412,6 +1412,160 @@
             font-size: 13px;
             font-weight: 700
         }
+
+        /* ── SELL BUTTON on position cards ── */
+        .pc-sell-btn {
+            background: none;
+            border: 1px solid rgba(248,81,73,.4);
+            color: var(--red);
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-size: 10px;
+            font-weight: 700;
+            cursor: pointer;
+            letter-spacing: .3px;
+            transition: background .15s, border-color .15s;
+            flex-shrink: 0;
+        }
+
+            .pc-sell-btn:hover {
+                background: rgba(248,81,73,.15);
+                border-color: var(--red);
+            }
+
+            /* Amber state: bot already submitted an exit that hasn't filled yet */
+            .pc-sell-btn.exit-pending {
+                border-color: rgba(210,153,34,.6);
+                color: #d2991f;
+            }
+
+                .pc-sell-btn.exit-pending:hover {
+                    background: rgba(210,153,34,.15);
+                    border-color: #d2991f;
+                }
+
+        /* ── LIQUIDATE ALL button in positions panel header ── */
+        .liq-all-btn {
+            background: none;
+            border: 1px solid rgba(248,81,73,.35);
+            color: var(--red);
+            border-radius: 4px;
+            padding: 2px 9px;
+            font-size: 9px;
+            font-weight: 700;
+            cursor: pointer;
+            letter-spacing: .3px;
+            text-transform: uppercase;
+            transition: background .15s, border-color .15s;
+            flex-shrink: 0;
+        }
+
+            .liq-all-btn:hover {
+                background: rgba(248,81,73,.15);
+                border-color: var(--red);
+            }
+
+        /* ── CONFIRM SELL / LIQUIDATE modal ── */
+        #confirm-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,.72);
+            z-index: 1100;
+            align-items: center;
+            justify-content: center;
+        }
+
+            #confirm-overlay.open {
+                display: flex;
+            }
+
+        #confirm-modal {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            width: 340px;
+            padding: 22px 24px 18px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            box-shadow: 0 24px 60px rgba(0,0,0,.6);
+        }
+
+        .cm-title {
+            font-size: 14px;
+            font-weight: 800;
+            color: var(--text);
+        }
+
+        .cm-sub {
+            font-size: 11px;
+            color: var(--muted);
+            margin-top: -8px;
+        }
+
+        .cm-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .cm-pw {
+            flex: 1;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 5px;
+            color: var(--text);
+            font-size: 12px;
+            padding: 6px 10px;
+            outline: none;
+        }
+
+            .cm-pw:focus {
+                border-color: var(--blue);
+            }
+
+        .cm-confirm-btn {
+            background: rgba(248,81,73,.15);
+            border: 1px solid var(--red);
+            color: var(--red);
+            border-radius: 5px;
+            padding: 6px 14px;
+            font-size: 12px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: background .15s;
+        }
+
+            .cm-confirm-btn:hover {
+                background: rgba(248,81,73,.3);
+            }
+
+            .cm-confirm-btn:disabled {
+                opacity: .5;
+                cursor: not-allowed;
+            }
+
+        .cm-cancel-btn {
+            background: none;
+            border: 1px solid var(--border);
+            color: var(--muted);
+            border-radius: 5px;
+            padding: 6px 14px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: color .15s, border-color .15s;
+        }
+
+            .cm-cancel-btn:hover {
+                color: var(--text);
+                border-color: var(--subtle);
+            }
+
+        .cm-note {
+            font-size: 10px;
+            min-height: 14px;
+        }
     </style>
 </head>
 <body>
@@ -1419,8 +1573,8 @@
 
     <!-- TOPBAR -->
     <div id="top">
-        <h1>📈 IBKR BOT</h1>
-        <div class="tsep"></div>
+        <!--<h1>📈 IBKR BOT</h1>
+        <div class="tsep"></div>-->
         <div id="status"><span class="dot wait" id="sdot"></span><span id="stxt" style="color:var(--yellow)">Connecting…</span></div>
         <span id="regime">—</span>
         <div class="tsep"></div>
@@ -1458,6 +1612,22 @@
         </div>
     </div>
 
+    <!-- CONFIRM SELL / LIQUIDATE MODAL -->
+    <div id="confirm-overlay" onclick="if(event.target===this)closeConfirm()">
+        <div id="confirm-modal">
+            <div class="cm-title" id="cm-title">Confirm Action</div>
+            <div class="cm-sub" id="cm-sub">Enter your settings password to proceed.</div>
+            <div class="cm-row">
+                <input type="password" class="cm-pw" id="cm-password"
+                       placeholder="Password" autocomplete="current-password"
+                       onkeydown="if(event.key==='Enter')submitConfirm();if(event.key==='Escape')closeConfirm()">
+                <button class="cm-confirm-btn" id="cm-confirm-btn" onclick="submitConfirm()">Confirm</button>
+                <button class="cm-cancel-btn" onclick="closeConfirm()">Cancel</button>
+            </div>
+            <div class="cm-note r" id="cm-note"></div>
+        </div>
+    </div>
+
     <!-- LAYOUT FLEX: main + detail side by side on desktop -->
     <div id="layout">
 
@@ -1490,7 +1660,7 @@
             <!-- EQUITY CURVE -->
             <div class="panel" id="ep">
                 <div class="ph">Equity Curve <span class="m" style="font-weight:400;font-size:8px">today</span></div>
-                <div class="pb"><canvas id="ec" style="width:100%;height:128px"></canvas></div>
+                <div class="pb"><canvas id="ec" style="width:100%;height:100px"></canvas></div>
             </div>
 
             <!-- PORTFOLIO GROWTH (lifetime) -->
@@ -1510,7 +1680,7 @@
                     </div>
                 </div>
                 <div class="pb" style="padding:5px 9px 8px">
-                    <canvas id="pg-chart" style="display:block;width:100%!important;height:128px!important"></canvas>
+                    <canvas id="pg-chart" style="display:block;width:100%!important;height:100px!important"></canvas>
                     <div id="pg-empty" class="m" style="display:none;text-align:center;padding:30px 0;font-size:10px">Needs 2+ trading days to draw a chart</div>
                 </div>
             </div>
@@ -1518,7 +1688,7 @@
             <!-- POSITIONS + TRADE HISTORY (tabbed) -->
             <div class="panel" id="posp">
                 <div class="ph" style="padding:0;gap:0">
-                    <div id="pos-tab-bar" style="display:flex;width:100%">
+                    <div id="pos-tab-bar" style="display:flex;width:100%;align-items:stretch">
                         <div id="tab-pos" onclick="switchPosTab('pos')"
                              style="flex:1;padding:6px 11px;cursor:pointer;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--blue);border-bottom:2px solid var(--blue);transition:color .15s">
                             Open Positions <span id="pcnt" class="m" style="color:var(--muted)">0</span>
@@ -1530,6 +1700,9 @@
                         <div id="tab-allhist" onclick="switchPosTab('allhist')"
                              style="flex:1;padding:6px 11px;cursor:pointer;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--muted);border-bottom:2px solid transparent;transition:color .15s">
                             All-time <span id="ahcnt" class="m">0</span>
+                        </div>
+                        <div style="display:flex;align-items:center;padding:0 8px;border-bottom:2px solid transparent">
+                            <button class="liq-all-btn" id="liq-all-btn" onclick="liquidateAll()" style="display:none">⚠ Liquidate All</button>
                         </div>
                     </div>
                 </div>
@@ -2173,24 +2346,24 @@
                 const atrC = w.atr >= 0.4 ? 'g' : w.atr >= 0.2 ? 'y' : 'm';
                 const isSelected = w.s === selectedSym;
                 return `<tr class="${w.hot ? 'hot' : ''} ${isSelected ? 'selected' : ''}" onclick="onSymClick('${w.s}')">
-                                                              <td><div class="sym-cell">${w.hot ? '<span class="hot-arrow">►</span>' : ''}<span>${w.s}</span></div></td>
-                                                              <td class="tr ${pC}">$${w.price.toFixed(2)}</td>
-                                                              <td class="tr ${(w.chg ?? 0) >= 0 ? 'g' : 'r'}" style="font-weight:700">${w.chg != null && w.chg !== 0 ? (w.chg >= 0 ? '+' : '') + w.chg.toFixed(2) + '%' : '<span class="m">—</span>'}</td>
-                                                              <td class="tr m">$${w.vwap > 0 ? w.vwap.toFixed(2) : '—'}</td>
-                                                              <td class="tr ${s20C}">$${w.sma20 > 0 ? w.sma20.toFixed(2) : '—'}</td>
-                                                              <td class="tr ${s50C}">$${w.sma50 > 0 ? w.sma50.toFixed(2) : '—'}</td>
-                                                              <td class="tc">${sma200Badge(w.price, w.sma200)}</td>
-                                                              <td class="tc">${macdBadge(w.macd)}</td>
-                                                              <td class="tr">${rsiHtml(w.rsi)}</td>
-                                                              <td class="tr ${gC}">${w.gap !== 0 ? pct(w.gap) : '<span class="m">—</span>'}</td>
-                                                              <td class="tr m">${volFmt(w.vol)}</td>
-                                                              <td class="tr ${atrC}">${w.atr.toFixed(2)}%</td>
-                                                              <td class="tr m">${oHi}</td>
-                                                              <td class="tr m">${oLo}</td>
-                                                              <td class="tc">${trH}</td>
-                                                              <td class="tc"><span class="led" style="background:${ledC}"></span></td>
-                                                              <td class="tc">${sigBadge(w.sig)}</td>
-                                                            </tr>`;
+                                                                      <td><div class="sym-cell">${w.hot ? '<span class="hot-arrow">►</span>' : ''}<span>${w.s}</span></div></td>
+                                                                      <td class="tr ${pC}">$${w.price.toFixed(2)}</td>
+                                                                      <td class="tr ${(w.chg ?? 0) >= 0 ? 'g' : 'r'}" style="font-weight:700">${w.chg != null && w.chg !== 0 ? (w.chg >= 0 ? '+' : '') + w.chg.toFixed(2) + '%' : '<span class="m">—</span>'}</td>
+                                                                      <td class="tr m">$${w.vwap > 0 ? w.vwap.toFixed(2) : '—'}</td>
+                                                                      <td class="tr ${s20C}">$${w.sma20 > 0 ? w.sma20.toFixed(2) : '—'}</td>
+                                                                      <td class="tr ${s50C}">$${w.sma50 > 0 ? w.sma50.toFixed(2) : '—'}</td>
+                                                                      <td class="tc">${sma200Badge(w.price, w.sma200)}</td>
+                                                                      <td class="tc">${macdBadge(w.macd)}</td>
+                                                                      <td class="tr">${rsiHtml(w.rsi)}</td>
+                                                                      <td class="tr ${gC}">${w.gap !== 0 ? pct(w.gap) : '<span class="m">—</span>'}</td>
+                                                                      <td class="tr m">${volFmt(w.vol)}</td>
+                                                                      <td class="tr ${atrC}">${w.atr.toFixed(2)}%</td>
+                                                                      <td class="tr m">${oHi}</td>
+                                                                      <td class="tr m">${oLo}</td>
+                                                                      <td class="tc">${trH}</td>
+                                                                      <td class="tc"><span class="led" style="background:${ledC}"></span></td>
+                                                                      <td class="tc">${sigBadge(w.sig)}</td>
+                                                                    </tr>`;
             }).join('');
         }
 
@@ -2244,8 +2417,11 @@
                 'GAP_GO_SHORT': 'Gap ↓',
                 'VWAP_BOUNCE_LONG': 'VWAP ↑',
                 'VWAP_BOUNCE_SHORT': 'VWAP ↓',
+                'VWAP_RECLAIM': 'VWAP Reclaim',
                 'MEAN_REV_LONG': 'MR ↑',
                 'MEAN_REV_SHORT': 'MR ↓',
+                'BB_MEAN_REV_LONG': 'BB MR ↑',
+                'BB_MEAN_REV_SHORT': 'BB MR ↓',
                 'MOMENTUM_LONG': 'Mom ↑',
                 'MOMENTUM_SHORT': 'Mom ↓',
                 'EMA_POCKET_LONG': 'EMA Pckt ↑',
@@ -2273,11 +2449,11 @@
             const sumColor = totalPnl >= 0 ? 'var(--green)' : 'var(--red)';
             const sumSign = totalPnl >= 0 ? '+' : '';
             hb.innerHTML = `
-                                                    <div style="display:flex;justify-content:space-between;align-items:center;padding:5px 2px 8px;border-bottom:1px solid var(--border);margin-bottom:8px">
-                                                        <span style="font-size:10px;color:var(--muted)">${totalTrades} trades · ${wins}W / ${losses}L · ${wr}% WR</span>
-                                                        <span style="font-size:13px;font-weight:800;color:${sumColor}">${sumSign}$${Math.abs(totalPnl).toFixed(2)}</span>
-                                                    </div>
-                                                    ${hist.map(t => {
+                                                            <div style="display:flex;justify-content:space-between;align-items:center;padding:5px 2px 8px;border-bottom:1px solid var(--border);margin-bottom:8px">
+                                                                <span style="font-size:10px;color:var(--muted)">${totalTrades} trades · ${wins}W / ${losses}L · ${wr}% WR</span>
+                                                                <span style="font-size:13px;font-weight:800;color:${sumColor}">${sumSign}$${Math.abs(totalPnl).toFixed(2)}</span>
+                                                            </div>
+                                                            ${hist.map(t => {
                 const pc = t.pnl >= 0 ? 'var(--green)' : 'var(--red)';
                 const ps = t.pnl >= 0 ? '+' : '';
                 const side = t.side === 'SHORT'
@@ -2286,15 +2462,15 @@
                 const entryToExit = `$${t.entry.toFixed(2)} → $${t.exit.toFixed(2)}`;
                 const held = t.min < 60 ? t.min + 'm' : (t.min / 60).toFixed(1) + 'h';
                 return `<div class="th-row">
-                                                            <div class="th-top">
-                                                                <span class="th-sym">${t.sym}</span>
-                                                                ${side}
-                                                                <span class="th-pnl" style="color:${pc}">${ps}$${Math.abs(t.pnl).toFixed(2)}</span>
-                                                            </div>
-                                                            <div class="th-mid">
-                                                                <span>${entryToExit} · x${t.qty} · ${held} · <span class="th-tag">${strategyLabel(t.strat)}</span> · ${exitReasonLabel(t.reason)} · ${t.time} ET</span>
-                                                            </div>
-                                                        </div>`;
+                                                                    <div class="th-top">
+                                                                        <span class="th-sym">${t.sym}</span>
+                                                                        ${side}
+                                                                        <span class="th-pnl" style="color:${pc}">${ps}$${Math.abs(t.pnl).toFixed(2)}</span>
+                                                                    </div>
+                                                                    <div class="th-mid">
+                                                                        <span>${entryToExit} · x${t.qty} · ${held} · <span class="th-tag">${strategyLabel(t.strat)}</span> · ${exitReasonLabel(t.reason)} · ${t.time} ET</span>
+                                                                    </div>
+                                                                </div>`;
             }).join('')}`;
         }
 
@@ -2326,9 +2502,9 @@
             const sumSign = totalPnl >= 0 ? '+' : '';
 
             let html = `<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 2px 8px;border-bottom:1px solid var(--border);margin-bottom:8px">
-                    <span style="font-size:10px;color:var(--muted)">${totalAll} trades · ${totalWins}W / ${totalAll - totalWins}L · ${totalWr}% WR (all-time)</span>
-                    <span style="font-size:13px;font-weight:800;color:${sumColor}">${sumSign}$${Math.abs(totalPnl).toFixed(2)}</span>
-                </div>`;
+                            <span style="font-size:10px;color:var(--muted)">${totalAll} trades · ${totalWins}W / ${totalAll - totalWins}L · ${totalWr}% WR (all-time)</span>
+                            <span style="font-size:13px;font-weight:800;color:${sumColor}">${sumSign}$${Math.abs(totalPnl).toFixed(2)}</span>
+                        </div>`;
 
             dates.forEach(date => {
                 const trades = byDate[date];
@@ -2337,10 +2513,10 @@
                 const dc = dayPnl >= 0 ? 'var(--green)' : 'var(--red)';
                 const ds = dayPnl >= 0 ? '+' : '';
                 html += `<div style="margin-bottom:12px">
-                        <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 2px 5px;border-bottom:1px solid var(--border);margin-bottom:5px">
-                            <span style="font-size:10px;font-weight:700;color:var(--muted)">${date}</span>
-                            <span style="font-size:11px;font-weight:800;color:${dc}">${ds}$${Math.abs(dayPnl).toFixed(2)} · ${dayWins}W/${trades.length - dayWins}L</span>
-                        </div>`;
+                                <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 2px 5px;border-bottom:1px solid var(--border);margin-bottom:5px">
+                                    <span style="font-size:10px;font-weight:700;color:var(--muted)">${date}</span>
+                                    <span style="font-size:11px;font-weight:800;color:${dc}">${ds}$${Math.abs(dayPnl).toFixed(2)} · ${dayWins}W/${trades.length - dayWins}L</span>
+                                </div>`;
                 trades.forEach(t => {
                     const pc = t.pnl >= 0 ? 'var(--green)' : 'var(--red)';
                     const ps = t.pnl >= 0 ? '+' : '';
@@ -2349,14 +2525,14 @@
                         : '<span class="pcside ls">LONG</span>';
                     const held = t.min < 60 ? t.min + 'm' : (t.min / 60).toFixed(1) + 'h';
                     html += `<div class="th-row">
-                            <div class="th-top">
-                                <span class="th-sym">${t.sym}</span>${side}
-                                <span class="th-pnl" style="color:${pc}">${ps}$${Math.abs(t.pnl).toFixed(2)}</span>
-                            </div>
-                            <div class="th-mid">
-                                <span>$${t.entry.toFixed(2)} → $${t.exit.toFixed(2)} · x${t.qty} · ${held} · <span class="th-tag">${strategyLabel(t.strat)}</span> · ${exitReasonLabel(t.reason)} · ${t.time} ET</span>
-                            </div>
-                        </div>`;
+                                    <div class="th-top">
+                                        <span class="th-sym">${t.sym}</span>${side}
+                                        <span class="th-pnl" style="color:${pc}">${ps}$${Math.abs(t.pnl).toFixed(2)}</span>
+                                    </div>
+                                    <div class="th-mid">
+                                        <span>$${t.entry.toFixed(2)} → $${t.exit.toFixed(2)} · x${t.qty} · ${held} · <span class="th-tag">${strategyLabel(t.strat)}</span> · ${exitReasonLabel(t.reason)} · ${t.time} ET</span>
+                                    </div>
+                                </div>`;
                 });
                 html += '</div>';
             });
@@ -2426,19 +2602,30 @@
 
             // Positions
             $('pcnt').textContent = d.positions.length;
+            window._lastPositions = d.positions;
             const pb = $('pbody');
+            const liqBtn = $('liq-all-btn');
+            if (liqBtn) liqBtn.style.display = d.positions.length > 0 ? '' : 'none';
             if (!d.positions.length) { pb.innerHTML = '<div class="nop m">No open positions</div>'; }
             else {
                 pb.innerHTML = d.positions.map(p => {
                     const pc = clr(p.unrl);
                     const pp = (p.pct >= 0 ? '+' : '') + p.pct.toFixed(2) + '%';
                     const [pbg, pfg] = p.unrl >= 0 ? ['var(--dg)', 'var(--green)'] : ['var(--dr)', 'var(--red)'];
+                    const pending = p.exitPending === true;
+                    const btnCls = pending ? 'pc-sell-btn exit-pending' : 'pc-sell-btn';
+                    const btnLabel = pending ? '⏳ Pending' : '✕ Sell';
+                    const btnTitle = pending ? `Exit pending for ${p.sym} — click to force new MKT order` : `Market sell ${p.sym}`;
                     return `<div class="pc">
-                                                                <div class="pct"><span class="pcsym">${p.sym}</span><span class="pcside ${p.side === 'LONG' ? 'ls' : 'ss'}">${p.side}</span></div>
-                                                                <div class="pcrow"><span class="m">Qty <b style="color:var(--text)">${p.qty}</b></span><span class="pcpnl ${pc}">${fmtS(p.unrl)}</span></div>
-                                                                <div class="pcrow"><span class="m">$${p.avg.toFixed(2)} → $${p.cur.toFixed(2)}</span><span class="ppill" style="background:${pbg};color:${pfg}">${pp}</span></div>
-                                                                <div class="pcm">${strategyLabel(p.strat)} · ${p.min.toFixed(0)}m held</div>
-                                                              </div>`;
+                                                                        <div class="pct">
+                                                                            <span class="pcsym">${p.sym}</span>
+                                                                            <span class="pcside ${p.side === 'LONG' ? 'ls' : 'ss'}">${p.side}</span>
+                                                                            <button class="${btnCls}" onclick="event.stopPropagation();sellPosition('${p.sym}')" title="${btnTitle}">${btnLabel}</button>
+                                                                        </div>
+                                                                        <div class="pcrow"><span class="m">Qty <b style="color:var(--text)">${p.qty}</b></span><span class="pcpnl ${pc}">${fmtS(p.unrl)}</span></div>
+                                                                        <div class="pcrow"><span class="m">$${p.avg.toFixed(2)} → $${p.cur.toFixed(2)}</span><span class="ppill" style="background:${pbg};color:${pfg}">${pp}</span></div>
+                                                                        <div class="pcm">${strategyLabel(p.strat)} · ${p.min.toFixed(0)}m held</div>
+                                                                      </div>`;
                 }).join('');
             }
 
@@ -2479,6 +2666,97 @@
         loadConfigFromAPI(); // pre-load config in background so settings modal is ready instantly
         poll();
         setInterval(poll, 1000);
+
+        // ══════════════════════════════════════════════════════════
+        //  SELL / LIQUIDATE — PASSWORD-PROTECTED MANUAL EXITS
+        // ══════════════════════════════════════════════════════════
+
+        // Pending action stored while the confirm modal is open.
+        let _pendingAction = null;  // { type: 'sell'|'liquidate', symbol?: string }
+
+        function sellPosition(sym) {
+            const pos = (window._lastPositions || []).find(p => p.sym === sym);
+            const isPending = pos && pos.exitPending;
+            _pendingAction = { type: 'sell', symbol: sym };
+            $('cm-title').textContent = isPending ? `⚠ Force Exit ${sym}` : `Sell ${sym} at Market`;
+            $('cm-sub').textContent = isPending
+                ? `An exit is already pending for ${sym}. This forces a new MKT order to ensure you get out now.`
+                : `This will submit a market exit order for your ${sym} position. Enter password to confirm.`;
+            $('cm-note').textContent = '';
+            $('cm-note').style.color = 'var(--red)';
+            $('cm-password').value = '';
+            $('cm-confirm-btn').disabled = false;
+            $('confirm-overlay').classList.add('open');
+            setTimeout(() => $('cm-password').focus(), 60);
+        }
+
+        function liquidateAll() {
+            _pendingAction = { type: 'liquidate' };
+            $('cm-title').textContent = '⚠ Liquidate All Positions';
+            $('cm-sub').textContent = 'This will submit market exit orders for ALL open positions immediately. Enter password to confirm.';
+            $('cm-note').textContent = '';
+            $('cm-password').value = '';
+            $('cm-confirm-btn').disabled = false;
+            $('confirm-overlay').classList.add('open');
+            setTimeout(() => $('cm-password').focus(), 60);
+        }
+
+        function closeConfirm() {
+            $('confirm-overlay').classList.remove('open');
+            $('cm-password').value = '';
+            $('cm-note').textContent = '';
+            _pendingAction = null;
+        }
+
+        async function submitConfirm() {
+            if (!_pendingAction) return;
+            const pw = $('cm-password').value;
+            if (!pw) {
+                $('cm-note').textContent = '⚠ Enter the settings password to confirm.';
+                $('cm-password').focus();
+                return;
+            }
+
+            const btn = $('cm-confirm-btn');
+            btn.disabled = true;
+            btn.textContent = 'Sending…';
+            $('cm-note').textContent = '';
+
+            try {
+                const base = API.replace('/api/status', '');
+                let url, body;
+
+                if (_pendingAction.type === 'sell') {
+                    url = base + '/api/sell';
+                    body = { symbol: _pendingAction.symbol, password: pw };
+                } else {
+                    url = base + '/api/liquidate';
+                    body = { password: pw };
+                }
+
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await res.json();
+
+                if (data.ok) {
+                    $('cm-note').style.color = 'var(--green)';
+                    $('cm-note').textContent = '✓ ' + data.message;
+                    setTimeout(closeConfirm, 1400);
+                } else {
+                    throw new Error(data.message || 'Action failed');
+                }
+            } catch (e) {
+                $('cm-note').style.color = 'var(--red)';
+                $('cm-note').textContent = '⚠ ' + e.message;
+                if (e.message.toLowerCase().includes('password') || e.message.includes('401'))
+                    $('cm-password').select();
+                btn.disabled = false;
+                btn.textContent = 'Confirm';
+            }
+        }
 
         // ══════════════════════════════════════════════════════════
         //  SETTINGS PANEL
@@ -2563,131 +2841,131 @@
 
         const TAB_HTML = {
             risk: () => `
-                                                            <div class="sm-section">
-                                                                <div class="sm-section-title">Capital &amp; Exposure</div>
-                                                                <div class="sm-grid">
-                                                                    ${field('TOTAL_BUDGET', 'Total Budget ($)', 'number', CFG.TOTAL_BUDGET, 'Total capital allocated to the bot')}
-                                                                    ${field('POSITION_SIZE', 'Position Size ($)', 'number', CFG.POSITION_SIZE, 'Dollar size per trade')}
-                                                                    ${field('MAX_POSITIONS', 'Max Open Positions', 'number', CFG.MAX_POSITIONS, 'Concurrent position limit')}
-                                                                    ${field('MAX_QTY_SANITY', 'Max Qty Sanity Cap', 'number', CFG.MAX_QTY_SANITY, 'Hard ceiling on share quantity')}
-                                                                    ${field('COMMISSION_PER_SIDE', 'Commission / Side ($)', 'number', CFG.COMMISSION_PER_SIDE, 'IBKR flat fee per order leg')}
-                                                                </div>
-                                                            </div>
-                                                            <div class="sm-section">
-                                                                <div class="sm-section-title">P&amp;L Limits</div>
-                                                                <div class="sm-grid">
-                                                                    ${field('DAILY_PROFIT_GOAL', 'Daily Profit Goal ($)', 'number', CFG.DAILY_PROFIT_GOAL, 'Target profit to halt new entries')}
-                                                                    ${field('MAX_DAILY_LOSS', 'Max Daily Loss ($)', 'number', CFG.MAX_DAILY_LOSS, 'Bot halts when this loss is hit (stored as positive)')}
-                                                                    ${field('MAX_LOSS_PER_TRADE', 'Max Loss / Trade ($)', 'number', CFG.MAX_LOSS_PER_TRADE, 'Dollar stop per individual trade')}
-                                                                    ${field('RISK_PCT', 'Risk % of Budget', 'number', CFG.RISK_PCT, 'Fractional risk per trade (e.g. 0.015 = 1.5%)')}
-                                                                    ${field('MAX_TRADES_PER_DAY', 'Max Trades / Day', 'number', CFG.MAX_TRADES_PER_DAY, 'Hard cap on daily trade count')}
-                                                                </div>
-                                                            </div>`,
+                                                                    <div class="sm-section">
+                                                                        <div class="sm-section-title">Capital &amp; Exposure</div>
+                                                                        <div class="sm-grid">
+                                                                            ${field('TOTAL_BUDGET', 'Total Budget ($)', 'number', CFG.TOTAL_BUDGET, 'Total capital allocated to the bot')}
+                                                                            ${field('POSITION_SIZE', 'Position Size ($)', 'number', CFG.POSITION_SIZE, 'Dollar size per trade')}
+                                                                            ${field('MAX_POSITIONS', 'Max Open Positions', 'number', CFG.MAX_POSITIONS, 'Concurrent position limit')}
+                                                                            ${field('MAX_QTY_SANITY', 'Max Qty Sanity Cap', 'number', CFG.MAX_QTY_SANITY, 'Hard ceiling on share quantity')}
+                                                                            ${field('COMMISSION_PER_SIDE', 'Commission / Side ($)', 'number', CFG.COMMISSION_PER_SIDE, 'IBKR flat fee per order leg')}
+                                                                        </div>
+                                                                    </div>
+                                                                    <div class="sm-section">
+                                                                        <div class="sm-section-title">P&amp;L Limits</div>
+                                                                        <div class="sm-grid">
+                                                                            ${field('DAILY_PROFIT_GOAL', 'Daily Profit Goal ($)', 'number', CFG.DAILY_PROFIT_GOAL, 'Target profit to halt new entries')}
+                                                                            ${field('MAX_DAILY_LOSS', 'Max Daily Loss ($)', 'number', CFG.MAX_DAILY_LOSS, 'Bot halts when this loss is hit (stored as positive)')}
+                                                                            ${field('MAX_LOSS_PER_TRADE', 'Max Loss / Trade ($)', 'number', CFG.MAX_LOSS_PER_TRADE, 'Dollar stop per individual trade')}
+                                                                            ${field('RISK_PCT', 'Risk % of Budget', 'number', CFG.RISK_PCT, 'Fractional risk per trade (e.g. 0.015 = 1.5%)')}
+                                                                            ${field('MAX_TRADES_PER_DAY', 'Max Trades / Day', 'number', CFG.MAX_TRADES_PER_DAY, 'Hard cap on daily trade count')}
+                                                                        </div>
+                                                                    </div>`,
 
             strategy: () => `
-                                                            <div class="sm-section">
-                                                                <div class="sm-section-title">Timing &amp; Cooldowns</div>
-                                                                <div class="sm-grid">
-                                                                    ${field('MIN_HOLD_SECONDS', 'Min Hold (seconds)', 'number', CFG.MIN_HOLD_SECONDS, 'Minimum seconds before any exit is considered')}
-                                                                    ${field('COOLDOWN_SECONDS', 'Cooldown (seconds)', 'number', CFG.COOLDOWN_SECONDS, 'Per-symbol cooldown after a trade closes')}
-                                                                    ${field('ORB_MINUTES', 'ORB Window (minutes)', 'number', CFG.ORB_MINUTES, 'Opening range breakout period length')}
-                                                                    ${field('VWAP_CONFIRM_BARS', 'VWAP Confirm Bars', 'number', CFG.VWAP_CONFIRM_BARS, 'Bars price must be above/below VWAP to confirm')}
-                                                                </div>
-                                                            </div>
-                                                            <div class="sm-section">
-                                                                <div class="sm-section-title">Stop &amp; Trail Multipliers</div>
-                                                                <div class="sm-grid">
-                                                                    ${field('ATR_TRAIL_MULT', 'ATR Trail Mult (Long)', 'number', CFG.ATR_TRAIL_MULT, 'ATR multiplier for trailing stop on longs')}
-                                                                    ${field('SHORT_ATR_TRAIL', 'ATR Trail Mult (Short)', 'number', CFG.SHORT_ATR_TRAIL, 'ATR multiplier for trailing stop on shorts')}
-                                                                    ${field('HARD_STOP_ATR_MULT', 'Hard Stop ATR Mult', 'number', CFG.HARD_STOP_ATR_MULT, 'ATR multiplier for initial hard stop')}
-                                                                    ${field('MIN_STOP_DISTANCE', 'Min Stop Distance ($)', 'number', CFG.MIN_STOP_DISTANCE, 'Floor on stop distance in dollars')}
-                                                                </div>
-                                                            </div>
-                                                            <div class="sm-section">
-                                                                <div class="sm-section-title">Direction</div>
-                                                                <div class="sm-toggle-row">
-                                                                    <div>
-                                                                        <div class="sm-toggle-lbl">Allow Short Selling</div>
-                                                                        <div class="sm-toggle-sub">Requires a margin account. Disabled by default.</div>
+                                                                    <div class="sm-section">
+                                                                        <div class="sm-section-title">Timing &amp; Cooldowns</div>
+                                                                        <div class="sm-grid">
+                                                                            ${field('MIN_HOLD_SECONDS', 'Min Hold (seconds)', 'number', CFG.MIN_HOLD_SECONDS, 'Minimum seconds before any exit is considered')}
+                                                                            ${field('COOLDOWN_SECONDS', 'Cooldown (seconds)', 'number', CFG.COOLDOWN_SECONDS, 'Per-symbol cooldown after a trade closes')}
+                                                                            ${field('ORB_MINUTES', 'ORB Window (minutes)', 'number', CFG.ORB_MINUTES, 'Opening range breakout period length')}
+                                                                            ${field('VWAP_CONFIRM_BARS', 'VWAP Confirm Bars', 'number', CFG.VWAP_CONFIRM_BARS, 'Bars price must be above/below VWAP to confirm')}
+                                                                        </div>
                                                                     </div>
-                                                                    <label class="toggle-switch">
-                                                                        <input type="checkbox" id="cfg-ALLOW_SHORTS" ${CFG.ALLOW_SHORTS ? 'checked' : ''}>
-                                                                        <span class="toggle-slider"></span>
-                                                                    </label>
-                                                                </div>
-                                                            </div>`,
+                                                                    <div class="sm-section">
+                                                                        <div class="sm-section-title">Stop &amp; Trail Multipliers</div>
+                                                                        <div class="sm-grid">
+                                                                            ${field('ATR_TRAIL_MULT', 'ATR Trail Mult (Long)', 'number', CFG.ATR_TRAIL_MULT, 'ATR multiplier for trailing stop on longs')}
+                                                                            ${field('SHORT_ATR_TRAIL', 'ATR Trail Mult (Short)', 'number', CFG.SHORT_ATR_TRAIL, 'ATR multiplier for trailing stop on shorts')}
+                                                                            ${field('HARD_STOP_ATR_MULT', 'Hard Stop ATR Mult', 'number', CFG.HARD_STOP_ATR_MULT, 'ATR multiplier for initial hard stop')}
+                                                                            ${field('MIN_STOP_DISTANCE', 'Min Stop Distance ($)', 'number', CFG.MIN_STOP_DISTANCE, 'Floor on stop distance in dollars')}
+                                                                        </div>
+                                                                    </div>
+                                                                    <div class="sm-section">
+                                                                        <div class="sm-section-title">Direction</div>
+                                                                        <div class="sm-toggle-row">
+                                                                            <div>
+                                                                                <div class="sm-toggle-lbl">Allow Short Selling</div>
+                                                                                <div class="sm-toggle-sub">Requires a margin account. Disabled by default.</div>
+                                                                            </div>
+                                                                            <label class="toggle-switch">
+                                                                                <input type="checkbox" id="cfg-ALLOW_SHORTS" ${CFG.ALLOW_SHORTS ? 'checked' : ''}>
+                                                                                <span class="toggle-slider"></span>
+                                                                            </label>
+                                                                        </div>
+                                                                    </div>`,
 
             filters: () => `
-                                                            <div class="sm-section">
-                                                                <div class="sm-section-title">Volatility &amp; Volume Filters</div>
-                                                                <div class="sm-grid">
-                                                                    ${field('MIN_ATR_PCT', 'Min ATR %', 'number', CFG.MIN_ATR_PCT, 'Skip symbols with ATR below this (e.g. 0.004 = 0.4%)')}
-                                                                    ${field('VOL_EXPAND_MULT', 'Volume Expansion Mult', 'number', CFG.VOL_EXPAND_MULT, 'Require volume this many times average for entry')}
-                                                                    ${field('GAP_GO_MIN_PCT', 'Gap-Go Min Gap %', 'number', CFG.GAP_GO_MIN_PCT, 'Minimum gap size for gap-and-go strategy (e.g. 0.008 = 0.8%)')}
-                                                                    ${field('GAP_GO_REL_VOL', 'Gap-Go Relative Vol', 'number', CFG.GAP_GO_REL_VOL, 'Minimum relative volume for gap-and-go confirmation')}
-                                                                </div>
-                                                            </div>
-                                                            <div class="sm-section">
-                                                                <div class="sm-section-title">RSI Thresholds</div>
-                                                                <div class="sm-grid">
-                                                                    ${field('RSI_LONG_MIN', 'RSI Long Min', 'number', CFG.RSI_LONG_MIN, 'Minimum RSI to enter a long position')}
-                                                                    ${field('RSI_SHORT_MAX', 'RSI Short Max', 'number', CFG.RSI_SHORT_MAX, 'Maximum RSI to enter a short position')}
-                                                                    ${field('RSI_OVERSOLD', 'RSI Oversold Level', 'number', CFG.RSI_OVERSOLD, 'RSI oversold threshold (mean-reversion long signal)')}
-                                                                    ${field('RSI_OVERBOUGHT', 'RSI Overbought Level', 'number', CFG.RSI_OVERBOUGHT, 'RSI overbought threshold (mean-reversion short signal)')}
-                                                                </div>
-                                                            </div>
-                                                            <div class="sm-section">
-                                                                <div class="sm-section-title">IBKR Market Data Lines
-                                                                    <span style="font-size:9px;color:var(--yellow);font-weight:400;margin-left:8px">
-                                                                        ⚠ Free accounts = 100 lines · Booster Pack adds 100 more
-                                                                    </span>
-                                                                </div>
-                                                                <div style="background:rgba(210,153,34,.08);border:1px solid rgba(210,153,34,.25);border-radius:5px;padding:8px 10px;margin-bottom:10px;font-size:10px;color:var(--muted);line-height:1.6">
-                                                                    IBKR counts <b style="color:var(--text)">data lines</b>, not symbols.
-                                                                    If your adapter calls <code style="color:var(--blue)">reqMktData</code> only → <b>1 line/symbol</b>.
-                                                                    If it also calls <code style="color:var(--blue)">reqRealTimeBars</code> → <b>6 lines/symbol</b> (1+5).
-                                                                    Set <b style="color:var(--text)">Data Lines / Symbol</b> to match your adapter so the bot
-                                                                    auto-caps subscriptions and prioritises symbols with open positions.
-                                                                    Current budget: <b style="color:var(--green)">${Math.floor((CFG.MAX_MARKET_DATA_LINES || 95) / (CFG.DATA_LINES_PER_SYMBOL || 1))} symbols</b> can be subscribed simultaneously.
-                                                                </div>
-                                                                <div class="sm-grid">
-                                                                    ${field('DATA_LINES_PER_SYMBOL', 'Data Lines / Symbol', 'number', CFG.DATA_LINES_PER_SYMBOL, '1 = reqMktData only · 6 = reqMktData + reqRealTimeBars')}
-                                                                    ${field('MAX_MARKET_DATA_LINES', 'Max Data Lines (account limit)', 'number', CFG.MAX_MARKET_DATA_LINES, 'Set 5 below your IBKR limit as a safety buffer (e.g. 95 for a 100-line account)')}
-                                                                </div>
-                                                            </div>`,
+                                                                    <div class="sm-section">
+                                                                        <div class="sm-section-title">Volatility &amp; Volume Filters</div>
+                                                                        <div class="sm-grid">
+                                                                            ${field('MIN_ATR_PCT', 'Min ATR %', 'number', CFG.MIN_ATR_PCT, 'Skip symbols with ATR below this (e.g. 0.004 = 0.4%)')}
+                                                                            ${field('VOL_EXPAND_MULT', 'Volume Expansion Mult', 'number', CFG.VOL_EXPAND_MULT, 'Require volume this many times average for entry')}
+                                                                            ${field('GAP_GO_MIN_PCT', 'Gap-Go Min Gap %', 'number', CFG.GAP_GO_MIN_PCT, 'Minimum gap size for gap-and-go strategy (e.g. 0.008 = 0.8%)')}
+                                                                            ${field('GAP_GO_REL_VOL', 'Gap-Go Relative Vol', 'number', CFG.GAP_GO_REL_VOL, 'Minimum relative volume for gap-and-go confirmation')}
+                                                                        </div>
+                                                                    </div>
+                                                                    <div class="sm-section">
+                                                                        <div class="sm-section-title">RSI Thresholds</div>
+                                                                        <div class="sm-grid">
+                                                                            ${field('RSI_LONG_MIN', 'RSI Long Min', 'number', CFG.RSI_LONG_MIN, 'Minimum RSI to enter a long position')}
+                                                                            ${field('RSI_SHORT_MAX', 'RSI Short Max', 'number', CFG.RSI_SHORT_MAX, 'Maximum RSI to enter a short position')}
+                                                                            ${field('RSI_OVERSOLD', 'RSI Oversold Level', 'number', CFG.RSI_OVERSOLD, 'RSI oversold threshold (mean-reversion long signal)')}
+                                                                            ${field('RSI_OVERBOUGHT', 'RSI Overbought Level', 'number', CFG.RSI_OVERBOUGHT, 'RSI overbought threshold (mean-reversion short signal)')}
+                                                                        </div>
+                                                                    </div>
+                                                                    <div class="sm-section">
+                                                                        <div class="sm-section-title">IBKR Market Data Lines
+                                                                            <span style="font-size:9px;color:var(--yellow);font-weight:400;margin-left:8px">
+                                                                                ⚠ Free accounts = 100 lines · Booster Pack adds 100 more
+                                                                            </span>
+                                                                        </div>
+                                                                        <div style="background:rgba(210,153,34,.08);border:1px solid rgba(210,153,34,.25);border-radius:5px;padding:8px 10px;margin-bottom:10px;font-size:10px;color:var(--muted);line-height:1.6">
+                                                                            IBKR counts <b style="color:var(--text)">data lines</b>, not symbols.
+                                                                            If your adapter calls <code style="color:var(--blue)">reqMktData</code> only → <b>1 line/symbol</b>.
+                                                                            If it also calls <code style="color:var(--blue)">reqRealTimeBars</code> → <b>6 lines/symbol</b> (1+5).
+                                                                            Set <b style="color:var(--text)">Data Lines / Symbol</b> to match your adapter so the bot
+                                                                            auto-caps subscriptions and prioritises symbols with open positions.
+                                                                            Current budget: <b style="color:var(--green)">${Math.floor((CFG.MAX_MARKET_DATA_LINES || 95) / (CFG.DATA_LINES_PER_SYMBOL || 1))} symbols</b> can be subscribed simultaneously.
+                                                                        </div>
+                                                                        <div class="sm-grid">
+                                                                            ${field('DATA_LINES_PER_SYMBOL', 'Data Lines / Symbol', 'number', CFG.DATA_LINES_PER_SYMBOL, '1 = reqMktData only · 6 = reqMktData + reqRealTimeBars')}
+                                                                            ${field('MAX_MARKET_DATA_LINES', 'Max Data Lines (account limit)', 'number', CFG.MAX_MARKET_DATA_LINES, 'Set 5 below your IBKR limit as a safety buffer (e.g. 95 for a 100-line account)')}
+                                                                        </div>
+                                                                    </div>`,
 
             watchlist: () => `
-                                                            <div class="sm-section">
-                                                                <div class="sm-section-title">Active Symbols <span style="color:var(--blue);margin-left:6px" id="wl-count">${WL.length} symbols</span></div>
-                                                                <div class="wl-grid" id="wl-tags">${renderWLTags()}</div>
-                                                                <div class="wl-add-row">
-                                                                    <input class="wl-add-input" id="wl-new" placeholder="e.g. AMZN, TSLA, SPY…" maxlength="80"
-                                                                           onkeydown="if(event.key==='Enter')addWLSymbols()">
-                                                                    <button class="wl-add-btn" onclick="addWLSymbols()">+ Add</button>
-                                                                </div>
-                                                                <div class="wl-group-label">Default groups</div>
-                                                                ${Object.entries(WATCHLIST_DEFAULTS).map(([grp, syms]) => `
-                                                                    <div style="margin-bottom:8px">
-                                                                        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-                                                                            <span style="font-size:10px;color:var(--muted)">${grp}</span>
-                                                                            <button onclick="addGroupToWL(${JSON.stringify(syms)})"
-                                                                                style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:3px;padding:1px 8px;font-size:9px;cursor:pointer;transition:color .15s"
-                                                                                onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">
-                                                                                + Add all
-                                                                            </button>
+                                                                    <div class="sm-section">
+                                                                        <div class="sm-section-title">Active Symbols <span style="color:var(--blue);margin-left:6px" id="wl-count">${WL.length} symbols</span></div>
+                                                                        <div class="wl-grid" id="wl-tags">${renderWLTags()}</div>
+                                                                        <div class="wl-add-row">
+                                                                            <input class="wl-add-input" id="wl-new" placeholder="e.g. AMZN, TSLA, SPY…" maxlength="80"
+                                                                                   onkeydown="if(event.key==='Enter')addWLSymbols()">
+                                                                            <button class="wl-add-btn" onclick="addWLSymbols()">+ Add</button>
                                                                         </div>
-                                                                        <div style="display:flex;flex-wrap:wrap;gap:4px">
-                                                                            ${syms.map(s => `<span style="font-size:10px;font-weight:700;color:${WL.includes(s) ? 'var(--green)' : 'var(--muted)'};cursor:pointer;padding:2px 5px;background:var(--subtle);border-radius:3px" onclick="toggleWLSym('${s}',this)" title="Toggle ${s}">${s}</span>`).join('')}
-                                                                        </div>
-                                                                    </div>`).join('')}
-                                                            </div>`
+                                                                        <div class="wl-group-label">Default groups</div>
+                                                                        ${Object.entries(WATCHLIST_DEFAULTS).map(([grp, syms]) => `
+                                                                            <div style="margin-bottom:8px">
+                                                                                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+                                                                                    <span style="font-size:10px;color:var(--muted)">${grp}</span>
+                                                                                    <button onclick="addGroupToWL(${JSON.stringify(syms)})"
+                                                                                        style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:3px;padding:1px 8px;font-size:9px;cursor:pointer;transition:color .15s"
+                                                                                        onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">
+                                                                                        + Add all
+                                                                                    </button>
+                                                                                </div>
+                                                                                <div style="display:flex;flex-wrap:wrap;gap:4px">
+                                                                                    ${syms.map(s => `<span style="font-size:10px;font-weight:700;color:${WL.includes(s) ? 'var(--green)' : 'var(--muted)'};cursor:pointer;padding:2px 5px;background:var(--subtle);border-radius:3px" onclick="toggleWLSym('${s}',this)" title="Toggle ${s}">${s}</span>`).join('')}
+                                                                                </div>
+                                                                            </div>`).join('')}
+                                                                    </div>`
         };
 
         function field(id, label, type, val, hint = '') {
             return `<div class="sm-field" title="${hint}">
-                                                            <span class="sm-label">${label}</span>
-                                                            <input class="sm-input" id="cfg-${id}" type="${type}" value="${val}" step="any">
-                                                        </div>`;
+                                                                    <span class="sm-label">${label}</span>
+                                                                    <input class="sm-input" id="cfg-${id}" type="${type}" value="${val}" step="any">
+                                                                </div>`;
         }
 
         function renderWLTags() {
@@ -2815,8 +3093,13 @@
             switchTab(_activeTab);
         }
 
-        // Close modal on Escape
-        document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSettings(); });
+        // Close modals on Escape
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape') {
+                closeSettings();
+                closeConfirm();
+            }
+        });
     </script>
 </body>
 </html>
