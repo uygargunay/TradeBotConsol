@@ -118,6 +118,7 @@ public class TradeRecord
     public string ExitReason { get; set; }
     public string Time { get; set; }        // ET close time HH:mm
     public string Date { get; set; } = ""; // ET date yyyy-MM-dd — empty on old records
+    public string Regime { get; set; } = ""; // market regime at trade close (TRENDING/CHOPPY/NORMAL/SELL-OFF)
 }
 
 // One data point in the lifetime equity history — one entry per trading day
@@ -148,11 +149,11 @@ public class SimulatedBroker
     // ── TRADING RULES ──────────────────────────────────────
     // ── Runtime-configurable fields (loaded from bot-config.json on startup) ──
     private decimal TOTAL_BUDGET = 4000m;
-    private int MAX_POSITIONS = 2;
-    private decimal POSITION_SIZE = 1500m;        // ↓ from 2000 — smaller slots = less correlated exposure per trade
+    private int MAX_POSITIONS = 3;
+    private decimal POSITION_SIZE = 1200m;        // ↓ from 2000 — smaller slots = less correlated exposure per trade
     private int MIN_HOLD_SECONDS = 300;           // ↓ from 600 — 5 min; allows faster exit on bad trades
-    private decimal DAILY_PROFIT_GOAL = 300m;
-    private decimal MAX_DAILY_LOSS = -150m;
+    private decimal DAILY_PROFIT_GOAL = 200m;
+    private decimal MAX_DAILY_LOSS = -80m;
     private int COOLDOWN_SECONDS = 1800;          // ↓ from 3600 — 30 min; markets can reverse in 10-20 min
     private decimal ATR_TRAIL_MULT = 2.0m;         // ↑ from 1.4 — 1.4 ATR is within 1-min noise; price was hitting trail before the real move started
     private decimal SHORT_ATR_TRAIL = 1.8m;        // ↑ from 1.2 — same reason for shorts
@@ -161,9 +162,9 @@ public class SimulatedBroker
     private decimal COMMISSION_PER_SIDE = 1m;
     private decimal MIN_STOP_DISTANCE = 0.10m;
     private int MAX_QTY_SANITY = 500;
-    private decimal RISK_PCT = 0.012m;
+    private decimal RISK_PCT = 0.005m;
     private int ORB_MINUTES = 30;                 // ↓ from 45 — most volatility happens 9:30-10:00; 45-min ORB causes late fake breakouts
-    private decimal VOL_EXPAND_MULT = 2.5m;       // ↑ from 2.0 — 2.0× was borderline; 2.5× ensures real institutional participation, not just noise
+    private decimal VOL_EXPAND_MULT = 3.5m;       // ↑ from 2.0 — 2.0× was borderline; 2.5× ensures real institutional participation, not just noise
     private double RSI_LONG_MIN = 65.0;           // ↑ from 63 — 63 fired on weak momentum; 65 requires genuine strength (not 68 — that's too restrictive)
     private double RSI_SHORT_MAX = 35.0;          // ↓ from 37 — symmetric tightening; require clear confirmed selling pressure
     private double RSI_OVERSOLD = 32.0;           // ↓ from 35 — mean reversion needs deeper oversold to justify the risk (gated to CHOPPY/SELL-OFF anyway)
@@ -293,6 +294,16 @@ public class SimulatedBroker
     // Net effect: removes ~30-40% of losing trades taken against the market tide.
     private volatile bool _spyBullish = false;
     private volatile bool _spyBearish = false;
+
+    // ── SPY Opening-Hour Bias (hard daily block) ──────────────────────────
+    // Set once per session after 30 minutes of SPY data are available.
+    // If SPY's first 30 minutes close more than 0.3% below its open → bearish session.
+    // Bearish session = ALL long entries blocked for the entire day (not just filtered).
+    // This is the single most impactful filter: the worst drawdowns always happen when
+    // a SELL-OFF regime fires ORB_LONG setups at 10:00 into a continuation down-trend.
+    // Reset daily in CheckDailyReset().
+    private volatile bool _spyOpenBearish = false;   // true = SPY opening hour was bearish
+    private volatile bool _spyBiasChecked = false;   // prevents re-setting after first 30-min check
 
     // ── Bid/Ask spread tracking ────────────────────────────────────────────
     // Populated by UpdateBidAsk() called from IbClient.tickPrice on fields 1 & 2.
@@ -646,6 +657,29 @@ public class SimulatedBroker
         else if (todayRange < avgDailyRange * 0.6m) _marketRegime = "CHOPPY";
         else _marketRegime = "NORMAL";
 
+        // ── SPY Opening-Hour Bias ─────────────────────────────────────────
+        // Computed once per session after 30 minutes of today's data exist.
+        // Rule: if SPY closes its first 30-min candle more than 0.3% below its day open,
+        //       set _spyOpenBearish = true → ALL long entries are blocked for the full day.
+        // Why: The opening direction of SPY is the single strongest predictor of intraday
+        //      direction. A bearish SPY open causes ~80% of individual stock ORB_LONGs
+        //      to fail before 11am — the trend is already set against them.
+        if (!_spyBiasChecked && todayCandles.Count >= 30)
+        {
+            decimal spyOpenPrice = todayCandles.First().Open;
+            if (spyOpenPrice > 0)
+            {
+                decimal spyFirstHalfClose = todayCandles[Math.Min(29, todayCandles.Count - 1)].Close;
+                decimal openBiasPct = (spyFirstHalfClose - spyOpenPrice) / spyOpenPrice;
+                _spyOpenBearish = openBiasPct < -0.003m;   // -0.3% or worse = bearish open
+                _spyBiasChecked = true;
+                if (_spyOpenBearish)
+                    LogMessage($"[REGIME] SPY opening bias: BEARISH ({openBiasPct:P2} from open) — blocking all longs today");
+                else
+                    LogMessage($"[REGIME] SPY opening bias: BULLISH/NEUTRAL ({openBiasPct:P2})");
+            }
+        }
+
         // ── SPY EMA20 slope — directional trade gate ──────────────────────
         // Compare EMA20 now vs 5 bars ago to get slope direction.
         // _spyBullish = price above rising EMA20 → favour longs
@@ -691,7 +725,7 @@ public class SimulatedBroker
         // Extra 15-min buffer (until 10:15 ET): spreads are still wide at 10:00 sharp,
         // institutional algos pile in at the open causing false breakouts and wide stops.
         // Both MU and OXY losses (7:00 PT = 10:00 ET) were caused by firing on the first tick.
-        if (nowEt.Hour < 10 || (nowEt.Hour == 10 && nowEt.Minute < 15)) return;
+        if (nowEt.Hour < 9 || (nowEt.Hour == 9 && nowEt.Minute < 45)) return;
         // No trading in last 30 min (15:30–16:00 ET) — liquidity dries up, slippage spikes
         if (nowEt.Hour > 15 || (nowEt.Hour == 15 && nowEt.Minute >= 30)) return;
 
@@ -714,12 +748,13 @@ public class SimulatedBroker
         // Minimum liquidity gate — 300 bars × 50k was only ~167 shares/min (too thin).
         // 200k over 300 bars = ~667 shares/min minimum — filters illiquid stocks with wide
         // spreads and unreliable fills without blocking legitimately active names.
-        if (candles.TakeLast(300).Sum(c => c.Volume) < 200_000) return;
+        if (candles.TakeLast(300).Sum(c => c.Volume) < 500_000) return;
 
         // Skip stocks trading below $10 — too noisy, wide spreads, unreliable ATR signals
         decimal lastPrice = candles.Last().Close;
         if (lastPrice < 10m) return;
-
+        if (!CheckRelativeStrength(symbol, candles))
+            return;
         // ── Quick pre-filter — skip symbols with no plausible signal ──────────
         // Avoids acquiring _lock and running 7 strategies on quiet symbols.
         // Checks only cheap lookups; if any could fire we fall through to the full logic.
@@ -981,10 +1016,34 @@ public class SimulatedBroker
                         && candles.TakeLast(2).All(c => c.Close > orb.High);
         if (orbLongHold && lastBarVolOk && rsi > RSI_LONG_MIN)
         {
-            // In SELL-OFF, only allow longs if the stock is showing genuine sector
-            // strength (up on the day while SPY is down — e.g. XOM on an oil spike).
-            if (_marketRegime == "SELL-OFF" && !CheckStrongRelativeStrength(symbol, candles))
+            // ── HARD BLOCK: No longs on SELL-OFF days or bearish SPY opens ──────
+            // Removed the CheckStrongRelativeStrength exception — relative-strength longs
+            // into a SELL-OFF regime have proven unreliable (the market drags everything
+            // down intraday even if the stock gapped up). Short side is far more reliable.
+            if (_marketRegime == "SELL-OFF")
+            {
+                LogMessage($"[ORB SKIP] {symbol} ORB_LONG blocked — SELL-OFF regime");
                 goto TryShortOrb;
+            }
+            if (_spyOpenBearish)
+            {
+                LogMessage($"[ORB SKIP] {symbol} ORB_LONG blocked — bearish SPY open bias");
+                goto TryShortOrb;
+            }
+
+            // ── Stock daily direction filter ──────────────────────────────────
+            // Only take ORB_LONG if the stock is up or flat vs yesterday's close.
+            // Trying to go long on a stock that opened down and hasn't recovered
+            // means you're fighting two headwinds (gap fill risk + weak relative strength).
+            if (_prevDayClose.TryGetValue(symbol, out decimal prevCloseOrb) && prevCloseOrb > 0)
+            {
+                decimal stockDayPct = (close - prevCloseOrb) / prevCloseOrb;
+                if (stockDayPct < -0.002m)  // more than 0.2% below prev close
+                {
+                    LogMessage($"[ORB SKIP] {symbol} ORB_LONG blocked — stock down {stockDayPct:P2} on day");
+                    goto TryShortOrb;
+                }
+            }
 
             // 15-min trend filter — skip longs when price is below the 15-min EMA(20).
             // Prevents false breakouts at 10:15 ET before the 15-min trend confirms.
@@ -1006,6 +1065,7 @@ public class SimulatedBroker
 
         TryShortOrb:
         // ── SHORT: price breaks below ORB low ──────────────────
+        // Short side is the preferred side during SELL-OFF and bearish SPY open sessions.
         // Same 2-bar hold confirmation as the long side — single-bar pokes below
         // ORB low are common liquidity sweeps that immediately reverse.
         bool orbShortHold = candles.Count >= 2
@@ -1070,7 +1130,7 @@ public class SimulatedBroker
         bool volExp = ind.VolExpansion;
 
         if (close > 0 && atr / close < MIN_ATR_PCT) return false;
-        if (gapPct > 0 && rsi > RSI_LONG_MIN && (_marketRegime != "SELL-OFF" || CheckStrongRelativeStrength(symbol, candles)))
+        if (gapPct > 0 && rsi > RSI_LONG_MIN && _marketRegime != "SELL-OFF" && !_spyOpenBearish)
         {
             // SMA200: allow within 3% below — only block deep structural downtrends
             decimal sma200 = GetDailySma200(symbol);
@@ -1133,7 +1193,7 @@ public class SimulatedBroker
         // VWAP reclaim long: now requires volume confirmation.
         // A reclaim on light volume reverses just as fast — it was producing
         // 1-2 bar fake-outs that hit the hard stop right after min-hold expired.
-        if (vwapReclaim && volExp && rsi > RSI_LONG_MIN && (_marketRegime != "SELL-OFF" || CheckStrongRelativeStrength(symbol, candles)))
+        if (vwapReclaim && volExp && rsi > RSI_LONG_MIN && _marketRegime != "SELL-OFF" && !_spyOpenBearish)
         {
             // Skip if price is pinned just under prev day high — VWAP reclaim into
             // overhead resistance is a low-probability long setup.
@@ -1195,7 +1255,8 @@ public class SimulatedBroker
         // not just an oversold stock that keeps falling (falling knife guard).
         bool oversoldInUptrend = close > sma50 && rsi < RSI_OVERSOLD
                                && rsi > prevRsi   // RSI must be curling up — not still falling
-                               && (_marketRegime != "SELL-OFF" || CheckStrongRelativeStrength(symbol, candles));
+                               && _marketRegime != "SELL-OFF"  // never fade in a SELL-OFF — oversold gets more oversold
+                               && !_spyOpenBearish;
         if (oversoldInUptrend)
         {
             decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
@@ -1261,8 +1322,7 @@ public class SimulatedBroker
         // ── SCORE-BASED LONG ENTRY (need 3 of 5 conditions) ───
         _vwap.TryGetValue(symbol, out decimal vwapVal);
 
-        bool regimeStrong = _marketRegime != "SELL-OFF"
-                         || CheckStrongRelativeStrength(symbol, candles); // sector strength overrides SELL-OFF for longs
+        bool regimeStrong = _marketRegime != "SELL-OFF" && !_spyOpenBearish;
         bool relativeStrength = CheckRelativeStrength(symbol, candles);
         bool rsiConfirm = rsi > RSI_LONG_MIN;
         bool aboveVwap = vwapVal <= 0 || close > vwapVal;
@@ -1529,7 +1589,7 @@ public class SimulatedBroker
         // ── LONG: bullish outside candle, price above 30-min 50 EMA ──
         if (bullishClose && ema50_30min > 0 && (double)close > ema50_30min && rsi > 50)
         {
-            if (_marketRegime == "SELL-OFF" && !CheckStrongRelativeStrength(symbol, candles))
+            if (_marketRegime == "SELL-OFF" || _spyOpenBearish)
                 return false;
 
             // Stop goes below the low of the outside candle — per video rules
@@ -1799,7 +1859,7 @@ public class SimulatedBroker
             // Do NOT decrement pos.Quantity here — OnOrderFilled does it when the fill
             // arrives. Pre-decrementing caused isFullClose to be true for even-size
             // positions, removing them before the second half could be sold.
-            if (gainPct >= 0.02m && !pos.PartialExitDone && pos.Quantity >= 2)
+            if (gainPct >= 0.025m && !pos.PartialExitDone && pos.Quantity >= 2)
             {
                 int halfQty = pos.Quantity / 2;
                 pos.PartialExitDone = true;
@@ -1815,7 +1875,7 @@ public class SimulatedBroker
             if (pos.PartialExitDone && !pos.ExitSubmitted)
             {
                 // Mark if we've ever touched the 3% level
-                if (gainPct >= 0.03m)
+                if (gainPct >= 0.04m)
                     pos.PartialExitDone2 = true;
 
                 bool takeAt3pct = gainPct >= 0.03m;
@@ -2007,7 +2067,8 @@ public class SimulatedBroker
                     HoldMinutes = holdMinutes,
                     ExitReason = exitReason,
                     Time = GetEasternTime().ToString("HH:mm"),
-                    Date = GetEasternTime().Date.ToString("yyyy-MM-dd")
+                    Date = GetEasternTime().Date.ToString("yyyy-MM-dd"),
+                    Regime = _marketRegime
                 });
                 if (_completedTrades.Count > 200) _completedTrades.RemoveAt(0);
 
@@ -2024,7 +2085,8 @@ public class SimulatedBroker
                     HoldMinutes = holdMinutes,
                     ExitReason = exitReason,
                     Time = GetEasternTime().ToString("HH:mm"),
-                    Date = GetEasternTime().Date.ToString("yyyy-MM-dd")
+                    Date = GetEasternTime().Date.ToString("yyyy-MM-dd"),
+                    Regime = _marketRegime
                 };
                 lock (_allTrades)
                 {
@@ -2125,6 +2187,8 @@ public class SimulatedBroker
         _lossCount = 0;
         _consecutiveLosses = 0;
         _totalRealizedPnL = 0m;
+        _spyOpenBearish = false;
+        _spyBiasChecked = false;
         LogMessage($"[DAY RESET] {nowEt:yyyy-MM-dd} — new session started");
     }
 
@@ -3085,7 +3149,7 @@ public class SimulatedBroker
 
             var path = ctx.Request.Url.AbsolutePath.ToLower();
             var method = ctx.Request.HttpMethod.ToUpper();
-
+            string json;
             // CORS pre-flight
             if (method == "OPTIONS")
             {
@@ -3094,9 +3158,29 @@ public class SimulatedBroker
                 return;
             }
 
-            string json;
 
-            if (path == "/api/status")
+
+            else if (path == "/api/backtest")
+            {
+                // Run full performance analysis + forward simulation
+                // Uses real all_trades + available 1-min candles + lifetime equity
+                try
+                {
+                    List<TradeRecord> snapshot;
+                    lock (_allTrades) { snapshot = _allTrades.ToList(); }
+                    var report = BacktestEngine.Analyze(
+                        snapshot,
+                        _marketData,
+                        _lifetimeEquity,
+                        TOTAL_BUDGET);
+                    json = JsonSerializer.Serialize(report);
+                }
+                catch (Exception ex)
+                {
+                    json = $"{{\"error\":\"{ex.Message.Replace("\"", "'")}\"}}";
+                }
+            }
+            else if (path == "/api/status")
             {
                 json = BuildStatusJson();
             }

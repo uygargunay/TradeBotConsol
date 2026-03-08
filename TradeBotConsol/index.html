@@ -967,6 +967,26 @@
                 background: rgba(255,255,255,.04);
             }
 
+        /* ── BACKTEST BUTTON ── */
+        #backtest-btn {
+            background: none;
+            border: 1px solid var(--border);
+            color: var(--muted);
+            border-radius: 5px;
+            padding: 4px 9px;
+            cursor: pointer;
+            font-size: 13px;
+            line-height: 1;
+            transition: color .15s, border-color .15s, background .15s;
+            flex-shrink: 0;
+        }
+
+            #backtest-btn:hover {
+                color: var(--blue);
+                border-color: var(--blue);
+                background: rgba(88,166,255,.06);
+            }
+
         /* ── SETTINGS MODAL ── */
         #settings-overlay {
             display: none;
@@ -1584,6 +1604,7 @@
         <div class="tstat"><span class="lbl">Cash</span><span class="val" id="t-cash">—</span></div>
         <div id="clock"><div id="c-pt">—</div><div id="c-et">—</div></div>
         <button id="settings-btn" onclick="openSettings()" title="Bot Settings">⚙</button>
+        <button id="backtest-btn" onclick="openBacktest()" title="Performance Analytics">📊</button>
     </div>
 
     <!-- SETTINGS MODAL -->
@@ -2346,24 +2367,24 @@
                 const atrC = w.atr >= 0.4 ? 'g' : w.atr >= 0.2 ? 'y' : 'm';
                 const isSelected = w.s === selectedSym;
                 return `<tr class="${w.hot ? 'hot' : ''} ${isSelected ? 'selected' : ''}" onclick="onSymClick('${w.s}')">
-                                                                      <td><div class="sym-cell">${w.hot ? '<span class="hot-arrow">►</span>' : ''}<span>${w.s}</span></div></td>
-                                                                      <td class="tr ${pC}">$${w.price.toFixed(2)}</td>
-                                                                      <td class="tr ${(w.chg ?? 0) >= 0 ? 'g' : 'r'}" style="font-weight:700">${w.chg != null && w.chg !== 0 ? (w.chg >= 0 ? '+' : '') + w.chg.toFixed(2) + '%' : '<span class="m">—</span>'}</td>
-                                                                      <td class="tr m">$${w.vwap > 0 ? w.vwap.toFixed(2) : '—'}</td>
-                                                                      <td class="tr ${s20C}">$${w.sma20 > 0 ? w.sma20.toFixed(2) : '—'}</td>
-                                                                      <td class="tr ${s50C}">$${w.sma50 > 0 ? w.sma50.toFixed(2) : '—'}</td>
-                                                                      <td class="tc">${sma200Badge(w.price, w.sma200)}</td>
-                                                                      <td class="tc">${macdBadge(w.macd)}</td>
-                                                                      <td class="tr">${rsiHtml(w.rsi)}</td>
-                                                                      <td class="tr ${gC}">${w.gap !== 0 ? pct(w.gap) : '<span class="m">—</span>'}</td>
-                                                                      <td class="tr m">${volFmt(w.vol)}</td>
-                                                                      <td class="tr ${atrC}">${w.atr.toFixed(2)}%</td>
-                                                                      <td class="tr m">${oHi}</td>
-                                                                      <td class="tr m">${oLo}</td>
-                                                                      <td class="tc">${trH}</td>
-                                                                      <td class="tc"><span class="led" style="background:${ledC}"></span></td>
-                                                                      <td class="tc">${sigBadge(w.sig)}</td>
-                                                                    </tr>`;
+                                                                              <td><div class="sym-cell">${w.hot ? '<span class="hot-arrow">►</span>' : ''}<span>${w.s}</span></div></td>
+                                                                              <td class="tr ${pC}">$${w.price.toFixed(2)}</td>
+                                                                              <td class="tr ${(w.chg ?? 0) >= 0 ? 'g' : 'r'}" style="font-weight:700">${w.chg != null && w.chg !== 0 ? (w.chg >= 0 ? '+' : '') + w.chg.toFixed(2) + '%' : '<span class="m">—</span>'}</td>
+                                                                              <td class="tr m">$${w.vwap > 0 ? w.vwap.toFixed(2) : '—'}</td>
+                                                                              <td class="tr ${s20C}">$${w.sma20 > 0 ? w.sma20.toFixed(2) : '—'}</td>
+                                                                              <td class="tr ${s50C}">$${w.sma50 > 0 ? w.sma50.toFixed(2) : '—'}</td>
+                                                                              <td class="tc">${sma200Badge(w.price, w.sma200)}</td>
+                                                                              <td class="tc">${macdBadge(w.macd)}</td>
+                                                                              <td class="tr">${rsiHtml(w.rsi)}</td>
+                                                                              <td class="tr ${gC}">${w.gap !== 0 ? pct(w.gap) : '<span class="m">—</span>'}</td>
+                                                                              <td class="tr m">${volFmt(w.vol)}</td>
+                                                                              <td class="tr ${atrC}">${w.atr.toFixed(2)}%</td>
+                                                                              <td class="tr m">${oHi}</td>
+                                                                              <td class="tr m">${oLo}</td>
+                                                                              <td class="tc">${trH}</td>
+                                                                              <td class="tc"><span class="led" style="background:${ledC}"></span></td>
+                                                                              <td class="tc">${sigBadge(w.sig)}</td>
+                                                                            </tr>`;
             }).join('');
         }
 
@@ -2449,11 +2470,11 @@
             const sumColor = totalPnl >= 0 ? 'var(--green)' : 'var(--red)';
             const sumSign = totalPnl >= 0 ? '+' : '';
             hb.innerHTML = `
-                                                            <div style="display:flex;justify-content:space-between;align-items:center;padding:5px 2px 8px;border-bottom:1px solid var(--border);margin-bottom:8px">
-                                                                <span style="font-size:10px;color:var(--muted)">${totalTrades} trades · ${wins}W / ${losses}L · ${wr}% WR</span>
-                                                                <span style="font-size:13px;font-weight:800;color:${sumColor}">${sumSign}$${Math.abs(totalPnl).toFixed(2)}</span>
-                                                            </div>
-                                                            ${hist.map(t => {
+                                                                    <div style="display:flex;justify-content:space-between;align-items:center;padding:5px 2px 8px;border-bottom:1px solid var(--border);margin-bottom:8px">
+                                                                        <span style="font-size:10px;color:var(--muted)">${totalTrades} trades · ${wins}W / ${losses}L · ${wr}% WR</span>
+                                                                        <span style="font-size:13px;font-weight:800;color:${sumColor}">${sumSign}$${Math.abs(totalPnl).toFixed(2)}</span>
+                                                                    </div>
+                                                                    ${hist.map(t => {
                 const pc = t.pnl >= 0 ? 'var(--green)' : 'var(--red)';
                 const ps = t.pnl >= 0 ? '+' : '';
                 const side = t.side === 'SHORT'
@@ -2462,15 +2483,15 @@
                 const entryToExit = `$${t.entry.toFixed(2)} → $${t.exit.toFixed(2)}`;
                 const held = t.min < 60 ? t.min + 'm' : (t.min / 60).toFixed(1) + 'h';
                 return `<div class="th-row">
-                                                                    <div class="th-top">
-                                                                        <span class="th-sym">${t.sym}</span>
-                                                                        ${side}
-                                                                        <span class="th-pnl" style="color:${pc}">${ps}$${Math.abs(t.pnl).toFixed(2)}</span>
-                                                                    </div>
-                                                                    <div class="th-mid">
-                                                                        <span>${entryToExit} · x${t.qty} · ${held} · <span class="th-tag">${strategyLabel(t.strat)}</span> · ${exitReasonLabel(t.reason)} · ${t.time} ET</span>
-                                                                    </div>
-                                                                </div>`;
+                                                                            <div class="th-top">
+                                                                                <span class="th-sym">${t.sym}</span>
+                                                                                ${side}
+                                                                                <span class="th-pnl" style="color:${pc}">${ps}$${Math.abs(t.pnl).toFixed(2)}</span>
+                                                                            </div>
+                                                                            <div class="th-mid">
+                                                                                <span>${entryToExit} · x${t.qty} · ${held} · <span class="th-tag">${strategyLabel(t.strat)}</span> · ${exitReasonLabel(t.reason)} · ${t.time} ET</span>
+                                                                            </div>
+                                                                        </div>`;
             }).join('')}`;
         }
 
@@ -2502,9 +2523,9 @@
             const sumSign = totalPnl >= 0 ? '+' : '';
 
             let html = `<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 2px 8px;border-bottom:1px solid var(--border);margin-bottom:8px">
-                            <span style="font-size:10px;color:var(--muted)">${totalAll} trades · ${totalWins}W / ${totalAll - totalWins}L · ${totalWr}% WR (all-time)</span>
-                            <span style="font-size:13px;font-weight:800;color:${sumColor}">${sumSign}$${Math.abs(totalPnl).toFixed(2)}</span>
-                        </div>`;
+                                    <span style="font-size:10px;color:var(--muted)">${totalAll} trades · ${totalWins}W / ${totalAll - totalWins}L · ${totalWr}% WR (all-time)</span>
+                                    <span style="font-size:13px;font-weight:800;color:${sumColor}">${sumSign}$${Math.abs(totalPnl).toFixed(2)}</span>
+                                </div>`;
 
             dates.forEach(date => {
                 const trades = byDate[date];
@@ -2513,10 +2534,10 @@
                 const dc = dayPnl >= 0 ? 'var(--green)' : 'var(--red)';
                 const ds = dayPnl >= 0 ? '+' : '';
                 html += `<div style="margin-bottom:12px">
-                                <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 2px 5px;border-bottom:1px solid var(--border);margin-bottom:5px">
-                                    <span style="font-size:10px;font-weight:700;color:var(--muted)">${date}</span>
-                                    <span style="font-size:11px;font-weight:800;color:${dc}">${ds}$${Math.abs(dayPnl).toFixed(2)} · ${dayWins}W/${trades.length - dayWins}L</span>
-                                </div>`;
+                                        <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 2px 5px;border-bottom:1px solid var(--border);margin-bottom:5px">
+                                            <span style="font-size:10px;font-weight:700;color:var(--muted)">${date}</span>
+                                            <span style="font-size:11px;font-weight:800;color:${dc}">${ds}$${Math.abs(dayPnl).toFixed(2)} · ${dayWins}W/${trades.length - dayWins}L</span>
+                                        </div>`;
                 trades.forEach(t => {
                     const pc = t.pnl >= 0 ? 'var(--green)' : 'var(--red)';
                     const ps = t.pnl >= 0 ? '+' : '';
@@ -2525,14 +2546,14 @@
                         : '<span class="pcside ls">LONG</span>';
                     const held = t.min < 60 ? t.min + 'm' : (t.min / 60).toFixed(1) + 'h';
                     html += `<div class="th-row">
-                                    <div class="th-top">
-                                        <span class="th-sym">${t.sym}</span>${side}
-                                        <span class="th-pnl" style="color:${pc}">${ps}$${Math.abs(t.pnl).toFixed(2)}</span>
-                                    </div>
-                                    <div class="th-mid">
-                                        <span>$${t.entry.toFixed(2)} → $${t.exit.toFixed(2)} · x${t.qty} · ${held} · <span class="th-tag">${strategyLabel(t.strat)}</span> · ${exitReasonLabel(t.reason)} · ${t.time} ET</span>
-                                    </div>
-                                </div>`;
+                                            <div class="th-top">
+                                                <span class="th-sym">${t.sym}</span>${side}
+                                                <span class="th-pnl" style="color:${pc}">${ps}$${Math.abs(t.pnl).toFixed(2)}</span>
+                                            </div>
+                                            <div class="th-mid">
+                                                <span>$${t.entry.toFixed(2)} → $${t.exit.toFixed(2)} · x${t.qty} · ${held} · <span class="th-tag">${strategyLabel(t.strat)}</span> · ${exitReasonLabel(t.reason)} · ${t.time} ET</span>
+                                            </div>
+                                        </div>`;
                 });
                 html += '</div>';
             });
@@ -2617,15 +2638,15 @@
                     const btnLabel = pending ? '⏳ Pending' : '✕ Sell';
                     const btnTitle = pending ? `Exit pending for ${p.sym} — click to force new MKT order` : `Market sell ${p.sym}`;
                     return `<div class="pc">
-                                                                        <div class="pct">
-                                                                            <span class="pcsym">${p.sym}</span>
-                                                                            <span class="pcside ${p.side === 'LONG' ? 'ls' : 'ss'}">${p.side}</span>
-                                                                            <button class="${btnCls}" onclick="event.stopPropagation();sellPosition('${p.sym}')" title="${btnTitle}">${btnLabel}</button>
-                                                                        </div>
-                                                                        <div class="pcrow"><span class="m">Qty <b style="color:var(--text)">${p.qty}</b></span><span class="pcpnl ${pc}">${fmtS(p.unrl)}</span></div>
-                                                                        <div class="pcrow"><span class="m">$${p.avg.toFixed(2)} → $${p.cur.toFixed(2)}</span><span class="ppill" style="background:${pbg};color:${pfg}">${pp}</span></div>
-                                                                        <div class="pcm">${strategyLabel(p.strat)} · ${p.min.toFixed(0)}m held</div>
-                                                                      </div>`;
+                                                                                <div class="pct">
+                                                                                    <span class="pcsym">${p.sym}</span>
+                                                                                    <span class="pcside ${p.side === 'LONG' ? 'ls' : 'ss'}">${p.side}</span>
+                                                                                    <button class="${btnCls}" onclick="event.stopPropagation();sellPosition('${p.sym}')" title="${btnTitle}">${btnLabel}</button>
+                                                                                </div>
+                                                                                <div class="pcrow"><span class="m">Qty <b style="color:var(--text)">${p.qty}</b></span><span class="pcpnl ${pc}">${fmtS(p.unrl)}</span></div>
+                                                                                <div class="pcrow"><span class="m">$${p.avg.toFixed(2)} → $${p.cur.toFixed(2)}</span><span class="ppill" style="background:${pbg};color:${pfg}">${pp}</span></div>
+                                                                                <div class="pcm">${strategyLabel(p.strat)} · ${p.min.toFixed(0)}m held</div>
+                                                                              </div>`;
                 }).join('');
             }
 
@@ -2841,131 +2862,131 @@
 
         const TAB_HTML = {
             risk: () => `
-                                                                    <div class="sm-section">
-                                                                        <div class="sm-section-title">Capital &amp; Exposure</div>
-                                                                        <div class="sm-grid">
-                                                                            ${field('TOTAL_BUDGET', 'Total Budget ($)', 'number', CFG.TOTAL_BUDGET, 'Total capital allocated to the bot')}
-                                                                            ${field('POSITION_SIZE', 'Position Size ($)', 'number', CFG.POSITION_SIZE, 'Dollar size per trade')}
-                                                                            ${field('MAX_POSITIONS', 'Max Open Positions', 'number', CFG.MAX_POSITIONS, 'Concurrent position limit')}
-                                                                            ${field('MAX_QTY_SANITY', 'Max Qty Sanity Cap', 'number', CFG.MAX_QTY_SANITY, 'Hard ceiling on share quantity')}
-                                                                            ${field('COMMISSION_PER_SIDE', 'Commission / Side ($)', 'number', CFG.COMMISSION_PER_SIDE, 'IBKR flat fee per order leg')}
-                                                                        </div>
-                                                                    </div>
-                                                                    <div class="sm-section">
-                                                                        <div class="sm-section-title">P&amp;L Limits</div>
-                                                                        <div class="sm-grid">
-                                                                            ${field('DAILY_PROFIT_GOAL', 'Daily Profit Goal ($)', 'number', CFG.DAILY_PROFIT_GOAL, 'Target profit to halt new entries')}
-                                                                            ${field('MAX_DAILY_LOSS', 'Max Daily Loss ($)', 'number', CFG.MAX_DAILY_LOSS, 'Bot halts when this loss is hit (stored as positive)')}
-                                                                            ${field('MAX_LOSS_PER_TRADE', 'Max Loss / Trade ($)', 'number', CFG.MAX_LOSS_PER_TRADE, 'Dollar stop per individual trade')}
-                                                                            ${field('RISK_PCT', 'Risk % of Budget', 'number', CFG.RISK_PCT, 'Fractional risk per trade (e.g. 0.015 = 1.5%)')}
-                                                                            ${field('MAX_TRADES_PER_DAY', 'Max Trades / Day', 'number', CFG.MAX_TRADES_PER_DAY, 'Hard cap on daily trade count')}
-                                                                        </div>
-                                                                    </div>`,
+                                                                            <div class="sm-section">
+                                                                                <div class="sm-section-title">Capital &amp; Exposure</div>
+                                                                                <div class="sm-grid">
+                                                                                    ${field('TOTAL_BUDGET', 'Total Budget ($)', 'number', CFG.TOTAL_BUDGET, 'Total capital allocated to the bot')}
+                                                                                    ${field('POSITION_SIZE', 'Position Size ($)', 'number', CFG.POSITION_SIZE, 'Dollar size per trade')}
+                                                                                    ${field('MAX_POSITIONS', 'Max Open Positions', 'number', CFG.MAX_POSITIONS, 'Concurrent position limit')}
+                                                                                    ${field('MAX_QTY_SANITY', 'Max Qty Sanity Cap', 'number', CFG.MAX_QTY_SANITY, 'Hard ceiling on share quantity')}
+                                                                                    ${field('COMMISSION_PER_SIDE', 'Commission / Side ($)', 'number', CFG.COMMISSION_PER_SIDE, 'IBKR flat fee per order leg')}
+                                                                                </div>
+                                                                            </div>
+                                                                            <div class="sm-section">
+                                                                                <div class="sm-section-title">P&amp;L Limits</div>
+                                                                                <div class="sm-grid">
+                                                                                    ${field('DAILY_PROFIT_GOAL', 'Daily Profit Goal ($)', 'number', CFG.DAILY_PROFIT_GOAL, 'Target profit to halt new entries')}
+                                                                                    ${field('MAX_DAILY_LOSS', 'Max Daily Loss ($)', 'number', CFG.MAX_DAILY_LOSS, 'Bot halts when this loss is hit (stored as positive)')}
+                                                                                    ${field('MAX_LOSS_PER_TRADE', 'Max Loss / Trade ($)', 'number', CFG.MAX_LOSS_PER_TRADE, 'Dollar stop per individual trade')}
+                                                                                    ${field('RISK_PCT', 'Risk % of Budget', 'number', CFG.RISK_PCT, 'Fractional risk per trade (e.g. 0.015 = 1.5%)')}
+                                                                                    ${field('MAX_TRADES_PER_DAY', 'Max Trades / Day', 'number', CFG.MAX_TRADES_PER_DAY, 'Hard cap on daily trade count')}
+                                                                                </div>
+                                                                            </div>`,
 
             strategy: () => `
-                                                                    <div class="sm-section">
-                                                                        <div class="sm-section-title">Timing &amp; Cooldowns</div>
-                                                                        <div class="sm-grid">
-                                                                            ${field('MIN_HOLD_SECONDS', 'Min Hold (seconds)', 'number', CFG.MIN_HOLD_SECONDS, 'Minimum seconds before any exit is considered')}
-                                                                            ${field('COOLDOWN_SECONDS', 'Cooldown (seconds)', 'number', CFG.COOLDOWN_SECONDS, 'Per-symbol cooldown after a trade closes')}
-                                                                            ${field('ORB_MINUTES', 'ORB Window (minutes)', 'number', CFG.ORB_MINUTES, 'Opening range breakout period length')}
-                                                                            ${field('VWAP_CONFIRM_BARS', 'VWAP Confirm Bars', 'number', CFG.VWAP_CONFIRM_BARS, 'Bars price must be above/below VWAP to confirm')}
-                                                                        </div>
-                                                                    </div>
-                                                                    <div class="sm-section">
-                                                                        <div class="sm-section-title">Stop &amp; Trail Multipliers</div>
-                                                                        <div class="sm-grid">
-                                                                            ${field('ATR_TRAIL_MULT', 'ATR Trail Mult (Long)', 'number', CFG.ATR_TRAIL_MULT, 'ATR multiplier for trailing stop on longs')}
-                                                                            ${field('SHORT_ATR_TRAIL', 'ATR Trail Mult (Short)', 'number', CFG.SHORT_ATR_TRAIL, 'ATR multiplier for trailing stop on shorts')}
-                                                                            ${field('HARD_STOP_ATR_MULT', 'Hard Stop ATR Mult', 'number', CFG.HARD_STOP_ATR_MULT, 'ATR multiplier for initial hard stop')}
-                                                                            ${field('MIN_STOP_DISTANCE', 'Min Stop Distance ($)', 'number', CFG.MIN_STOP_DISTANCE, 'Floor on stop distance in dollars')}
-                                                                        </div>
-                                                                    </div>
-                                                                    <div class="sm-section">
-                                                                        <div class="sm-section-title">Direction</div>
-                                                                        <div class="sm-toggle-row">
-                                                                            <div>
-                                                                                <div class="sm-toggle-lbl">Allow Short Selling</div>
-                                                                                <div class="sm-toggle-sub">Requires a margin account. Disabled by default.</div>
+                                                                            <div class="sm-section">
+                                                                                <div class="sm-section-title">Timing &amp; Cooldowns</div>
+                                                                                <div class="sm-grid">
+                                                                                    ${field('MIN_HOLD_SECONDS', 'Min Hold (seconds)', 'number', CFG.MIN_HOLD_SECONDS, 'Minimum seconds before any exit is considered')}
+                                                                                    ${field('COOLDOWN_SECONDS', 'Cooldown (seconds)', 'number', CFG.COOLDOWN_SECONDS, 'Per-symbol cooldown after a trade closes')}
+                                                                                    ${field('ORB_MINUTES', 'ORB Window (minutes)', 'number', CFG.ORB_MINUTES, 'Opening range breakout period length')}
+                                                                                    ${field('VWAP_CONFIRM_BARS', 'VWAP Confirm Bars', 'number', CFG.VWAP_CONFIRM_BARS, 'Bars price must be above/below VWAP to confirm')}
+                                                                                </div>
                                                                             </div>
-                                                                            <label class="toggle-switch">
-                                                                                <input type="checkbox" id="cfg-ALLOW_SHORTS" ${CFG.ALLOW_SHORTS ? 'checked' : ''}>
-                                                                                <span class="toggle-slider"></span>
-                                                                            </label>
-                                                                        </div>
-                                                                    </div>`,
+                                                                            <div class="sm-section">
+                                                                                <div class="sm-section-title">Stop &amp; Trail Multipliers</div>
+                                                                                <div class="sm-grid">
+                                                                                    ${field('ATR_TRAIL_MULT', 'ATR Trail Mult (Long)', 'number', CFG.ATR_TRAIL_MULT, 'ATR multiplier for trailing stop on longs')}
+                                                                                    ${field('SHORT_ATR_TRAIL', 'ATR Trail Mult (Short)', 'number', CFG.SHORT_ATR_TRAIL, 'ATR multiplier for trailing stop on shorts')}
+                                                                                    ${field('HARD_STOP_ATR_MULT', 'Hard Stop ATR Mult', 'number', CFG.HARD_STOP_ATR_MULT, 'ATR multiplier for initial hard stop')}
+                                                                                    ${field('MIN_STOP_DISTANCE', 'Min Stop Distance ($)', 'number', CFG.MIN_STOP_DISTANCE, 'Floor on stop distance in dollars')}
+                                                                                </div>
+                                                                            </div>
+                                                                            <div class="sm-section">
+                                                                                <div class="sm-section-title">Direction</div>
+                                                                                <div class="sm-toggle-row">
+                                                                                    <div>
+                                                                                        <div class="sm-toggle-lbl">Allow Short Selling</div>
+                                                                                        <div class="sm-toggle-sub">Requires a margin account. Disabled by default.</div>
+                                                                                    </div>
+                                                                                    <label class="toggle-switch">
+                                                                                        <input type="checkbox" id="cfg-ALLOW_SHORTS" ${CFG.ALLOW_SHORTS ? 'checked' : ''}>
+                                                                                        <span class="toggle-slider"></span>
+                                                                                    </label>
+                                                                                </div>
+                                                                            </div>`,
 
             filters: () => `
-                                                                    <div class="sm-section">
-                                                                        <div class="sm-section-title">Volatility &amp; Volume Filters</div>
-                                                                        <div class="sm-grid">
-                                                                            ${field('MIN_ATR_PCT', 'Min ATR %', 'number', CFG.MIN_ATR_PCT, 'Skip symbols with ATR below this (e.g. 0.004 = 0.4%)')}
-                                                                            ${field('VOL_EXPAND_MULT', 'Volume Expansion Mult', 'number', CFG.VOL_EXPAND_MULT, 'Require volume this many times average for entry')}
-                                                                            ${field('GAP_GO_MIN_PCT', 'Gap-Go Min Gap %', 'number', CFG.GAP_GO_MIN_PCT, 'Minimum gap size for gap-and-go strategy (e.g. 0.008 = 0.8%)')}
-                                                                            ${field('GAP_GO_REL_VOL', 'Gap-Go Relative Vol', 'number', CFG.GAP_GO_REL_VOL, 'Minimum relative volume for gap-and-go confirmation')}
-                                                                        </div>
-                                                                    </div>
-                                                                    <div class="sm-section">
-                                                                        <div class="sm-section-title">RSI Thresholds</div>
-                                                                        <div class="sm-grid">
-                                                                            ${field('RSI_LONG_MIN', 'RSI Long Min', 'number', CFG.RSI_LONG_MIN, 'Minimum RSI to enter a long position')}
-                                                                            ${field('RSI_SHORT_MAX', 'RSI Short Max', 'number', CFG.RSI_SHORT_MAX, 'Maximum RSI to enter a short position')}
-                                                                            ${field('RSI_OVERSOLD', 'RSI Oversold Level', 'number', CFG.RSI_OVERSOLD, 'RSI oversold threshold (mean-reversion long signal)')}
-                                                                            ${field('RSI_OVERBOUGHT', 'RSI Overbought Level', 'number', CFG.RSI_OVERBOUGHT, 'RSI overbought threshold (mean-reversion short signal)')}
-                                                                        </div>
-                                                                    </div>
-                                                                    <div class="sm-section">
-                                                                        <div class="sm-section-title">IBKR Market Data Lines
-                                                                            <span style="font-size:9px;color:var(--yellow);font-weight:400;margin-left:8px">
-                                                                                ⚠ Free accounts = 100 lines · Booster Pack adds 100 more
-                                                                            </span>
-                                                                        </div>
-                                                                        <div style="background:rgba(210,153,34,.08);border:1px solid rgba(210,153,34,.25);border-radius:5px;padding:8px 10px;margin-bottom:10px;font-size:10px;color:var(--muted);line-height:1.6">
-                                                                            IBKR counts <b style="color:var(--text)">data lines</b>, not symbols.
-                                                                            If your adapter calls <code style="color:var(--blue)">reqMktData</code> only → <b>1 line/symbol</b>.
-                                                                            If it also calls <code style="color:var(--blue)">reqRealTimeBars</code> → <b>6 lines/symbol</b> (1+5).
-                                                                            Set <b style="color:var(--text)">Data Lines / Symbol</b> to match your adapter so the bot
-                                                                            auto-caps subscriptions and prioritises symbols with open positions.
-                                                                            Current budget: <b style="color:var(--green)">${Math.floor((CFG.MAX_MARKET_DATA_LINES || 95) / (CFG.DATA_LINES_PER_SYMBOL || 1))} symbols</b> can be subscribed simultaneously.
-                                                                        </div>
-                                                                        <div class="sm-grid">
-                                                                            ${field('DATA_LINES_PER_SYMBOL', 'Data Lines / Symbol', 'number', CFG.DATA_LINES_PER_SYMBOL, '1 = reqMktData only · 6 = reqMktData + reqRealTimeBars')}
-                                                                            ${field('MAX_MARKET_DATA_LINES', 'Max Data Lines (account limit)', 'number', CFG.MAX_MARKET_DATA_LINES, 'Set 5 below your IBKR limit as a safety buffer (e.g. 95 for a 100-line account)')}
-                                                                        </div>
-                                                                    </div>`,
+                                                                            <div class="sm-section">
+                                                                                <div class="sm-section-title">Volatility &amp; Volume Filters</div>
+                                                                                <div class="sm-grid">
+                                                                                    ${field('MIN_ATR_PCT', 'Min ATR %', 'number', CFG.MIN_ATR_PCT, 'Skip symbols with ATR below this (e.g. 0.004 = 0.4%)')}
+                                                                                    ${field('VOL_EXPAND_MULT', 'Volume Expansion Mult', 'number', CFG.VOL_EXPAND_MULT, 'Require volume this many times average for entry')}
+                                                                                    ${field('GAP_GO_MIN_PCT', 'Gap-Go Min Gap %', 'number', CFG.GAP_GO_MIN_PCT, 'Minimum gap size for gap-and-go strategy (e.g. 0.008 = 0.8%)')}
+                                                                                    ${field('GAP_GO_REL_VOL', 'Gap-Go Relative Vol', 'number', CFG.GAP_GO_REL_VOL, 'Minimum relative volume for gap-and-go confirmation')}
+                                                                                </div>
+                                                                            </div>
+                                                                            <div class="sm-section">
+                                                                                <div class="sm-section-title">RSI Thresholds</div>
+                                                                                <div class="sm-grid">
+                                                                                    ${field('RSI_LONG_MIN', 'RSI Long Min', 'number', CFG.RSI_LONG_MIN, 'Minimum RSI to enter a long position')}
+                                                                                    ${field('RSI_SHORT_MAX', 'RSI Short Max', 'number', CFG.RSI_SHORT_MAX, 'Maximum RSI to enter a short position')}
+                                                                                    ${field('RSI_OVERSOLD', 'RSI Oversold Level', 'number', CFG.RSI_OVERSOLD, 'RSI oversold threshold (mean-reversion long signal)')}
+                                                                                    ${field('RSI_OVERBOUGHT', 'RSI Overbought Level', 'number', CFG.RSI_OVERBOUGHT, 'RSI overbought threshold (mean-reversion short signal)')}
+                                                                                </div>
+                                                                            </div>
+                                                                            <div class="sm-section">
+                                                                                <div class="sm-section-title">IBKR Market Data Lines
+                                                                                    <span style="font-size:9px;color:var(--yellow);font-weight:400;margin-left:8px">
+                                                                                        ⚠ Free accounts = 100 lines · Booster Pack adds 100 more
+                                                                                    </span>
+                                                                                </div>
+                                                                                <div style="background:rgba(210,153,34,.08);border:1px solid rgba(210,153,34,.25);border-radius:5px;padding:8px 10px;margin-bottom:10px;font-size:10px;color:var(--muted);line-height:1.6">
+                                                                                    IBKR counts <b style="color:var(--text)">data lines</b>, not symbols.
+                                                                                    If your adapter calls <code style="color:var(--blue)">reqMktData</code> only → <b>1 line/symbol</b>.
+                                                                                    If it also calls <code style="color:var(--blue)">reqRealTimeBars</code> → <b>6 lines/symbol</b> (1+5).
+                                                                                    Set <b style="color:var(--text)">Data Lines / Symbol</b> to match your adapter so the bot
+                                                                                    auto-caps subscriptions and prioritises symbols with open positions.
+                                                                                    Current budget: <b style="color:var(--green)">${Math.floor((CFG.MAX_MARKET_DATA_LINES || 95) / (CFG.DATA_LINES_PER_SYMBOL || 1))} symbols</b> can be subscribed simultaneously.
+                                                                                </div>
+                                                                                <div class="sm-grid">
+                                                                                    ${field('DATA_LINES_PER_SYMBOL', 'Data Lines / Symbol', 'number', CFG.DATA_LINES_PER_SYMBOL, '1 = reqMktData only · 6 = reqMktData + reqRealTimeBars')}
+                                                                                    ${field('MAX_MARKET_DATA_LINES', 'Max Data Lines (account limit)', 'number', CFG.MAX_MARKET_DATA_LINES, 'Set 5 below your IBKR limit as a safety buffer (e.g. 95 for a 100-line account)')}
+                                                                                </div>
+                                                                            </div>`,
 
             watchlist: () => `
-                                                                    <div class="sm-section">
-                                                                        <div class="sm-section-title">Active Symbols <span style="color:var(--blue);margin-left:6px" id="wl-count">${WL.length} symbols</span></div>
-                                                                        <div class="wl-grid" id="wl-tags">${renderWLTags()}</div>
-                                                                        <div class="wl-add-row">
-                                                                            <input class="wl-add-input" id="wl-new" placeholder="e.g. AMZN, TSLA, SPY…" maxlength="80"
-                                                                                   onkeydown="if(event.key==='Enter')addWLSymbols()">
-                                                                            <button class="wl-add-btn" onclick="addWLSymbols()">+ Add</button>
-                                                                        </div>
-                                                                        <div class="wl-group-label">Default groups</div>
-                                                                        ${Object.entries(WATCHLIST_DEFAULTS).map(([grp, syms]) => `
-                                                                            <div style="margin-bottom:8px">
-                                                                                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-                                                                                    <span style="font-size:10px;color:var(--muted)">${grp}</span>
-                                                                                    <button onclick="addGroupToWL(${JSON.stringify(syms)})"
-                                                                                        style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:3px;padding:1px 8px;font-size:9px;cursor:pointer;transition:color .15s"
-                                                                                        onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">
-                                                                                        + Add all
-                                                                                    </button>
+                                                                            <div class="sm-section">
+                                                                                <div class="sm-section-title">Active Symbols <span style="color:var(--blue);margin-left:6px" id="wl-count">${WL.length} symbols</span></div>
+                                                                                <div class="wl-grid" id="wl-tags">${renderWLTags()}</div>
+                                                                                <div class="wl-add-row">
+                                                                                    <input class="wl-add-input" id="wl-new" placeholder="e.g. AMZN, TSLA, SPY…" maxlength="80"
+                                                                                           onkeydown="if(event.key==='Enter')addWLSymbols()">
+                                                                                    <button class="wl-add-btn" onclick="addWLSymbols()">+ Add</button>
                                                                                 </div>
-                                                                                <div style="display:flex;flex-wrap:wrap;gap:4px">
-                                                                                    ${syms.map(s => `<span style="font-size:10px;font-weight:700;color:${WL.includes(s) ? 'var(--green)' : 'var(--muted)'};cursor:pointer;padding:2px 5px;background:var(--subtle);border-radius:3px" onclick="toggleWLSym('${s}',this)" title="Toggle ${s}">${s}</span>`).join('')}
-                                                                                </div>
-                                                                            </div>`).join('')}
-                                                                    </div>`
+                                                                                <div class="wl-group-label">Default groups</div>
+                                                                                ${Object.entries(WATCHLIST_DEFAULTS).map(([grp, syms]) => `
+                                                                                    <div style="margin-bottom:8px">
+                                                                                        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+                                                                                            <span style="font-size:10px;color:var(--muted)">${grp}</span>
+                                                                                            <button onclick="addGroupToWL(${JSON.stringify(syms)})"
+                                                                                                style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:3px;padding:1px 8px;font-size:9px;cursor:pointer;transition:color .15s"
+                                                                                                onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">
+                                                                                                + Add all
+                                                                                            </button>
+                                                                                        </div>
+                                                                                        <div style="display:flex;flex-wrap:wrap;gap:4px">
+                                                                                            ${syms.map(s => `<span style="font-size:10px;font-weight:700;color:${WL.includes(s) ? 'var(--green)' : 'var(--muted)'};cursor:pointer;padding:2px 5px;background:var(--subtle);border-radius:3px" onclick="toggleWLSym('${s}',this)" title="Toggle ${s}">${s}</span>`).join('')}
+                                                                                        </div>
+                                                                                    </div>`).join('')}
+                                                                            </div>`
         };
 
         function field(id, label, type, val, hint = '') {
             return `<div class="sm-field" title="${hint}">
-                                                                    <span class="sm-label">${label}</span>
-                                                                    <input class="sm-input" id="cfg-${id}" type="${type}" value="${val}" step="any">
-                                                                </div>`;
+                                                                            <span class="sm-label">${label}</span>
+                                                                            <input class="sm-input" id="cfg-${id}" type="${type}" value="${val}" step="any">
+                                                                        </div>`;
         }
 
         function renderWLTags() {
@@ -3101,5 +3122,642 @@
             }
         });
     </script>
+
+    <!-- ══════════════════════════════════════════════════════
+         BACKTEST / PERFORMANCE ANALYTICS OVERLAY
+    ══════════════════════════════════════════════════════ -->
+    <div id="bt-overlay" onclick="if(event.target===this)closeBacktest()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:2000;overflow:auto;padding:20px">
+        <div id="bt-modal" style="max-width:1100px;margin:0 auto;background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow:hidden">
+
+            <!-- Header -->
+            <div style="border-bottom:1px solid var(--border);background:rgba(88,166,255,.05)">
+                <!-- Title row -->
+                <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px 10px">
+                    <div>
+                        <span style="font-size:15px;font-weight:700;color:var(--blue)">📊 Performance Analytics</span>
+                        <span id="bt-datasummary" style="font-size:10px;color:var(--muted);margin-left:12px"></span>
+                    </div>
+                    <div style="display:flex;gap:8px;align-items:center">
+                        <button onclick="loadBacktest()" style="background:rgba(88,166,255,.12);border:1px solid rgba(88,166,255,.3);color:var(--blue);border-radius:5px;padding:4px 12px;font-size:11px;cursor:pointer;font-weight:600">↻ Refresh</button>
+                        <button onclick="closeBacktest()" style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:5px;padding:4px 12px;font-size:11px;cursor:pointer">✕ Close</button>
+                    </div>
+                </div>
+                <!-- Mode bar -->
+                <div style="display:flex;align-items:center;gap:10px;padding:0 18px 12px;flex-wrap:wrap">
+                    <div style="display:flex;gap:0;border:1px solid var(--border);border-radius:6px;overflow:hidden">
+                        <button id="bt-mode-live" onclick="btSetMode('live')" style="padding:5px 14px;font-size:11px;font-weight:600;cursor:pointer;border:none;background:var(--blue);color:#0d1117">📈 Live Analytics</button>
+                        <button id="bt-mode-hist" onclick="btSetMode('hist')" style="padding:5px 14px;font-size:11px;font-weight:600;cursor:pointer;border:none;background:var(--panel);color:var(--muted)">🕰 Historical Backtest</button>
+                    </div>
+                    <!-- Historical controls (hidden in live mode) -->
+                    <div id="bt-hist-controls" style="display:none;align-items:center;gap:8px;flex-wrap:wrap">
+                        <label style="font-size:10px;color:var(--muted)">FROM</label>
+                        <input type="date" id="bt-from" value="2025-01-01" style="background:var(--bg);border:1px solid var(--border);color:var(--fg);border-radius:4px;padding:3px 7px;font-size:11px">
+                        <label style="font-size:10px;color:var(--muted)">TO</label>
+                        <input type="date" id="bt-to" style="background:var(--bg);border:1px solid var(--border);color:var(--fg);border-radius:4px;padding:3px 7px;font-size:11px">
+                        <button onclick="runHistoricalBacktest()" style="background:rgba(63,185,80,.15);border:1px solid rgba(63,185,80,.4);color:#3fb950;border-radius:5px;padding:5px 14px;font-size:11px;font-weight:700;cursor:pointer">▶ Run Backtest</button>
+                        <span style="font-size:9px;color:var(--muted)">Fetches Yahoo Finance daily bars · results ~10–30s</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Loading state -->
+            <div id="bt-loading" style="padding:60px;text-align:center;color:var(--muted)">
+                <div style="font-size:28px;margin-bottom:12px">⏳</div>
+                <div style="font-size:13px">Running analysis…</div>
+            </div>
+
+            <!-- Content (hidden until loaded) -->
+            <div id="bt-content" style="display:none;padding:16px">
+
+                <!-- Period Tabs -->
+                <div style="display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap">
+                    <span style="font-size:10px;color:var(--muted);align-self:center;margin-right:4px">PERIOD:</span>
+                    <button class="bt-ptab active" onclick="btSelectPeriod(this,'all')" data-period="all">All Time</button>
+                    <button class="bt-ptab" onclick="btSelectPeriod(this,'1m')" data-period="1m">1 Month</button>
+                    <button class="bt-ptab" onclick="btSelectPeriod(this,'6m')" data-period="6m">6 Months</button>
+                    <button class="bt-ptab" onclick="btSelectPeriod(this,'1y')" data-period="1y">1 Year</button>
+                    <button class="bt-ptab" onclick="btSelectPeriod(this,'2y')" data-period="2y">2 Years</button>
+                    <button class="bt-ptab" onclick="btSelectPeriod(this,'5y')" data-period="5y">5 Years</button>
+                    <span id="bt-projlabel" style="font-size:9px;color:var(--yellow);align-self:center;margin-left:6px"></span>
+                </div>
+
+                <!-- KPI Cards Row -->
+                <div id="bt-kpis" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px;margin-bottom:14px"></div>
+
+                <!-- Charts Row -->
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
+                    <div style="background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:12px">
+                        <div style="font-size:10px;color:var(--muted);font-weight:700;letter-spacing:.5px;margin-bottom:8px">EQUITY CURVE</div>
+                        <div style="position:relative;height:160px;width:100%;overflow:hidden">
+                            <canvas id="bt-equity-chart"></canvas>
+                        </div>
+                    </div>
+                    <div style="background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:12px">
+                        <div style="font-size:10px;color:var(--muted);font-weight:700;letter-spacing:.5px;margin-bottom:8px">ROLLING WIN RATE (7 trades)</div>
+                        <div style="position:relative;height:160px;width:100%;overflow:hidden">
+                            <canvas id="bt-winrate-chart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Strategy + Regime Tables Row -->
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
+                    <!-- Strategy Breakdown -->
+                    <div style="background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:12px">
+                        <div style="font-size:10px;color:var(--muted);font-weight:700;letter-spacing:.5px;margin-bottom:8px">STRATEGY ATTRIBUTION</div>
+                        <table style="width:100%;border-collapse:collapse;font-size:10px" id="bt-strat-table">
+                            <thead>
+                                <tr style="color:var(--muted)">
+                                    <th style="text-align:left;padding:3px 0">Strategy</th>
+                                    <th style="text-align:right">Trades</th>
+                                    <th style="text-align:right">Win%</th>
+                                    <th style="text-align:right">Net PnL</th>
+                                    <th style="text-align:right">PF</th>
+                                    <th style="text-align:right">Avg Hold</th>
+                                    <th style="text-align:right" title="Avg Max Adverse Excursion — how far sim trades moved against you before closing">MAE</th>
+                                </tr>
+                            </thead>
+                            <tbody id="bt-strat-body"></tbody>
+                        </table>
+                    </div>
+                    <!-- Regime Breakdown -->
+                    <div style="background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:12px">
+                        <div style="font-size:10px;color:var(--muted);font-weight:700;letter-spacing:.5px;margin-bottom:8px">PERFORMANCE BY REGIME</div>
+                        <div style="position:relative;height:130px;width:100%;overflow:hidden">
+                            <canvas id="bt-regime-chart"></canvas>
+                        </div>
+                        <table style="width:100%;border-collapse:collapse;font-size:10px;margin-top:8px" id="bt-regime-table">
+                            <thead>
+                                <tr style="color:var(--muted)">
+                                    <th style="text-align:left;padding:3px 0">Regime</th>
+                                    <th style="text-align:right">Trades</th>
+                                    <th style="text-align:right">Win%</th>
+                                    <th style="text-align:right">Net PnL</th>
+                                    <th style="text-align:right">PF</th>
+                                </tr>
+                            </thead>
+                            <tbody id="bt-regime-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Monthly PnL Heatmap + MAE Analysis + Period Table -->
+                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px">
+                    <div style="background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:12px">
+                        <div style="font-size:10px;color:var(--muted);font-weight:700;letter-spacing:.5px;margin-bottom:8px">MONTHLY P&amp;L</div>
+                        <div style="position:relative;height:140px;width:100%;overflow:hidden">
+                            <canvas id="bt-monthly-chart"></canvas>
+                        </div>
+                    </div>
+                    <div style="background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:12px">
+                        <div style="font-size:10px;color:var(--muted);font-weight:700;letter-spacing:.5px;margin-bottom:4px">MAE vs PnL <span style="font-weight:400;font-size:9px">(sim / historical trades)</span></div>
+                        <div style="font-size:9px;color:var(--muted);margin-bottom:6px">Each dot = 1 trade. X = adverse excursion, Y = net PnL.</div>
+                        <div style="position:relative;height:150px;width:100%;overflow:hidden">
+                            <canvas id="bt-mae-chart"></canvas>
+                        </div>
+                    </div>
+                    <div style="background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:12px">
+                        <div style="font-size:10px;color:var(--muted);font-weight:700;letter-spacing:.5px;margin-bottom:8px">PERIOD PROJECTIONS</div>
+                        <table style="width:100%;border-collapse:collapse;font-size:10px">
+                            <thead>
+                                <tr style="color:var(--muted)">
+                                    <th style="text-align:left;padding:3px 0">Period</th>
+                                    <th style="text-align:right">PnL</th>
+                                    <th style="text-align:right">Win%</th>
+                                    <th style="text-align:right">MaxDD</th>
+                                    <th style="text-align:right">Sharpe</th>
+                                </tr>
+                            </thead>
+                            <tbody id="bt-period-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Simulation note (if any) -->
+                <div id="bt-simnote" style="display:none;background:rgba(88,166,255,.06);border:1px solid rgba(88,166,255,.2);border-radius:6px;padding:10px 14px;margin-bottom:14px;font-size:10px;color:var(--muted)"></div>
+
+                <!-- Trade List -->
+                <div style="background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:12px">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                        <div style="font-size:10px;color:var(--muted);font-weight:700;letter-spacing:.5px">TRADE LOG</div>
+                        <div style="display:flex;gap:6px">
+                            <select id="bt-filter-strat" onchange="btRenderTrades()" style="background:var(--subtle);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 6px;font-size:10px">
+                                <option value="">All Strategies</option>
+                            </select>
+                            <select id="bt-filter-regime" onchange="btRenderTrades()" style="background:var(--subtle);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 6px;font-size:10px">
+                                <option value="">All Regimes</option>
+                            </select>
+                            <select id="bt-filter-type" onchange="btRenderTrades()" style="background:var(--subtle);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 6px;font-size:10px">
+                                <option value="">Real + Sim</option>
+                                <option value="real">Real Only</option>
+                                <option value="sim">Sim Only</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div style="max-height:260px;overflow-y:auto">
+                        <table style="width:100%;border-collapse:collapse;font-size:10px">
+                            <thead style="position:sticky;top:0;background:var(--bg)">
+                                <tr style="color:var(--muted)">
+                                    <th style="text-align:left;padding:3px 4px">Date</th>
+                                    <th style="text-align:left">Symbol</th>
+                                    <th style="text-align:left">Strategy</th>
+                                    <th style="text-align:left">Side</th>
+                                    <th style="text-align:left">Regime</th>
+                                    <th style="text-align:right">Entry</th>
+                                    <th style="text-align:right">Exit</th>
+                                    <th style="text-align:right">Qty</th>
+                                    <th style="text-align:right">Net PnL</th>
+                                    <th style="text-align:right">Hold</th>
+                                    <th style="text-align:right">Exit</th>
+                                    <th style="text-align:center">Src</th>
+                                </tr>
+                            </thead>
+                            <tbody id="bt-trades-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+            </div><!-- /bt-content -->
+        </div><!-- /bt-modal -->
+    </div><!-- /bt-overlay -->
+
+    <style>
+        .bt-ptab {
+            background: var(--subtle);
+            border: 1px solid var(--border);
+            color: var(--muted);
+            border-radius: 5px;
+            padding: 3px 10px;
+            font-size: 10px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all .15s;
+        }
+
+            .bt-ptab.active {
+                background: rgba(88,166,255,.15);
+                border-color: var(--blue);
+                color: var(--blue);
+            }
+
+            .bt-ptab:hover:not(.active) {
+                color: var(--text);
+                border-color: var(--subtle);
+            }
+
+        .bt-kpi {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 7px;
+            padding: 10px 12px;
+        }
+
+            .bt-kpi .lbl {
+                font-size: 9px;
+                color: var(--muted);
+                text-transform: uppercase;
+                letter-spacing: .5px;
+                margin-bottom: 3px;
+            }
+
+            .bt-kpi .val {
+                font-size: 18px;
+                font-weight: 700;
+                font-variant-numeric: tabular-nums;
+            }
+
+            .bt-kpi .sub {
+                font-size: 9px;
+                color: var(--muted);
+                margin-top: 2px;
+            }
+
+        #bt-trades-body tr:hover {
+            background: rgba(255,255,255,.03);
+        }
+
+        #bt-trades-body td {
+            padding: 3px 4px;
+            border-bottom: 1px solid rgba(33,38,45,.6);
+        }
+    </style>
+
+    <script>
+    // ── Backtest JS ──────────────────────────────────────────────────────────
+    let _btData = null;
+    let _btPeriod = 'all';
+    let _btCharts = {};
+    let _btMode = 'live';  // 'live' | 'hist'
+
+    // Set default "to" date to yesterday
+    (function() {
+        const d = new Date(); d.setDate(d.getDate()-1);
+        const toEl = document.getElementById('bt-to');
+        if (toEl) toEl.value = d.toISOString().split('T')[0];
+    })();
+
+    function btSetMode(mode) {
+        _btMode = mode;
+        const histCtrl = document.getElementById('bt-hist-controls');
+        const livBtn   = document.getElementById('bt-mode-live');
+        const hiBtn    = document.getElementById('bt-mode-hist');
+        if (mode === 'hist') {
+            histCtrl.style.display = 'flex';
+            livBtn.style.background = 'var(--panel)'; livBtn.style.color = 'var(--muted)';
+            hiBtn.style.background  = 'var(--blue)';  hiBtn.style.color  = '#0d1117';
+        } else {
+            histCtrl.style.display = 'none';
+            livBtn.style.background = 'var(--blue)';  livBtn.style.color = '#0d1117';
+            hiBtn.style.background  = 'var(--panel)'; hiBtn.style.color  = 'var(--muted)';
+            loadBacktest();
+        }
+    }
+
+    async function runHistoricalBacktest() {
+        const from = document.getElementById('bt-from').value;
+        const to   = document.getElementById('bt-to').value;
+        if (!from || !to) { alert('Please select a From and To date.'); return; }
+        document.getElementById('bt-loading').style.display = 'block';
+        document.getElementById('bt-content').style.display = 'none';
+        document.getElementById('bt-datasummary').textContent = '';
+        // Show informative loading message
+        document.querySelector('#bt-loading div:last-child').textContent =
+            `Fetching Yahoo Finance daily bars for ${from} → ${to}. This takes 10–30s…`;
+        try {
+            const url = API.replace('/api/status', `/api/backtest/historical?from=${from}&to=${to}`);
+            const res = await fetch(url);
+            _btData = await res.json();
+            if (_btData.error) throw new Error(_btData.error);
+            btRender();
+        } catch(e) {
+            document.getElementById('bt-loading').innerHTML =
+                `<div style="color:var(--red);padding:40px;text-align:center">❌ ${e.message}</div>`;
+        }
+    }
+
+    function openBacktest() {
+        document.getElementById('bt-overlay').style.display = 'block';
+        if (!_btData) loadBacktest();
+    }
+    function closeBacktest() {
+        document.getElementById('bt-overlay').style.display = 'none';
+    }
+
+    async function loadBacktest() {
+        document.getElementById('bt-loading').style.display = 'block';
+        document.getElementById('bt-content').style.display = 'none';
+        document.querySelector('#bt-loading div:last-child').textContent = 'Running analysis…';
+        try {
+            const res = await fetch(API.replace('/api/status', '/api/backtest'));
+            _btData = await res.json();
+            if (_btData.error) throw new Error(_btData.error);
+            btRender();
+        } catch(e) {
+            document.getElementById('bt-loading').innerHTML =
+                `<div style="color:var(--red);padding:40px;text-align:center">⚠ ${e.message}<br><small style="color:var(--muted)">Run the bot first so trade data accumulates.</small></div>`;
+        }
+    }
+
+    function btRender() {
+        const d = _btData;
+        document.getElementById('bt-loading').style.display = 'none';
+        document.getElementById('bt-content').style.display = 'block';
+        document.getElementById('bt-datasummary').textContent = d.DataSummary || '';
+
+        // Sim / historical note
+        if (d.IsHistoricalMode) {
+            const sn = document.getElementById('bt-simnote');
+            sn.style.display = 'block';
+            sn.style.background = 'rgba(63,185,80,.08)';
+            sn.style.borderColor = 'rgba(63,185,80,.3)';
+            sn.innerHTML = `<b style="color:#3fb950">🕰 Historical Backtest:</b> ${d.HistoricalTradesTotal} trades simulated on Yahoo Finance daily bars (${d.HistoricalPeriodLabel}). Entry at daily open + 0.05% slippage · exits via daily H/L stop-target logic. All results are <b>HIST</b> in the trade log.`;
+        } else if (d.SimTrades > 0) {
+            const sn = document.getElementById('bt-simnote');
+            sn.style.display = 'block';
+            sn.innerHTML = `<b style="color:var(--blue)">ℹ Simulation:</b> ${d.SimTrades} additional trades were simulated on available 1-min candle data — Win rate: <b>${d.SimWinRate?.toFixed(1)}%</b>, PnL: <b style="color:${d.SimTotalPnL>=0?'var(--green)':'var(--red)'}">${fmt(d.SimTotalPnL)}</b>, Profit Factor: <b>${d.SimProfitFactor?.toFixed(2)}</b>. These complement real data and are labelled SIM in the trade log.`;
+        }
+
+        // Populate filter selects
+        const strats = [...new Set((d.AllTrades||[]).map(t=>t.Strategy).filter(Boolean))];
+        const regimes= [...new Set((d.AllTrades||[]).map(t=>t.Regime).filter(Boolean))];
+        const ss = document.getElementById('bt-filter-strat');
+        const rs = document.getElementById('bt-filter-regime');
+        ss.innerHTML = '<option value="">All Strategies</option>' + strats.map(s=>`<option>${s}</option>`).join('');
+        rs.innerHTML = '<option value="">All Regimes</option>' + regimes.map(r=>`<option>${r}</option>`).join('');
+
+        btSelectPeriodData('all');
+        btRenderTrades();
+        btRenderStratTable();
+        btRenderRegimeTable();
+        btRenderPeriodTable();
+        btRenderCharts();
+    }
+
+    function btSelectPeriod(btn, period) {
+        document.querySelectorAll('.bt-ptab').forEach(b=>b.classList.remove('active'));
+        btn.classList.add('active');
+        _btPeriod = period;
+        btSelectPeriodData(period);
+        btRenderKPIs();
+    }
+
+    let _btPeriodData = null;
+    function btSelectPeriodData(period) {
+        const d = _btData;
+        if (!d) return;
+        if (period === 'all') {
+            _btPeriodData = { wins: d.Wins, losses: d.Losses, winRate: d.WinRate, totalPnL: d.TotalPnL,
+                              maxDD: d.MaxDrawdown, pf: d.ProfitFactor, sharpe: d.SharpeRatio,
+                              avgWin: d.AvgWin, avgLoss: d.AvgLoss, avgHold: d.AvgHoldMinutes,
+                              maxConsecL: d.MaxConsecLosses, largestWin: d.LargestWin, largestLoss: d.LargestLoss,
+                              isProjected: false, note: '' };
+        } else {
+            const labelMap = { '1m':'1 Month','6m':'6 Months','1y':'1 Year','2y':'2 Years','5y':'5 Years' };
+            const ps = (d.ByPeriod||[]).find(p=>p.Label===labelMap[period]);
+            if (ps) {
+                _btPeriodData = { wins: ps.Wins, losses: ps.Trades-ps.Wins, winRate: ps.WinRate,
+                                  totalPnL: ps.TotalPnL, maxDD: ps.MaxDrawdown, pf: ps.ProfitFactor,
+                                  sharpe: ps.SharpeRatio, avgWin: d.AvgWin, avgLoss: d.AvgLoss,
+                                  avgHold: d.AvgHoldMinutes, maxConsecL: d.MaxConsecLosses,
+                                  largestWin: d.LargestWin, largestLoss: d.LargestLoss,
+                                  isProjected: ps.IsProjected, note: ps.DataNote };
+            }
+        }
+        const lbl = document.getElementById('bt-projlabel');
+        if (_btPeriodData?.isProjected) {
+            lbl.textContent = '⚠ Projected — ' + (_btPeriodData.note || '');
+            lbl.style.display = 'inline';
+        } else { lbl.style.display = 'none'; }
+        btRenderKPIs();
+    }
+
+    function btRenderKPIs() {
+        const p = _btPeriodData; if (!p) return;
+        const kpis = [
+            { lbl:'Total PnL', val: fmt(p.totalPnL), color: p.totalPnL>=0?'var(--green)':'var(--red)', sub: p.isProjected?'projected':'' },
+            { lbl:'Win Rate',  val: (p.winRate||0).toFixed(1)+'%', color: (p.winRate||0)>=55?'var(--green)':(p.winRate||0)>=45?'var(--yellow)':'var(--red)', sub: `${p.wins}W / ${p.losses}L` },
+            { lbl:'Profit Factor', val: (p.pf||0).toFixed(2), color: (p.pf||0)>=1.5?'var(--green)':(p.pf||0)>=1?'var(--yellow)':'var(--red)', sub:'' },
+            { lbl:'Max Drawdown', val: fmt(-Math.abs(p.maxDD||0)), color:'var(--red)', sub:'' },
+            { lbl:'Sharpe Ratio', val: (p.sharpe||0).toFixed(2), color: (p.sharpe||0)>=1?'var(--green)':(p.sharpe||0)>=0?'var(--yellow)':'var(--red)', sub:'annualised' },
+            { lbl:'Avg Win', val: fmt(p.avgWin||0), color:'var(--green)', sub:'' },
+            { lbl:'Avg Loss', val: fmt(p.avgLoss||0), color:'var(--red)', sub:'' },
+            { lbl:'Avg Hold', val: ((p.avgHold||0)).toFixed(0)+'m', color:'var(--blue)', sub:'' },
+            { lbl:'Max Consec. Losses', val: p.maxConsecL||0, color: (p.maxConsecL||0)>=4?'var(--red)':'var(--text)', sub:'' },
+            { lbl:'Largest Win',  val: fmt(p.largestWin||0),  color:'var(--green)', sub:'' },
+            { lbl:'Largest Loss', val: fmt(p.largestLoss||0), color:'var(--red)', sub:'' },
+            { lbl:'Avg MAE (sim)', val: fmt(_btData?.AvgMae||0), color:'var(--orange)', sub:'max adverse excursion' },
+        ];
+        document.getElementById('bt-kpis').innerHTML = kpis.map(k=>`
+            <div class="bt-kpi">
+                <div class="lbl">${k.lbl}</div>
+                <div class="val" style="color:${k.color}">${k.val}</div>
+                ${k.sub?`<div class="sub">${k.sub}</div>`:''}
+            </div>`).join('');
+    }
+
+    function btRenderStratTable() {
+        const rows = (_btData?.ByStrategy||[]);
+        document.getElementById('bt-strat-body').innerHTML = rows.map(r=>{
+            const wr = (r.WinRate||0).toFixed(1);
+            const wrColor = r.WinRate>=55?'var(--green)':r.WinRate>=45?'var(--yellow)':'var(--red)';
+            const maeLabel = r.AvgMae > 0
+                ? `${fmt(r.AvgMae)} <span style="font-size:8px;color:var(--muted)">(${(r.AvgMaePct||0).toFixed(2)}%)</span>`
+                : '<span style="color:var(--muted)">—</span>';
+            return `<tr>
+                <td style="font-weight:700;color:var(--blue)">${r.Strategy}</td>
+                <td style="text-align:right">${r.Trades}</td>
+                <td style="text-align:right;color:${wrColor}">${wr}%</td>
+                <td style="text-align:right;color:${r.TotalPnL>=0?'var(--green)':'var(--red)'}">${fmt(r.TotalPnL)}</td>
+                <td style="text-align:right;color:${r.ProfitFactor>=1.3?'var(--green)':r.ProfitFactor>=1?'var(--yellow)':'var(--red)'}">${(r.ProfitFactor||0).toFixed(2)}</td>
+                <td style="text-align:right;color:var(--muted)">${(r.AvgHoldMin||0).toFixed(0)}m</td>
+                <td style="text-align:right;color:var(--orange)">${maeLabel}</td>
+            </tr>`;
+        }).join('') || '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:12px">No data yet</td></tr>';
+    }
+
+    function btRenderRegimeTable() {
+        const rows = (_btData?.ByRegime||[]);
+        const regimeColor = r => ({ TRENDING:'var(--green)', CHOPPY:'var(--yellow)', 'SELL-OFF':'var(--red)', NORMAL:'var(--blue)', UNKNOWN:'var(--muted)' }[r] || 'var(--muted)');
+        document.getElementById('bt-regime-body').innerHTML = rows.map(r=>{
+            return `<tr>
+                <td style="font-weight:700;color:${regimeColor(r.Regime)}">${r.Regime}</td>
+                <td style="text-align:right">${r.Trades}</td>
+                <td style="text-align:right;color:${r.WinRate>=55?'var(--green)':r.WinRate>=45?'var(--yellow)':'var(--red)'}">${(r.WinRate||0).toFixed(1)}%</td>
+                <td style="text-align:right;color:${r.TotalPnL>=0?'var(--green)':'var(--red)'}">${fmt(r.TotalPnL)}</td>
+                <td style="text-align:right;color:${r.ProfitFactor>=1.3?'var(--green)':r.ProfitFactor>=1?'var(--yellow)':'var(--red)'}">${(r.ProfitFactor||0).toFixed(2)}</td>
+            </tr>`;
+        }).join('') || '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:8px">No regime data — will populate as bot trades</td></tr>';
+    }
+
+    function btRenderPeriodTable() {
+        const rows = (_btData?.ByPeriod||[]);
+        document.getElementById('bt-period-body').innerHTML = rows.map(r=>`
+            <tr style="${r.IsProjected?'opacity:.7':''}">
+                <td style="font-weight:700${r.IsProjected?';color:var(--yellow)':''}">
+                    ${r.IsProjected?'〜 ':''} ${r.Label}
+                    ${r.IsProjected?'<span style="font-size:8px;color:var(--yellow);margin-left:4px">PROJ</span>':''}
+                </td>
+                <td style="text-align:right;color:${r.TotalPnL>=0?'var(--green)':'var(--red)'}">${fmt(r.TotalPnL)}</td>
+                <td style="text-align:right">${(r.WinRate||0).toFixed(1)}%</td>
+                <td style="text-align:right;color:var(--red)">${fmt(-(r.MaxDrawdown||0))}</td>
+                <td style="text-align:right;color:${r.SharpeRatio>=1?'var(--green)':r.SharpeRatio>=0?'var(--yellow)':'var(--red)'}">${(r.SharpeRatio||0).toFixed(2)}</td>
+            </tr>`).join('') || '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:8px">No data yet</td></tr>';
+    }
+
+    function btRenderTrades() {
+        const stratF  = document.getElementById('bt-filter-strat')?.value || '';
+        const regimeF = document.getElementById('bt-filter-regime')?.value || '';
+        const typeF   = document.getElementById('bt-filter-type')?.value || '';
+        let rows = (_btData?.AllTrades||[])
+            .filter(t => (!stratF  || t.Strategy===stratF))
+            .filter(t => (!regimeF || t.Regime===regimeF))
+            .filter(t => (!typeF   || (typeF==='real'&&t.IsReal) || (typeF==='sim'&&!t.IsReal)))
+            .slice().reverse()
+            .slice(0, 300);
+        document.getElementById('bt-trades-body').innerHTML = rows.map(t=>`
+            <tr>
+                <td style="color:var(--muted)">${t.Date} ${t.Time}</td>
+                <td style="font-weight:700">${t.Symbol}</td>
+                <td style="color:var(--blue)">${t.Strategy}</td>
+                <td style="color:${t.Side==='LONG'?'var(--green)':'var(--red)'}">${t.Side}</td>
+                <td style="color:${{TRENDING:'var(--green)',CHOPPY:'var(--yellow)','SELL-OFF':'var(--red)',NORMAL:'var(--blue)'}[t.Regime]||'var(--muted)'}">${t.Regime||'—'}</td>
+                <td style="text-align:right">${t.Entry?.toFixed(2)}</td>
+                <td style="text-align:right">${t.Exit?.toFixed(2)}</td>
+                <td style="text-align:right">${t.Qty}</td>
+                <td style="text-align:right;font-weight:700;color:${t.NetPnL>=0?'var(--green)':'var(--red)'}">${fmt(t.NetPnL)}</td>
+                <td style="text-align:right;color:var(--muted)">${(t.HoldMinutes||0).toFixed(0)}m</td>
+                <td style="text-align:right;color:var(--muted)">${t.ExitReason||'—'}</td>
+                <td style="text-align:center"><span style="font-size:8px;padding:1px 4px;border-radius:3px;background:${t.IsReal?'rgba(63,185,80,.15)':t.IsHistorical?'rgba(210,153,34,.15)':'rgba(88,166,255,.12)'};color:${t.IsReal?'var(--green)':t.IsHistorical?'var(--yellow)':'var(--blue)'}">${t.IsReal?'LIVE':t.IsHistorical?'HIST':'SIM'}</span></td>
+            </tr>`).join('') || '<tr><td colspan="12" style="text-align:center;color:var(--muted);padding:16px">No trades yet — run the bot to accumulate data</td></tr>';
+    }
+
+    function btRenderCharts() {
+        const d = _btData;
+
+        // Destroy old charts
+        Object.values(_btCharts).forEach(c => { try { c.destroy(); } catch(e){} });
+        _btCharts = {};
+
+        // Equity Curve
+        const eq = (d.EquityCurve||[]);
+        if (eq.length) {
+            const ctx = document.getElementById('bt-equity-chart').getContext('2d');
+            _btCharts.equity = new Chart(ctx, {
+                type:'line',
+                data:{
+                    labels: eq.map(p=>p.Date),
+                    datasets:[
+                        { label:'Equity ($)', data: eq.filter(p=>!p.IsProjected).map(p=>p.Equity),
+                          borderColor:'#58a6ff', backgroundColor:'rgba(88,166,255,.07)',
+                          pointRadius:0, fill:true, tension:.3, borderWidth:2 },
+                        { label:'Projected', data: eq.map((p,i)=> p.IsProjected ? p.Equity : (i===eq.findLastIndex(x=>!x.IsProjected) ? p.Equity : null)),
+                          borderColor:'rgba(210,153,34,.6)', backgroundColor:'rgba(210,153,34,.04)',
+                          borderDash:[4,4], pointRadius:0, fill:true, tension:.3, borderWidth:1.5, spanGaps:true }
+                    ]
+                },
+                options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{display:false}, tooltip:{mode:'index',intersect:false} },
+                    scales:{ x:{display:false}, y:{grid:{color:'rgba(255,255,255,.05)'}, ticks:{color:'#7d8590',font:{size:9}, callback:v=>'$'+v.toFixed(0)}} } }
+            });
+        }
+
+        // Rolling Win Rate
+        const rwr = (d.Rolling7Day||[]);
+        if (rwr.length) {
+            const ctx2 = document.getElementById('bt-winrate-chart').getContext('2d');
+            _btCharts.winrate = new Chart(ctx2, {
+                type:'line',
+                data:{ labels:rwr.map(p=>p.Date), datasets:[
+                    { label:'Win Rate %', data:rwr.map(p=>p.WinRate), borderColor:'#3fb950',
+                      backgroundColor:'rgba(63,185,80,.06)', pointRadius:0, fill:true, tension:.3, borderWidth:2 },
+                    { label:'50%', data:rwr.map(()=>50), borderColor:'rgba(255,255,255,.15)', borderDash:[3,3], pointRadius:0, borderWidth:1 }
+                ]},
+                options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{display:false} },
+                    scales:{ x:{display:false}, y:{min:0, max:100, grid:{color:'rgba(255,255,255,.05)'}, ticks:{color:'#7d8590',font:{size:9},callback:v=>v+'%'}} } }
+            });
+        }
+
+        // Regime bar chart
+        const regimes = (d.ByRegime||[]);
+        if (regimes.length) {
+            const regColors = { TRENDING:'#3fb950', CHOPPY:'#d29922', 'SELL-OFF':'#f85149', NORMAL:'#58a6ff', UNKNOWN:'#7d8590' };
+            const ctx3 = document.getElementById('bt-regime-chart').getContext('2d');
+            _btCharts.regime = new Chart(ctx3, {
+                type:'bar',
+                data:{ labels:regimes.map(r=>r.Regime), datasets:[
+                    { label:'Win Rate %', data:regimes.map(r=>r.WinRate),
+                      backgroundColor:regimes.map(r=>regColors[r.Regime]||'#7d8590')+'33',
+                      borderColor:regimes.map(r=>regColors[r.Regime]||'#7d8590'),
+                      borderWidth:2 }
+                ]},
+                options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{display:false} },
+                    scales:{ x:{ticks:{color:'#7d8590',font:{size:9}}}, y:{min:0,max:100,grid:{color:'rgba(255,255,255,.05)'},ticks:{color:'#7d8590',font:{size:9},callback:v=>v+'%'}} } }
+            });
+        }
+
+        // Monthly PnL bar
+        const monthly = (d.ByMonth||[]).filter(m=>!m.IsProjected);
+        if (monthly.length) {
+            const ctx4 = document.getElementById('bt-monthly-chart').getContext('2d');
+            _btCharts.monthly = new Chart(ctx4, {
+                type:'bar',
+                data:{ labels:monthly.map(m=>m.YearMonth), datasets:[
+                    { label:'Monthly PnL', data:monthly.map(m=>m.PnL),
+                      backgroundColor:monthly.map(m=>m.PnL>=0?'rgba(63,185,80,.25)':'rgba(248,81,73,.25)'),
+                      borderColor:monthly.map(m=>m.PnL>=0?'#3fb950':'#f85149'),
+                      borderWidth:2 }
+                ]},
+                options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{display:false} },
+                    scales:{ x:{ticks:{color:'#7d8590',font:{size:9}}}, y:{grid:{color:'rgba(255,255,255,.05)'},ticks:{color:'#7d8590',font:{size:9},callback:v=>'$'+v}} } }
+            });
+        }
+
+
+        // MAE vs PnL scatter (sim trades only, where Mae > 0)
+        const maeData = (d.AllTrades||[]).filter(t => !t.IsReal && t.Mae > 0);
+        if (maeData.length) {
+            const ctx5 = document.getElementById('bt-mae-chart').getContext('2d');
+            _btCharts.mae = new Chart(ctx5, {
+                type: 'scatter',
+                data: { datasets: [
+                    {
+                        label: 'Wins',
+                        data: maeData.filter(t=>t.IsWin).map(t=>({ x: t.Mae, y: t.NetPnL })),
+                        backgroundColor: 'rgba(63,185,80,.5)', borderColor: '#3fb950', pointRadius: 4, pointHoverRadius: 6
+                    },
+                    {
+                        label: 'Losses',
+                        data: maeData.filter(t=>!t.IsWin).map(t=>({ x: t.Mae, y: t.NetPnL })),
+                        backgroundColor: 'rgba(248,81,73,.5)', borderColor: '#f85149', pointRadius: 4, pointHoverRadius: 6
+                    }
+                ]},
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: true, labels: { color: '#7d8590', font: { size: 9 }, boxWidth: 10 } },
+                        tooltip: { callbacks: { label: ctx => `MAE: ${fmt(ctx.raw.x)}  PnL: ${fmt(ctx.raw.y)}` } }
+                    },
+                    scales: {
+                        x: { title: { display: true, text: 'MAE ($)', color: '#7d8590', font: { size: 9 } },
+                             grid: { color: 'rgba(255,255,255,.05)' }, ticks: { color: '#7d8590', font: { size: 9 }, callback: v => '$'+v } },
+                        y: { title: { display: true, text: 'Net PnL ($)', color: '#7d8590', font: { size: 9 } },
+                             grid: { color: 'rgba(255,255,255,.05)' }, ticks: { color: '#7d8590', font: { size: 9 }, callback: v => '$'+v } }
+                    }
+                }
+            });
+        } else {
+            const c = document.getElementById('bt-mae-chart');
+            if (c) { const ctx = c.getContext('2d'); ctx.fillStyle='#7d8590'; ctx.font='11px system-ui'; ctx.textAlign='center'; ctx.fillText('MAE data from sim trades will appear here', c.width/2, c.height/2); }
+        }
+    }
+
+    function fmt(v) {
+        if (v == null) return '—';
+        const n = typeof v === 'number' ? v : parseFloat(v);
+        const abs = Math.abs(n).toFixed(2);
+        return (n >= 0 ? '+$' : '-$') + abs.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    }
+
+    // Close on Escape (add to existing keydown listener)
+    document.addEventListener('keydown', e => { if (e.key==='Escape') closeBacktest(); });
+    </script>
 </body>
-</html>
