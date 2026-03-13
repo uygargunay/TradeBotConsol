@@ -303,17 +303,21 @@ internal static class BtCalc
 public static class BacktestEngine
 {
     private const decimal INITIAL_CAPITAL = 4000m;
-    private const decimal RISK_PCT = 0.012m;
-    private const decimal POSITION_SIZE = 1500m;
+    private const decimal RISK_PCT = 0.008m;
+    private const decimal POSITION_SIZE = 1200m;
     private const decimal HARD_STOP_ATR_MULT = 2.0m;
     private const decimal ATR_TRAIL_MULT = 2.0m;
-    private const decimal TARGET_ATR_MULT = 3.0m;
+    private const decimal TARGET_ATR_MULT = 2.4m;
     private const decimal COMMISSION = 2.0m;  // $1 each side
     private const int MAX_POSITIONS = 2;
     private const int MIN_HOLD_SECONDS = 300;
     private const double RSI_LONG_MIN = 65.0;
     private const double RSI_SHORT_MAX = 35.0;
     private const int ORB_MINUTES = 30;
+    private const decimal BREAK_EVEN_TRIGGER_R = 1.0m;
+    private static readonly HashSet<string> ApprovedSymbols = new(StringComparer.OrdinalIgnoreCase)
+    { "SPY","QQQ","IWM","NVDA","AMD","AAPL","AMZN","MSFT","META","AVGO","MU","NFLX" };
+    private const decimal MIN_BREAKOUT_BODY_RATIO = 0.55m;
 
     // ── Public entry point ─────────────────────────────────────────────────────
     // Called from /api/backtest. Accepts live in-memory data — no file I/O needed.
@@ -736,6 +740,7 @@ public static class BacktestEngine
         // ── Replay ──────────────────────────────────────────────────────────
         foreach (var (symbol, candle) in allEvents)
         {
+            if (!ApprovedSymbols.Contains(symbol)) continue;
             var etTime = candle.Time;  // already ET from the bot's candle data
 
             // Reset daily structures at each new trading day
@@ -800,28 +805,34 @@ public static class BacktestEngine
                 if (!exit && pos.IsShort && candle.High >= pos.HardStop)
                 { exit = true; exitPrice = pos.HardStop; reason = "STOP"; }
 
+                decimal oneR = Math.Max(pos.AtrAtEntry * HARD_STOP_ATR_MULT, 0.10m);
+
                 // Target
                 if (!exit && !pos.IsShort && candle.High >= pos.Target)
                 { exit = true; exitPrice = pos.Target; reason = "TARGET"; }
                 if (!exit && pos.IsShort && candle.Low <= pos.Target)
                 { exit = true; exitPrice = pos.Target; reason = "TARGET"; }
 
-                // Trail (once min-hold passed)
+                // Trail / breakeven protection (once min-hold passed)
                 if (!exit && (etTime - pos.EntryTime).TotalSeconds >= MIN_HOLD_SECONDS)
                 {
                     if (!pos.IsShort)
                     {
                         pos.HighWater = Math.Max(pos.HighWater, candle.High);
                         decimal trail = pos.HighWater - pos.AtrAtEntry * ATR_TRAIL_MULT;
-                        if (candle.Low <= trail && trail > pos.EntryPrice * 0.99m)
-                        { exit = true; exitPrice = trail; reason = "TRAIL"; }
+                        decimal breakEven = pos.HighWater >= pos.EntryPrice + oneR * BREAK_EVEN_TRIGGER_R ? pos.EntryPrice : decimal.MinValue;
+                        decimal activeStop = Math.Max(trail, breakEven);
+                        if (candle.Low <= activeStop && activeStop > pos.EntryPrice * 0.995m)
+                        { exit = true; exitPrice = activeStop; reason = activeStop == breakEven ? "BREAK_EVEN" : "TRAIL"; }
                     }
                     else
                     {
                         pos.LowWater = Math.Min(pos.LowWater, candle.Low);
                         decimal trail = pos.LowWater + pos.AtrAtEntry * ATR_TRAIL_MULT;
-                        if (candle.High >= trail && trail < pos.EntryPrice * 1.01m)
-                        { exit = true; exitPrice = trail; reason = "TRAIL"; }
+                        decimal breakEven = pos.LowWater <= pos.EntryPrice - oneR * BREAK_EVEN_TRIGGER_R ? pos.EntryPrice : decimal.MaxValue;
+                        decimal activeStop = Math.Min(trail, breakEven);
+                        if (candle.High >= activeStop && activeStop < pos.EntryPrice * 1.005m)
+                        { exit = true; exitPrice = activeStop; reason = activeStop == breakEven ? "BREAK_EVEN" : "TRAIL"; }
                     }
                     positions[symbol] = pos;
                 }
@@ -892,6 +903,9 @@ public static class BacktestEngine
             decimal close = candle.Close;
             decimal atr = BtCalc.CalcATR(win, 14);
             if (atr <= 0 || close <= 0) continue;
+            var todayWin = win.Where(c => c.Time.Date == etTime.Date).ToList();
+            decimal todayDollarVolume = todayWin.Sum(c => c.Close * c.Volume);
+            if (todayWin.Count >= 20 && todayDollarVolume < 20000000m) continue;
             double rsi = BtCalc.CalcRSI(win, 14);
             decimal sma20 = BtCalc.CalcSMA(win, 20);
             decimal sma50 = BtCalc.CalcSMA(win, Math.Min(50, win.Count));
@@ -909,7 +923,7 @@ public static class BacktestEngine
 
                 // ORB_LONG: blocked in SELL-OFF or bearish SPY open
                 // Also requires stock to be UP or flat on the day (daily direction filter)
-                if (!blockLongs && orbLongHold && rsi > RSI_LONG_MIN && volOk)
+                if (false && !blockLongs && orbLongHold && rsi > RSI_LONG_MIN && volOk && HasStrongBodyClose(candle, true))
                 {
                     // Stock daily direction check: must be >= -0.2% vs prev candle day's last close
                     bool stockDayOk = true;
@@ -927,32 +941,35 @@ public static class BacktestEngine
                     {
                         int qty = CalcQty(close, atr * HARD_STOP_ATR_MULT);
                         if (qty > 0)
-                            newPos = new BtPosition { Symbol = symbol, IsShort = false, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "ORB_LONG", Regime = regime, HardStop = close - atr * HARD_STOP_ATR_MULT, Target = close + atr * TARGET_ATR_MULT, AtrAtEntry = atr };
+                            newPos = new BtPosition { Symbol = symbol, IsShort = false, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "ORB_LONG", Regime = regime, HardStop = close - atr * HARD_STOP_ATR_MULT, Target = close + atr * TARGET_ATR_MULT, AtrAtEntry = atr, WorstPrice = close };
                     }
                 }
                 // ORB_SHORT: preferred in SELL-OFF / bearish open days
-                else if (orbShortHold && rsi < RSI_SHORT_MAX && volOk)
+                else if (orbShortHold && rsi < RSI_SHORT_MAX && volOk && HasStrongBodyClose(candle, false))
                 {
-                    int qty = CalcQty(close, atr * HARD_STOP_ATR_MULT);
-                    if (qty > 0)
-                        newPos = new BtPosition { Symbol = symbol, IsShort = true, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "ORB_SHORT", Regime = regime, HardStop = close + atr * HARD_STOP_ATR_MULT, Target = close - atr * TARGET_ATR_MULT, AtrAtEntry = atr };
+                    if (!(symbol.Equals("MSTR", StringComparison.OrdinalIgnoreCase) || symbol.Equals("COIN", StringComparison.OrdinalIgnoreCase) || symbol.Equals("TSLA", StringComparison.OrdinalIgnoreCase)) || regime == "SELL-OFF")
+                    {
+                        int qty = CalcQty(close, atr * HARD_STOP_ATR_MULT);
+                        if (qty > 0)
+                            newPos = new BtPosition { Symbol = symbol, IsShort = true, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "ORB_SHORT", Regime = regime, HardStop = close + atr * HARD_STOP_ATR_MULT, Target = close - atr * TARGET_ATR_MULT, AtrAtEntry = atr, WorstPrice = close };
+                    }
                 }
             }
 
             // ── VWAP Reclaim (blocked in SELL-OFF and bearish open) ───────
-            if (newPos == null && vwap > 0 && volExp && !blockLongs)
+            if (newPos == null && vwap > 0 && volExp && !blockLongs && HasStrongBodyClose(candle, true))
             {
                 bool reclaim = win.Count >= 3 && win[^1].Close > vwap && win[^2].Close > vwap && win[^3].Close <= vwap;
                 if (reclaim && rsi > RSI_LONG_MIN)
                 {
                     int qty = CalcQty(close, atr * HARD_STOP_ATR_MULT);
                     if (qty > 0)
-                        newPos = new BtPosition { Symbol = symbol, IsShort = false, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "VWAP_RECLAIM", Regime = regime, HardStop = close - atr * HARD_STOP_ATR_MULT, Target = close + atr * TARGET_ATR_MULT, AtrAtEntry = atr };
+                        newPos = new BtPosition { Symbol = symbol, IsShort = false, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "VWAP_RECLAIM", Regime = regime, HardStop = close - atr * HARD_STOP_ATR_MULT, Target = close + atr * TARGET_ATR_MULT, AtrAtEntry = atr, WorstPrice = close };
                 }
             }
 
             // ── Momentum Breakout (TRENDING only, blocked in SELL-OFF) ────
-            if (newPos == null && volExp && sma20 > sma50 && sma50 > 0 && regime == "TRENDING" && !blockLongs)
+            if (newPos == null && volExp && sma20 > sma50 && sma50 > 0 && regime == "TRENDING" && !blockLongs && HasStrongBodyClose(candle, true))
             {
                 decimal recentHigh = win.TakeLast(8).Max(c => c.High);
                 // Require volatility compression before the breakout (coil → spring)
@@ -962,22 +979,10 @@ public static class BacktestEngine
                 {
                     int qty = CalcQty(close, atr * HARD_STOP_ATR_MULT);
                     if (qty > 0)
-                        newPos = new BtPosition { Symbol = symbol, IsShort = false, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "MOMENTUM_LONG", Regime = regime, HardStop = close - atr * HARD_STOP_ATR_MULT, Target = close + atr * TARGET_ATR_MULT, AtrAtEntry = atr };
+                        newPos = new BtPosition { Symbol = symbol, IsShort = false, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "MOMENTUM_LONG", Regime = regime, HardStop = close - atr * HARD_STOP_ATR_MULT, Target = close + atr * TARGET_ATR_MULT, AtrAtEntry = atr, WorstPrice = close };
                 }
             }
 
-            // ── Mean Reversion (CHOPPY only, never in SELL-OFF) ───────────
-            if (newPos == null && regime == "CHOPPY" && sma50 > 0 && close > sma50)
-            {
-                double prevRsi = win.Count > 1 ? BtCalc.CalcRSI(win.Take(win.Count - 1).ToList(), 14) : 50;
-                bool oversold = rsi < 35 && rsi > prevRsi;  // RSI curling up = not a falling knife
-                if (oversold)
-                {
-                    int qty = CalcQty(close, atr * HARD_STOP_ATR_MULT);
-                    if (qty > 0)
-                        newPos = new BtPosition { Symbol = symbol, IsShort = false, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "MEAN_REV_LONG", Regime = regime, HardStop = close - atr * HARD_STOP_ATR_MULT, Target = close + atr * 2.0m, AtrAtEntry = atr };
-                }
-            }
 
             if (newPos != null) positions[symbol] = newPos;
         }
@@ -1015,6 +1020,14 @@ public static class BacktestEngine
         }
 
         return trades;
+    }
+
+    private static bool HasStrongBodyClose(Candle candle, bool bullish)
+    {
+        decimal range = candle.High - candle.Low;
+        if (range <= 0) return false;
+        decimal closePos = (candle.Close - candle.Low) / range;
+        return bullish ? closePos >= MIN_BREAKOUT_BODY_RATIO : closePos <= (1m - MIN_BREAKOUT_BODY_RATIO);
     }
 
     private static int CalcQty(decimal price, decimal stopDistance)

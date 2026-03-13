@@ -34,6 +34,15 @@ public class IbClient : EWrapper, IBroker
     // NEW: track filled orderIds to prevent double-fire between orderStatus and execDetails
     private readonly ConcurrentDictionary<int, bool> _filledOrders = new();
 
+    // ── Bracket child order tracking ───────────────────────────────────────────
+    // When SubmitBracketOrder places a stop child and a target child, their IDs are
+    // registered here so orderStatus() can route fills correctly and cancel the sibling.
+    // _bracketChildToSymbol : stopId/targetId → symbol (so we know which position to close)
+    // _bracketSiblings      : stopId → targetId and targetId → stopId (for sibling cancellation)
+    // Both are cleared when a child fills or is cancelled.
+    private readonly ConcurrentDictionary<int, string> _bracketChildToSymbol = new();
+    private readonly ConcurrentDictionary<int, int> _bracketSiblings = new();
+
     // ── Bid/Ask spread tracking — fields 1 (BID) and 2 (ASK) ──
     // Stored per symbol so SimulatedBroker can check spread before entering a trade.
     // Both must be positive before UpdateBidAsk is called to avoid partial/stale data.
@@ -87,6 +96,109 @@ public class IbClient : EWrapper, IBroker
         _client.placeOrder(orderId, contract, order);
     }
 
+    // ── IBroker.SupportsBrackets ─────────────────────────────────────────────────
+    // Bracket children (stop + target) are now fully registered in _ordersById and
+    // _bracketChildToSymbol so orderStatus() routes their fills to OnOrderFilled().
+    // SimulatedBroker stores child IDs on SimPosition and skips conflicting local
+    // exit logic (scale-out, trailing stop) while a bracket is live.
+    public bool SupportsBrackets => true;
+
+    // ── IBroker.SubmitBracketOrder — parent LMT entry + OCA stop + OCA target ─
+    // IBKR bracket pattern:
+    //   1. Parent order  — LMT entry, transmit=false
+    //   2. Stop child    — STP-LMT, parentId = parent orderId, transmit=false
+    //   3. Target child  — LMT,     parentId = parent orderId, transmit=true (fires all three)
+    // The two child orders share an OCA group so a fill on one cancels the other.
+    // entryPrice  — parent limit price
+    // stopPrice   — stop trigger; stopLimit — worst acceptable fill price
+    // targetPrice — profit target limit price
+    public void SubmitBracketOrder(string symbol, int qty, decimal entryPrice, TradeSide side,
+                                   decimal stopPrice, decimal stopLimit, decimal targetPrice)
+    {
+        if (!_isReady) return;
+
+        Contract contract = new Contract
+        {
+            Symbol = symbol,
+            SecType = "STK",
+            Exchange = "SMART",
+            Currency = "USD"
+        };
+
+        string entryAction = side == TradeSide.Buy ? "BUY" : "SELL";
+        string exitAction = side == TradeSide.Buy ? "SELL" : "BUY";
+
+        // ── 1. Parent entry order (LMT, not transmitted yet) ──────────────────
+        int parentId = Interlocked.Increment(ref _currentOrderId);
+        Order parent = new Order
+        {
+            Action = entryAction,
+            OrderType = "LMT",
+            TotalQuantity = qty,
+            LmtPrice = (double)entryPrice,
+            Tif = "GTC",
+            Transmit = false   // hold — transmit together with children
+        };
+
+        // ── 2. Stop-Limit child ───────────────────────────────────────────────
+        int stopId = Interlocked.Increment(ref _currentOrderId);
+        string ocaGroup = $"OCA_{symbol}_{parentId}";
+        Order stopOrder = new Order
+        {
+            Action = exitAction,
+            OrderType = "STP LMT",
+            TotalQuantity = qty,
+            AuxPrice = (double)stopPrice,   // STP trigger
+            LmtPrice = (double)stopLimit,   // worst-acceptable fill
+            ParentId = parentId,
+            OcaGroup = ocaGroup,
+            OcaType = 1,                   // 1 = cancel remaining orders with block
+            Tif = "GTC",
+            Transmit = false
+        };
+
+        // ── 3. Target LMT child (transmit=true fires all three atomically) ────
+        int targetId = Interlocked.Increment(ref _currentOrderId);
+        Order targetOrder = new Order
+        {
+            Action = exitAction,
+            OrderType = "LMT",
+            TotalQuantity = qty,
+            LmtPrice = (double)targetPrice,
+            ParentId = parentId,
+            OcaGroup = ocaGroup,
+            OcaType = 1,
+            Tif = "GTC",
+            Transmit = true   // transmits all three at once
+        };
+
+        // Register all three with SimulatedBroker so fills / rejections are tracked.
+        // Only the entry (parentId) is registered as an entry order.
+        // Stop and target are exit legs — registered with the exit side so OnOrderFilled
+        // routes their fills into the CLOSING path, not as new entries.
+        TradeSide exitSide = side == TradeSide.Buy ? TradeSide.Sell : TradeSide.Buy;
+        _broker.RegisterLiveOrder(parentId, symbol, side, qty);
+        _broker.RegisterLiveOrder(stopId, symbol, exitSide, qty);   // stop child
+        _broker.RegisterLiveOrder(targetId, symbol, exitSide, qty);   // target child
+
+        // Track children for fill routing and sibling cancellation in orderStatus()
+        _bracketChildToSymbol[stopId] = symbol;
+        _bracketChildToSymbol[targetId] = symbol;
+        _bracketSiblings[stopId] = targetId;
+        _bracketSiblings[targetId] = stopId;
+
+        _client.placeOrder(parentId, contract, parent);
+        _client.placeOrder(stopId, contract, stopOrder);
+        _client.placeOrder(targetId, contract, targetOrder);
+
+        // Tell SimulatedBroker to stamp child IDs onto the SimPosition once the entry fills
+        _broker.RegisterBracketChildren(symbol, stopId, targetId);
+
+        Console.WriteLine($"[BRACKET] {symbol} x{qty} entry={entryPrice:F2} " +
+                          $"stop={stopPrice:F2}/{stopLimit:F2} target={targetPrice:F2} " +
+                          $"parentId={parentId} stopId={stopId} targetId={targetId}");
+    }
+
     // --- CONNECTION ---
     public void Connect(string host = "127.0.0.1", int port = 7497, int clientId = 1)
     {
@@ -106,6 +218,16 @@ public class IbClient : EWrapper, IBroker
 
     public bool IsConnected() => _client.IsConnected();
     public void Disconnect() => _client.eDisconnect();
+
+    // IBroker.CancelOrder — cancels a live IBKR order by ID.
+    // Called by SimulatedBroker when a local exit fires while a bracket is active,
+    // so the exchange-side stop/target is withdrawn before the local order goes out.
+    public void CancelOrder(int orderId)
+    {
+        if (!_isReady) return;
+        _client.cancelOrder(orderId);
+        Console.WriteLine($"[IBKR] cancelOrder({orderId})");
+    }
 
     // IBroker.RequestPositions — fires reqPositions() on the IBKR socket.
     // IBKR will call position() once per holding, then positionEnd() when done.
@@ -274,6 +396,30 @@ public class IbClient : EWrapper, IBroker
 
         if (status == "Filled")
         {
+            // ── Bracket child fill (stop or target hit on the exchange) ──────────
+            // Must be checked BEFORE the normal path to prevent double-fire.
+            // When a child fills: cancel the sibling so only one exit executes,
+            // clean up tracking state, then route to OnOrderFilled normally.
+            if (_bracketChildToSymbol.TryRemove(orderId, out _))
+            {
+                if (_filledOrders.TryAdd(orderId, true))
+                {
+                    if (_bracketSiblings.TryRemove(orderId, out int siblingId))
+                    {
+                        // Cancel the other leg (e.g. target fills → cancel stop, and vice versa)
+                        _client.cancelOrder(siblingId);
+                        _bracketChildToSymbol.TryRemove(siblingId, out _);
+                        _bracketSiblings.TryRemove(siblingId, out _);
+                        // Remove sibling from _ordersById — its cancel may still call back
+                        _broker.RemoveLiveOrder(siblingId);
+                    }
+                    _broker.OnOrderFilled(orderId, (int)filled, (decimal)avgFillPrice);
+                    _filledOrders.TryRemove(orderId, out _);
+                }
+                return; // handled — do not fall through to normal path
+            }
+
+            // ── Normal (non-bracket) fill ─────────────────────────────────────
             if (_filledOrders.TryAdd(orderId, true))
             {
                 _broker.OnOrderFilled(orderId, (int)filled, (decimal)avgFillPrice);
