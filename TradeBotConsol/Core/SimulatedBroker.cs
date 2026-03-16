@@ -31,46 +31,12 @@ public interface IBroker
     void SubmitOrder(string symbol, int qty, decimal price, TradeSide side,
                      double currentRsi = 0, string orderType = "LMT");
     void RequestHistoricalData(string symbol);
-
-    // Unsubscribes live tick + market data feed for a symbol.
-    // Implement as a no-op if your adapter doesn't support it yet.
     void CancelMarketData(string symbol);
-
-    // Cancels a live order by IBKR order ID.
-    // Called by SimulatedBroker before firing a local exit when a bracket is active,
-    // so the exchange-side stop or target is withdrawn first to prevent double exits.
     void CancelOrder(int orderId);
-
-    // True once the IBKR socket handshake is complete (nextValidId has fired).
     bool IsReady { get; }
-
-    // Sends reqPositions() to IBKR. The adapter must call
-    // SimulatedBroker.OnPositionReceived() per position, then
-    // SimulatedBroker.OnReconciliationComplete() when IBKR fires positionEnd().
     void RequestPositions();
-
-    // Requests 1 year of daily (1-day bar) historical data for a symbol.
-    // IbClient routes these bars to SimulatedBroker.AddDailyCandle().
-    // Used to build the daily SMA200 trend filter without touching the
-    // 1-min candle pipeline or consuming a live market data subscription slot.
     void RequestDailyHistoricalData(string symbol);
-
-    // ── Bracket / OCA order support ───────────────────────────────────────
-    // When true, OpenPosition() will submit a parent LMT entry + attached
-    // child STP-LMT stop + child LMT target in a single OCA group.
-    // The exchange manages the trigger — protects against bot crash / disconnect.
-    // Implement SubmitBracketOrder() in IbClient using IBKR's "parentId" / OCA API.
-    // Existing adapters that don't support brackets: return false from SupportsBrackets
-    // and leave SubmitBracketOrder() as a no-op — SimulatedBroker falls back to
-    // single-leg entry + local stop management automatically.
     bool SupportsBrackets { get; }
-
-    // entryPrice  — parent LMT order price
-    // stopPrice   — child STP-LMT trigger price  (stop side)
-    // stopLimit   — child STP-LMT limit price    (protection band below/above stop)
-    // targetPrice — child LMT take-profit price
-    // All three child orders must be linked in one OCA group so a fill on one
-    // automatically cancels the other.
     void SubmitBracketOrder(string symbol, int qty, decimal entryPrice, TradeSide side,
                             decimal stopPrice, decimal stopLimit, decimal targetPrice);
 }
@@ -87,22 +53,14 @@ public class SimPosition
     public decimal CurrentPrice { get; set; }
     public DateTime EntryTime { get; set; } = DateTime.UtcNow;
     public bool ExitSubmitted { get; set; }
-    public bool PartialExitDone { get; set; }    // first scale-out completed at +1.25R
-    public bool PartialExitDone2 { get; set; }   // giveback protection armed after strong profit (>~1.75R)
-    public bool IsShort { get; set; }            // true = short position
-    public string StrategyTag { get; set; } = ""; // which strategy opened this
-    public decimal EntryCommission { get; set; } = 0m; // $1 paid at open — deducted from final close record
-    public decimal InitialRiskPerShare { get; set; } = 0m; // stop distance at entry for R-based exits
-
-    // ── Bracket order IDs ─────────────────────────────────────────────────
-    // Set after the entry fills (via RegisterBracketChildren → OnOrderFilled).
-    // When both are 0 the position uses local stop management only.
-    // When set: CheckHardStop cancels both before firing a local exit;
-    //           CheckExits skips scale-out and trailing stop (exchange owns those).
+    public bool PartialExitDone { get; set; }
+    public bool PartialExitDone2 { get; set; }
+    public bool IsShort { get; set; }
+    public string StrategyTag { get; set; } = "";
+    public decimal EntryCommission { get; set; } = 0m;
+    public decimal InitialRiskPerShare { get; set; } = 0m;
     public int BracketStopId { get; set; } = 0;
     public int BracketTargetId { get; set; } = 0;
-
-    // For shorts: PnL is inverted — profit when price falls
     public decimal UnrealizedPnL(decimal price) =>
         IsShort ? Quantity * (AvgPrice - price) : Quantity * (price - AvgPrice);
 }
@@ -113,7 +71,7 @@ public class TrackedOrder
     public string Symbol;
     public TradeSide Side;
     public int Qty;
-    public bool IsShortEntry;  // true if this BUY is covering a short
+    public bool IsShortEntry;
 }
 
 public class BotPersistData
@@ -127,21 +85,16 @@ public class BotPersistData
     public Dictionary<string, DateTime> LastTradeTime { get; set; } = new();
     public Dictionary<string, bool> LastTradeWasLoss { get; set; } = new();
     public Dictionary<string, int> DailyEntryCount { get; set; } = new();
-    // Persisted so the hourly rate limiter survives same-day restarts
     public int TradesThisHour { get; set; }
     public DateTime TradeHourSlot { get; set; } = DateTime.MinValue;
-    // Persisted so the UI history panel survives same-day restarts and matches _totalRealizedPnL
     public List<TradeRecord> CompletedTrades { get; set; } = new();
-    // Persisted so CheckDailyReset() detects a new trading day on restart
-    // and correctly clears yesterday's halt/PnL/counters.
     public DateTime LastVolumeResetDate { get; set; } = DateTime.MinValue;
 }
 
-// A completed (fully closed) trade — stored in-memory for the dashboard history panel
 public class TradeRecord
 {
     public string Symbol { get; set; }
-    public string Side { get; set; }        // "LONG" or "SHORT"
+    public string Side { get; set; }
     public string Strategy { get; set; }
     public int Qty { get; set; }
     public decimal Entry { get; set; }
@@ -149,20 +102,18 @@ public class TradeRecord
     public decimal NetPnL { get; set; }
     public decimal HoldMinutes { get; set; }
     public string ExitReason { get; set; }
-    public string Time { get; set; }        // ET close time HH:mm
-    public string Date { get; set; } = ""; // ET date yyyy-MM-dd — empty on old records
-    public string Regime { get; set; } = ""; // market regime at trade close (TRENDING/CHOPPY/NORMAL/SELL-OFF)
+    public string Time { get; set; }
+    public string Date { get; set; } = "";
+    public string Regime { get; set; } = "";
 }
 
-// One data point in the lifetime equity history — one entry per trading day
 public class LifetimeEquityPoint
 {
-    public string Date { get; set; }         // "yyyy-MM-dd"
-    public decimal AccountValue { get; set; } // TOTAL_BUDGET + cumulative PnL at close
-    public decimal DailyPnL { get; set; }    // that day's realized PnL
+    public string Date { get; set; }
+    public decimal AccountValue { get; set; }
+    public decimal DailyPnL { get; set; }
 }
 
-// Tracks the Opening Range (first 30 min high/low) per symbol
 public class OpeningRange
 {
     public decimal High { get; set; }
@@ -180,81 +131,65 @@ public class SimulatedBroker
     private readonly object _lock = new object();
 
     // ── TRADING RULES ──────────────────────────────────────
-    // ── Runtime-configurable fields (loaded from bot-config.json on startup) ──
     private decimal TOTAL_BUDGET = 4000m;
     private int MAX_POSITIONS = 3;
-    private decimal POSITION_SIZE = 1200m;        // ↓ from 2000 — smaller slots = less correlated exposure per trade
-    private int MIN_HOLD_SECONDS = 300;           // ↓ from 600 — 5 min; allows faster exit on bad trades
+    private decimal POSITION_SIZE = 1200m;
+    private int MIN_HOLD_SECONDS = 300;
     private decimal DAILY_PROFIT_GOAL = 200m;
-    private decimal MAX_DAILY_LOSS = -80m;
-    private int COOLDOWN_SECONDS = 1800;          // ↓ from 3600 — 30 min; markets can reverse in 10-20 min
-    private decimal ATR_TRAIL_MULT = 2.0m;         // ↑ from 1.4 — 1.4 ATR is within 1-min noise; price was hitting trail before the real move started
-    private decimal SHORT_ATR_TRAIL = 1.8m;        // ↑ from 1.2 — same reason for shorts
-    private decimal HARD_STOP_ATR_MULT = 2.0m;    // ↑ from 1.5 — 1.5 ATR on 1-min bars = noise stop; 2.0 matches the trail and gives trades room to breathe
-    private decimal MAX_LOSS_PER_TRADE = 40m;      // ↑ from 30 — widened to match the wider ATR stop; $30 was too tight for 2.0 ATR
+    // CHANGE 3: MAX_DAILY_LOSS -80 → -100 — avoids premature halt after 2 normal stops
+    private decimal MAX_DAILY_LOSS = -100m;
+    private int COOLDOWN_SECONDS = 1800;
+    private decimal ATR_TRAIL_MULT = 2.0m;
+    private decimal SHORT_ATR_TRAIL = 1.8m;
+    private decimal HARD_STOP_ATR_MULT = 2.0m;
+    private decimal MAX_LOSS_PER_TRADE = 40m;
     private decimal COMMISSION_PER_SIDE = 1m;
     private decimal MIN_STOP_DISTANCE = 0.10m;
     private int MAX_QTY_SANITY = 500;
     private decimal RISK_PCT = 0.005m;
-    private int ORB_MINUTES = 30;                 // ↓ from 45 — most volatility happens 9:30-10:00; 45-min ORB causes late fake breakouts
-    private decimal VOL_EXPAND_MULT = 2.25m;      // relaxed from 3.5× — still demands participation without requiring exhaustion spikes
-    private double RSI_LONG_MIN = 65.0;           // ↑ from 63 — 63 fired on weak momentum; 65 requires genuine strength (not 68 — that's too restrictive)
-    private double RSI_SHORT_MAX = 35.0;          // ↓ from 37 — symmetric tightening; require clear confirmed selling pressure
-    private double RSI_OVERSOLD = 32.0;           // ↓ from 35 — mean reversion needs deeper oversold to justify the risk (gated to CHOPPY/SELL-OFF anyway)
-    private double RSI_OVERBOUGHT = 68.0;         // ↑ from 65 — symmetric with oversold; require more extreme spike before fading
+    private int ORB_MINUTES = 30;
+    private decimal VOL_EXPAND_MULT = 1.8m;
+    // CHANGE 2: RSI_LONG_MIN 65.0 → 62.0 — recovers valid momentum entries filtered too aggressively 
+    //uygar change this to 64 if too much loosing
+    private double RSI_LONG_MIN = 62.0;
+    private double RSI_SHORT_MAX = 35.0;
+    private double RSI_OVERSOLD = 32.0;
+    private double RSI_OVERBOUGHT = 68.0;
     private decimal GAP_GO_MIN_PCT = 0.020m;
     private decimal GAP_GO_REL_VOL = 1.8m;
     private int VWAP_CONFIRM_BARS = 2;
-    private int MAX_TRADES_PER_DAY = 6;           // ↓ from 10 — fewer, higher-quality entries beat overtrading
-    private decimal MIN_ATR_PCT = 0.003m;        // ↑ from 0.002 — 0.2% floor; filters truly choppy/dormant stocks where noise exceeds signal
-    private decimal MAX_ATR_PCT = 0.015m;        // chaos ceiling — skip entries when 1-min ATR > 1.5% of price (news spikes, flash crashes)
-    private decimal MIN_RR_RATIO = 1.5m;         // minimum reward:risk ratio required before entering any trade — below this the math doesn't work long-term
+    private int MAX_TRADES_PER_DAY = 6;
+    private decimal MIN_ATR_PCT = 0.003m;
+    private decimal MAX_ATR_PCT = 0.015m;
+    private decimal MIN_RR_RATIO = 1.5m;
 
-    // ── VIX-awareness thresholds ──────────────────────────────────────────
-    // VIX is subscribed as a market-data symbol (treat like any ticker).
-    // At REDUCE: halve position size on longs — elevated fear = wider whipsaws.
-    // At NO_LONG: block all longs entirely — historically above 35 long setups fail >70%.
     private decimal VIX_REDUCE_THRESHOLD = 25m;
     private decimal VIX_NO_LONG_THRESHOLD = 35m;
 
-    // ── Setup quality gate ────────────────────────────────────────────────
-    // ScoreSetup() rates each entry 0–100; entries below this threshold are skipped.
-    // Raise to 50–60 for stricter filtering on choppy days; lower to 30 for more flow.
-    private int MIN_SETUP_SCORE = 40;
+    // CHANGE 1: MIN_SETUP_SCORE 40 → 45 — filters the weakest 15-20% of setups
+    private int MIN_SETUP_SCORE = 45;
 
-    // ── Consecutive-loss death-spiral halt ────────────────────────────────
-    // Halts NEW entries after N losing trades in a row. Reset on any win or daily reset.
-    // Set to 0 to disable. Recommended: 3.
     private int MAX_CONSECUTIVE_LOSSES = 3;
 
-    // ── Per-strategy enable flags ─────────────────────────────────────────
-    // Toggle individual strategies without restarting the bot.
-    // Advisor recommendation: momentum system should run ORB + VWAP + Gap&Go only.
-    // Mean-reversion fights momentum direction — disable it on trending days.
     private bool STRATEGY_ORB_ENABLED = true;
     private bool STRATEGY_GAP_GO_ENABLED = true;
     private bool STRATEGY_VWAP_ENABLED = true;
-    private bool STRATEGY_MEAN_REV_ENABLED = false;   // RSI mean reversion disabled while testing momentum-focused edge
-    private bool STRATEGY_BB_MR_ENABLED = false;   // Bollinger mean reversion disabled while testing momentum-focused edge
-    private bool STRATEGY_MOMENTUM_ENABLED = true;   // Momentum breakout
-    private bool STRATEGY_EMA_POCKET_ENABLED = false;  // EMA pocket  — off by default (low edge on 1-min)
-    private bool STRATEGY_OUTSIDE_CANDLE_ENABLED = false;  // Outside candle — off by default (fires rarely, easy fake)
-    // IBKR market data line budget.
-    // DATA_LINES_PER_SYMBOL: how many lines ONE symbol uses (1 = reqMktData only,
-    //   6 = reqMktData + reqRealTimeBars, adjust to match your IbClient adapter).
-    // MAX_MARKET_DATA_LINES: hard ceiling — stay below your account limit (100 by default).
+    private bool STRATEGY_MEAN_REV_ENABLED = false;
+    private bool STRATEGY_BB_MR_ENABLED = false;
+    private bool STRATEGY_MOMENTUM_ENABLED = true;
+    private bool STRATEGY_EMA_POCKET_ENABLED = false;
+    private bool STRATEGY_OUTSIDE_CANDLE_ENABLED = false;
     private int DATA_LINES_PER_SYMBOL = 1;
     private int MAX_MARKET_DATA_LINES = 95;
 
-
-    private bool _allowShorts = true; // set to true only if you have a margin account
+    private bool _allowShorts = true;
 
     // ── STATE ──────────────────────────────────────────────
     public readonly ConcurrentDictionary<string, List<Candle>> _marketData = new();
     private Dictionary<string, SimPosition> _positions = new();
     private readonly ConcurrentDictionary<int, TrackedOrder> _ordersById = new();
     private readonly List<string> _tradeHistoryLog = new();
-    private readonly List<TradeRecord> _completedTrades = new();  // structured history for dashboard
+    private readonly List<TradeRecord> _completedTrades = new();
     private readonly Dictionary<string, DateTime> _lastTradeTime = new();
     private readonly Dictionary<string, long> _dailyVolume = new();
     private readonly ConcurrentDictionary<string, decimal> _latestTick = new();
@@ -262,146 +197,75 @@ public class SimulatedBroker
     private readonly List<(DateTime time, decimal equity)> _equityCurve = new();
     private readonly List<LifetimeEquityPoint> _lifetimeEquity = new();
 
-    // ── Cross-day trade log — never cleared by CheckDailyReset ───────────────
-    // Survives daily resets so the "All-time" history panel in the dashboard
-    // shows trades from all previous sessions, not just today.
     private readonly List<TradeRecord> _allTrades = new();
     private static readonly string ALL_TRADES_FILE = StatePath("all_trades.json");
 
-    // ── Absolute state directory — pinned to the executable folder so all
-    // .json files are found regardless of which directory the bot is launched from.
     private static readonly string STATE_DIR = AppDomain.CurrentDomain.BaseDirectory;
     private static string StatePath(string filename) => Path.Combine(AppDomain.CurrentDomain.BaseDirectory, filename);
     private static readonly string LIFETIME_EQUITY_FILE = StatePath("lifetime_equity.json");
 
-    // Opening Range per symbol (resets daily)
     private readonly ConcurrentDictionary<string, OpeningRange> _orbRanges = new();
-
-    // Gap-and-Go: track daily gap % per symbol
     private readonly ConcurrentDictionary<string, decimal> _dailyGapPct = new();
-
-    // ── DAILY CANDLE DATA (1 bar per day, up to 250 days) ────────────────────
-    // Populated by AddDailyCandle() which IbClient calls after RequestDailyHistoricalData().
-    // Used exclusively for the daily SMA200 trend filter — completely separate from
-    // the 1-min _marketData pipeline. Does NOT consume a live market data slot.
     private readonly ConcurrentDictionary<string, List<Candle>> _dailyCandles = new();
-
-    // Previous day High/Low — derived from _dailyCandles on load and daily reset.
-    // Used to detect key S/R levels (prev day high = resistance, prev day low = support).
     private readonly ConcurrentDictionary<string, decimal> _prevDayHighLevel = new();
     private readonly ConcurrentDictionary<string, decimal> _prevDayLowLevel = new();
 
-    // ── Per-symbol indicator cache ─────────────────────────────────────────
-    // Recomputed once per 1-min candle close in RefreshIndicatorCache().
-    // All strategies read from this instead of re-running O(n) calculations,
-    // cutting the per-candle compute burst from 7×O(n) → 1×O(n) per symbol.
     private sealed class SymIndicators
     {
         public double Rsi14;
-        public double Rsi14Prev;    // RSI 1 bar ago — used for momentum reversal detection (must be turning, not just extreme)
+        public double Rsi14Prev;
         public decimal Atr14;
         public decimal Sma20;
         public decimal Sma50;
         public double Ema9;
         public double Ema21;
-        public double Ema9Prev;    // value 5 bars ago (slope check)
-        public double Ema21Prev;   // value 5 bars ago (slope check)
+        public double Ema9Prev;
+        public double Ema21Prev;
         public int MacdDir;
-        public decimal RecentHigh8; // highest high over last 8 bars
-        public decimal RecentLow8;  // lowest low over last 8 bars
+        public decimal RecentHigh8;
+        public decimal RecentLow8;
         public bool VolExpansion;
     }
     private readonly ConcurrentDictionary<string, SymIndicators> _indicatorCache = new();
-
-    // ── 15-min EMA(20) cache — higher-timeframe trend filter ──────────────
-    // Updated whenever a new 15-min bar closes. Used to gate long/short entries
-    // so 1-min false breakouts against the 15-min trend are skipped.
     private readonly ConcurrentDictionary<string, (decimal ema20, DateTime barTime)> _ema20_15min = new();
-
-    // ── 30-min EMA(50) cache — used by Outside Candle strategy ───────────
-    // Rebuilt only when a new 30-min bar closes, not on every 1-min candle.
     private readonly ConcurrentDictionary<string, (double ema50, DateTime barTime)> _ema50_30min = new();
 
-    // Win / loss
     private int _winCount = 0;
     private int _lossCount = 0;
-    private int _consecutiveLosses = 0;  // resets on any win or daily reset
+    private int _consecutiveLosses = 0;
 
-    // Market regime
     private string _marketRegime = "UNKNOWN";
 
-    // ── SPY Directional Gate ───────────────────────────────────────────────
-    // Updated in UpdateMarketRegime() every candle close.
-    // _spyBullish = SPY price > EMA20 AND EMA20 is sloping upward (bull trend).
-    // _spyBearish = SPY price < EMA20 AND EMA20 is sloping downward (bear trend).
-    // When true the gate blocks longs (bearish) or shorts (bullish) in OpenPosition().
-    // Exception: strong relative strength (stock up while SPY down) overrides for longs.
-    // Net effect: removes ~30-40% of losing trades taken against the market tide.
     private volatile bool _spyBullish = false;
     private volatile bool _spyBearish = false;
+    private volatile bool _spyOpenBearish = false;
+    private volatile bool _spyBiasChecked = false;
 
-    // ── SPY Opening-Hour Bias (hard daily block) ──────────────────────────
-    // Set once per session after 30 minutes of SPY data are available.
-    // If SPY's first 30 minutes close more than 0.3% below its open → bearish session.
-    // Bearish session = ALL long entries blocked for the entire day (not just filtered).
-    // This is the single most impactful filter: the worst drawdowns always happen when
-    // a SELL-OFF regime fires ORB_LONG setups at 10:00 into a continuation down-trend.
-    // Reset daily in CheckDailyReset().
-    private volatile bool _spyOpenBearish = false;   // true = SPY opening hour was bearish
-    private volatile bool _spyBiasChecked = false;   // prevents re-setting after first 30-min check
-
-    // ── Bid/Ask spread tracking ────────────────────────────────────────────
-    // Populated by UpdateBidAsk() called from IbClient.tickPrice on fields 1 & 2.
-    // Used by the spread filter in OpenPosition() to skip wide-spread stocks.
     private readonly ConcurrentDictionary<string, decimal> _latestBid = new();
     private readonly ConcurrentDictionary<string, decimal> _latestAsk = new();
 
-    // ── Midday chop filter ─────────────────────────────────────────────────
-    // Blocks NEW entries 11:30–13:30 ET — the dead zone where momentum dies,
-    // spreads widen and algorithms churn. Profitable windows are 9:35–10:45
-    // and 13:30–15:30. Set false to disable.
     private bool MIDDAY_FILTER_ENABLED = true;
 
-    // VWAP (reset daily)
     private readonly ConcurrentDictionary<string, (decimal SumPV, long SumVol)> _vwapAccum = new();
     private readonly ConcurrentDictionary<string, decimal> _vwap = new();
     private readonly ConcurrentDictionary<string, decimal> _prevDayClose = new();
-
-    // Previous bar VWAP tracking for crossover detection
     private readonly ConcurrentDictionary<string, bool> _prevBarAboveVwap = new();
 
-    // Strategy tag staging — set before order, stamped onto position at fill
     private ConcurrentDictionary<string, string> _pendingStrategyTag = new();
     private ConcurrentDictionary<string, decimal> _pendingInitialRisk = new();
 
-    // ── Earnings blacklist ────────────────────────────────────────────────
-    // Populated from "earnings_blacklist": [...] in bot-config.json.
-    // Symbols on this list are skipped for new entries all day (existing positions
-    // still run their exit logic normally). Cleared on daily reset.
     private readonly HashSet<string> _earningsBlacklist = new(StringComparer.OrdinalIgnoreCase);
-
-    // ── Bracket child staging ─────────────────────────────────────────────
-    // Populated by RegisterBracketChildren() when IbClient places a bracket order.
-    // Consumed in OnOrderFilled() when the entry fill creates the SimPosition —
-    // at that point child IDs are stamped onto pos.BracketStopId / BracketTargetId.
-    // Stored here (not on SimPosition) because the position doesn't exist yet
-    // at the moment the bracket is submitted.
     private readonly ConcurrentDictionary<string, (int stopId, int targetId)> _pendingBracketChildren = new();
 
-    // Race-condition guard: counts orders submitted but not yet filled
-    // Prevents 3 entries firing before any fill comes back (12:09 bug)
     private int _pendingEntryCount = 0;
 
-    // Per-symbol loss tracking — doubles cooldown after a losing trade
     private readonly Dictionary<string, bool> _lastTradeWasLoss = new();
-    // Per-symbol daily entry count — max 1 entry per symbol per day
     private readonly Dictionary<string, int> _dailyEntryCount = new();
 
     private decimal _totalRealizedPnL = 0m;
     private int _tradesToday = 0;
-    // ── Per-hour rate limiter — prevents burning all MAX_TRADES_PER_DAY slots in one burst ──
     private int _tradesThisHour = 0;
-    private int MAX_TRADES_PER_HOUR = 2;        // ↓ from 3 — max 2 new entries per clock-hour; prevents burst overtrading
+    private int MAX_TRADES_PER_HOUR = 2;
     private DateTime _currentTradeHour = DateTime.MinValue;
     private bool _haltTrading = false;
     private bool _eodSent = false;
@@ -409,11 +273,6 @@ public class SimulatedBroker
     private DateTime _lastMemorySave = DateTime.MinValue;
     private DateTime _lastStateSave = DateTime.MinValue;
 
-    // ── RECONCILIATION ─────────────────────────────────────────────────────────
-    // _reconciled blocks ExecuteStrategy until IBKR confirms its live positions.
-    // _needsReconciliation is the one-shot trigger: set by LoadState(), consumed by
-    // either nextValidId (if Connect comes after LoadState) or LoadState itself
-    // (if Connect already happened first). Cleared in OnReconciliationComplete().
     private volatile bool _reconciled = false;
     private volatile bool _needsReconciliation = false;
     private readonly Dictionary<string, (int qty, decimal avgCost)> _ibkrPositionSnapshot = new();
@@ -423,24 +282,11 @@ public class SimulatedBroker
     private static readonly TimeZoneInfo Pacific =
         TimeZoneInfo.FindSystemTimeZoneById("America/Vancouver");
 
-    // ── EMAIL ──────────────────────────────────────────────
     private const string EmailFrom = "uygargunay@gmail.com";
     private const string EmailTo = "uygargunay@gmail.com";
     private static readonly string EmailPassword =
         Environment.GetEnvironmentVariable("BOT_EMAIL_PASS") ?? "sznd kafk nhec skqh";
 
-    // ── WATCHLIST (mutable — updated at runtime via /api/config) ──────────────
-    // 85 best-in-class symbols — fits within the 95-slot IBKR data budget.
-    // Ranked by: daily volume, ATR, trend-following behaviour, fill quality.
-    // Add more only after purchasing an IBKR Market Data Booster Pack.
-    // ── WATCHLIST — 30 momentum-first symbols ─────────────────────────────
-    // Selected for: daily vol >8M, ATR% >0.8%, clean 1-min bars, catalyst-
-    // driven intraday moves, and strong institutional + retail participation.
-    // Split into three tiers:
-    //   Tier 1 — Index ETFs: regime detection + always-tradeable liquidity
-    //   Tier 2 — Mega-cap momentum: high ATR$, tight spreads, deep order books
-    //   Tier 3 — High-beta growth: biggest ORB/Gap&Go/VWAP movers on catalysts
-    // Keeps us well under the 95-slot IBKR data budget (1 line each = 30 lines).
     public string[] _watchlist =
     {
         // Tier 1 — Regime anchors (always on)
@@ -456,66 +302,45 @@ public class SimulatedBroker
         "ACHR", "JOBY"
     };
 
-    // Dashboard timer
-    // Tracks which symbols we've already called RequestHistoricalData for so
-    // ApplyWatchlistDiff doesn't re-subscribe symbols already streaming.
     private readonly HashSet<string> _subscribedSymbols = new(StringComparer.OrdinalIgnoreCase);
-    // Used to detect ORB_MINUTES changes so we can clear stale opening ranges.
     private int _previousOrbMinutes;
 
-    // ── Sector diversification map ─────────────────────────────────────────
-    // Prevents two highly-correlated positions from opening at the same time
-    // (e.g. NVDA + AMD both long = one semiconductor trade, not two).
-    // Any symbol not in the map is treated as its own standalone sector.
     private static readonly Dictionary<string, string> _symbolSectors
         = new(StringComparer.OrdinalIgnoreCase)
     {
-        // Core ETFs — each is its own sector
         {"SPY","sp500_etf"},{"QQQ","nasdaq_etf"},{"IWM","small_cap_etf"},
         {"SMH","semi_etf"},{"XLK","tech_etf"},{"XLF","fin_etf"},
         {"XLE","energy_etf"},{"XBI","biotech_etf"},{"DIA","dow_etf"},
-        // Mega-cap tech
         {"AAPL","megacap_tech"},{"MSFT","megacap_tech"},{"NVDA","megacap_tech"},
         {"META","megacap_tech"},{"AMZN","megacap_tech"},{"GOOGL","megacap_tech"},
         {"TSLA","auto_ev"},{"ADBE","design_sw"},
-        // Semiconductors
         {"AMD","semiconductor"},{"AVGO","semiconductor"},{"ARM","semiconductor"},
         {"MU","semiconductor"},{"AMAT","semiconductor"},{"LRCX","semiconductor"},
         {"QCOM","semiconductor"},{"TSM","semiconductor"},{"TXN","semiconductor"},
         {"ASML","semiconductor"},{"SMCI","semiconductor"},
-        // Cloud / SaaS
         {"CRM","cloud_saas"},{"NOW","cloud_saas"},{"CRWD","cloud_saas"},
         {"PANW","cloud_saas"},{"PLTR","cloud_saas"},{"DDOG","cloud_saas"},
         {"NET","cloud_saas"},{"SNOW","cloud_saas"},{"APP","cloud_saas"},
         {"TTD","cloud_saas"},{"ZS","cloud_saas"},{"MDB","cloud_saas"},{"OKTA","cloud_saas"},
-        // Crypto / Fintech / High-beta
         {"COIN","crypto"},{"MSTR","crypto"},
         {"PYPL","fintech"},{"HOOD","fintech"},{"SOFI","fintech"},
         {"UPST","fintech"},{"AFRM","fintech"},
-        // Banks / Financials
         {"JPM","bank"},{"GS","bank"},{"MS","bank"},{"BAC","bank"},
         {"V","payments"},{"MA","payments"},{"BX","alt_finance"},
-        // High-momentum growth / Consumer tech
         {"NFLX","streaming"},{"SPOT","streaming"},
         {"UBER","mobility"},{"DASH","delivery"},
         {"SHOP","ecommerce"},{"MELI","ecommerce"},{"RBLX","gaming"},
         {"SNAP","social_media"},
         {"BKNG","travel"},{"ABNB","travel"},
         {"INTU","fin_software"},{"ANET","networking"},
-        // EV / Next-gen mobility (high-beta, catalyst-driven)
         {"RIVN","auto_ev"},{"LCID","auto_ev"},
         {"ACHR","evtol"},{"JOBY","evtol"},
-        // AI / Quantum (high-beta, news-driven)
         {"IONQ","quantum"},{"RXRX","ai_biotech"},{"SOUN","ai_audio"},
-        // Energy
         {"XOM","energy"},{"CVX","energy"},{"OXY","energy"},
-        // Healthcare / Biotech
         {"UNH","healthcare"},{"ABBV","pharma"},
         {"VRTX","biotech"},{"REGN","biotech"},{"GILD","biotech"},
-        // Industrials / Defense
         {"CAT","industrial"},{"DE","industrial"},{"GE","industrial"},{"HON","industrial"},
         {"RTX","defense"},{"LMT","defense"},{"BA","defense"},
-        // Enterprise software
         {"ORCL","enterprise_sw"},{"IBM","enterprise_sw"},
     };
 
@@ -580,7 +405,6 @@ public class SimulatedBroker
                     pos.CurrentPrice = price;
             }
 
-            // Hard stop runs on EVERY tick, outside the min-hold gate
             CheckHardStop(symbol, price);
             CheckExits(symbol, price);
 
@@ -589,7 +413,6 @@ public class SimulatedBroker
                 SaveMarketMemory();
                 _lastMemorySave = DateTime.UtcNow;
             }
-            // Save full state every 2 min so positions survive a crash between fills
             if ((DateTime.UtcNow - _lastStateSave).TotalMinutes >= 2)
             {
                 SaveState();
@@ -602,15 +425,12 @@ public class SimulatedBroker
         }
     }
 
-    // ── Bid/Ask spread update — called from IbClient.tickPrice (fields 1 & 2) ──
-    // Stored separately from LAST price so we can check spread before entering.
     public void UpdateBidAsk(string symbol, decimal bid, decimal ask)
     {
         if (bid > 0) _latestBid[symbol] = bid;
         if (ask > 0) _latestAsk[symbol] = ask;
     }
 
-    // ── VWAP accumulator — resets at 9:30 ET open each day ──
     private void UpdateVwap(string symbol, decimal price, long size)
     {
         if (size <= 0) return;
@@ -627,17 +447,14 @@ public class SimulatedBroker
             _vwap[symbol] = updated.Item1 / updated.Item2;
     }
 
-    // ── Opening Range tracker — builds first 30 min high/low ──
     private void UpdateOpeningRange(string symbol, decimal price, DateTime etNow)
     {
-        // Reset at market open
         if (etNow.Hour == 9 && etNow.Minute == 30 && etNow.Second < 5)
         {
             _orbRanges[symbol] = new OpeningRange { High = price, Low = price, IsSet = false };
             return;
         }
 
-        // Only accumulate during the first ORB_MINUTES of the session
         int minutesSinceOpen = (etNow.Hour - 9) * 60 + etNow.Minute - 30;
         if (minutesSinceOpen < 0 || minutesSinceOpen > ORB_MINUTES) return;
 
@@ -645,9 +462,6 @@ public class SimulatedBroker
         orb.High = Math.Max(orb.High, price);
         orb.Low = Math.Min(orb.Low, price);
 
-        // Mark as fully set once the ORB window closes.
-        // >= not == — if no tick arrives at exactly minute ORB_MINUTES the
-        // == check would never fire and ORB strategy would be dead all day.
         if (minutesSinceOpen >= ORB_MINUTES)
             orb.IsSet = true;
     }
@@ -664,21 +478,15 @@ public class SimulatedBroker
                 list.RemoveAt(0);
         }
 
-        // Snapshot prev-day close just before open (for gap calc)
         var nowEt = GetEasternTime();
         if (nowEt.Hour == 9 && nowEt.Minute == 29)
             _prevDayClose[symbol] = candle.Close;
-        // NOTE: _dailyGapPct is now computed live in TryGapAndGoStrategy
-        //       using _latestTick vs _prevDayClose, so it's always fresh
 
-        // Track whether prev bar was above/below VWAP for crossover detection
         _vwap.TryGetValue(symbol, out decimal vwapNow);
         bool aboveVwap = vwapNow > 0 && candle.Close > vwapNow;
         _prevBarAboveVwap.TryGetValue(symbol, out bool wasAbove);
         _prevBarAboveVwap[symbol] = aboveVwap;
 
-        // Refresh indicator cache and higher-timeframe EMAs once per candle close.
-        // Strategies read from the cache instead of recomputing — 7× speedup.
         if (_marketData.TryGetValue(symbol, out var cacheCandles))
         {
             RefreshIndicatorCache(symbol, cacheCandles);
@@ -721,13 +529,6 @@ public class SimulatedBroker
         else if (todayRange < avgDailyRange * 0.6m) _marketRegime = "CHOPPY";
         else _marketRegime = "NORMAL";
 
-        // ── SPY Opening-Hour Bias ─────────────────────────────────────────
-        // Computed once per session after 30 minutes of today's data exist.
-        // Rule: if SPY closes its first 30-min candle more than 0.3% below its day open,
-        //       set _spyOpenBearish = true → ALL long entries are blocked for the full day.
-        // Why: The opening direction of SPY is the single strongest predictor of intraday
-        //      direction. A bearish SPY open causes ~80% of individual stock ORB_LONGs
-        //      to fail before 11am — the trend is already set against them.
         if (!_spyBiasChecked && todayCandles.Count >= 30)
         {
             decimal spyOpenPrice = todayCandles.First().Open;
@@ -735,7 +536,7 @@ public class SimulatedBroker
             {
                 decimal spyFirstHalfClose = todayCandles[Math.Min(29, todayCandles.Count - 1)].Close;
                 decimal openBiasPct = (spyFirstHalfClose - spyOpenPrice) / spyOpenPrice;
-                _spyOpenBearish = openBiasPct < -0.003m;   // -0.3% or worse = bearish open
+                _spyOpenBearish = openBiasPct < -0.003m;
                 _spyBiasChecked = true;
                 if (_spyOpenBearish)
                     LogMessage($"[REGIME] SPY opening bias: BEARISH ({openBiasPct:P2} from open) — blocking all longs today");
@@ -744,11 +545,6 @@ public class SimulatedBroker
             }
         }
 
-        // ── SPY EMA20 slope — directional trade gate ──────────────────────
-        // Compare EMA20 now vs 5 bars ago to get slope direction.
-        // _spyBullish = price above rising EMA20 → favour longs
-        // _spyBearish = price below falling EMA20 → favour shorts
-        // Both can be false simultaneously (flat/choppy) — no gate in that case.
         if (spy.Count >= 25)
         {
             var closes = spy.Select(c => (double)c.Close).ToArray();
@@ -771,12 +567,8 @@ public class SimulatedBroker
         CheckDailyReset();
         if (_haltTrading) return;
 
-        // Skip entry logic for symbols no longer on the watchlist.
-        // CheckHardStop / CheckExits still run via UpdateLiveTick to protect open positions.
         if (!_watchlist.Contains(symbol, StringComparer.OrdinalIgnoreCase)) return;
 
-        // Block new entries until IBKR position snapshot is reconciled.
-        // Prevents buying into already-open positions after a restart.
         if (!_reconciled)
         {
             LogMessage("[SKIP] Waiting for IBKR position reconciliation before trading.");
@@ -785,29 +577,27 @@ public class SimulatedBroker
 
         var nowEt = GetEasternTime();
         if (nowEt.DayOfWeek == DayOfWeek.Saturday || nowEt.DayOfWeek == DayOfWeek.Sunday) return;
-        // No trading in first 30 min (9:30–10:00 ET) — ORB is still forming, spreads wide
-        // Extra 15-min buffer (until 10:15 ET): spreads are still wide at 10:00 sharp,
-        // institutional algos pile in at the open causing false breakouts and wide stops.
-        // Both MU and OXY losses (7:00 PT = 10:00 ET) were caused by firing on the first tick.
-        if (nowEt.Hour < 9 || (nowEt.Hour == 9 && nowEt.Minute < 45)) return;
-        // No trading in last 30 min (15:30–16:00 ET) — liquidity dries up, slippage spikes
-        if (nowEt.Hour > 15 || (nowEt.Hour == 15 && nowEt.Minute >= 30)) return;
+        if (nowEt.Hour < 9 || (nowEt.Hour == 9 && nowEt.Minute < 32)) return;
+        if (nowEt.Hour > 14 || (nowEt.Hour == 14 && nowEt.Minute >= 30)) return;
 
-        // ── Earnings blackout — skip entry if this symbol reports today ────
-        // Earnings candles are gap-driven noise, not strategy signals. Any setup
-        // that fires into an earnings release is essentially a coin-flip with extra
-        // tail risk. Check BEFORE acquiring _lock so we bail early and cheaply.
+        // ── CHANGE 4: OpEx Friday filter ──────────────────────────────────────
+        // 3rd Friday of month = quarterly options expiration. Volume spikes are
+        // options-driven noise, not directional. MMs pin to max-pain levels,
+        // breakouts reverse violently. Cap at 2 trades on these days.
+        bool isOpExFriday = nowEt.DayOfWeek == DayOfWeek.Friday
+            && nowEt.Day >= 15 && nowEt.Day <= 21;
+        if (isOpExFriday && _tradesToday >= 2)
+        {
+            LogMessage($"[OPEX SKIP] OpEx Friday — capped at 2 trades, skipping new entries");
+            return;
+        }
+
         if (_earningsBlacklist.Contains(symbol))
         {
             LogMessage($"[EARNINGS SKIP] {symbol} is on today's earnings blacklist — no new entries");
             return;
         }
 
-        // ── Midday chop filter — skip 11:45–13:05 ET ──────────────────────
-        // This window has the lowest signal-to-noise ratio of the day:
-        // volume dries up, MM algorithms probe for liquidity, breakouts fail.
-        // Exception: bypass on TRENDING days — momentum carries through lunch.
-        // Profitable windows: 9:35–10:45 (open momentum) and 13:30–15:30 (afternoon).
         if (MIDDAY_FILTER_ENABLED &&
             _marketRegime != "TRENDING" &&
             (nowEt.Hour == 11 && nowEt.Minute >= 45 ||
@@ -821,17 +611,11 @@ public class SimulatedBroker
             return;
         }
 
-        // Minimum liquidity gate — 300 bars × 50k was only ~167 shares/min (too thin).
-        // 200k over 300 bars = ~667 shares/min minimum — filters illiquid stocks with wide
-        // spreads and unreliable fills without blocking legitimately active names.
         if (candles.TakeLast(300).Sum(c => c.Volume) < 500_000) return;
 
-        // Skip stocks trading below $10 — too noisy, wide spreads, unreliable ATR signals
         decimal lastPrice = candles.Last().Close;
         if (lastPrice < 10m) return;
-        // ── Quick pre-filter — skip symbols with no plausible signal ──────────
-        // Avoids acquiring _lock and running 7 strategies on quiet symbols.
-        // Checks only cheap lookups; if any could fire we fall through to the full logic.
+
         if (_indicatorCache.TryGetValue(symbol, out var preInd))
         {
             bool orbActive = _orbRanges.TryGetValue(symbol, out var preOrb) && preOrb.IsSet
@@ -844,46 +628,28 @@ public class SimulatedBroker
             bool gapActive = prevCloseCheck > 0
                                 && Math.Abs((lastPrice - prevCloseCheck) / prevCloseCheck) >= GAP_GO_MIN_PCT;
             if (!orbActive && !rsiExtreme && !nearVwap && !gapActive && !preInd.VolExpansion)
-                return;   // nothing to do — skip lock + all 7 strategy checks
+                return;
         }
 
-        // ── Spread filter — dynamic ATR-relative tolerance ────────────────
-        // A static 0.15% cap is too tight for high-ATR stocks (NVDA, TSLA, COIN)
-        // and too loose for low-ATR names. We allow spread up to 30% of 1-min ATR:
-        //   Low-ATR  (ATR=$0.10): max spread ~$0.03 — very tight
-        //   High-ATR (ATR=$2.00): max spread ~$0.60 — still reasonable
-        // Floor at 0.08% so micro-cap noise never passes; ceiling at 0.30% so
-        // spread alone never eats a meaningful slice of the ATR-sized stop.
         if (_latestBid.TryGetValue(symbol, out decimal bid) &&
             _latestAsk.TryGetValue(symbol, out decimal ask) &&
             bid > 0 && ask > 0)
         {
             decimal spreadPct = (ask - bid) / ask;
-            decimal atrForSpread = _indicatorCache.TryGetValue(symbol, out var spInd) && spInd.Atr14 > 0
-                ? spInd.Atr14 : ask * 0.003m;
-            decimal dynamicMaxSpread = Math.Max(0.0008m, Math.Min(0.003m, atrForSpread / ask * 0.30m));
-            if (spreadPct > dynamicMaxSpread)
+            const decimal maxSpreadPct = 0.0015m;
+            if (spreadPct > maxSpreadPct)
             {
-                LogMessage($"[REJECT] {symbol} spread {spreadPct:P3} > ATR-dynamic max {dynamicMaxSpread:P3} (bid={bid:F2} ask={ask:F2} atr={atrForSpread:F3})");
+                LogMessage($"[REJECT] {symbol} spread {spreadPct:P3} > hard max {maxSpreadPct:P3} (bid={bid:F2} ask={ask:F2})");
                 return;
             }
         }
 
-        // ── Liquidity Sweep Filter — skip entry candle if it was a stop hunt ──
-        // A candle that spiked above resistance (or below support) but closed back inside
-        // is a classic "stop hunt / bull trap". Entering right after this candle almost
-        // always means entering into the reversal. Checked once per candle close — cheap.
         if (candles.Count >= 11 && IsLiquiditySweep(candles))
         {
             LogMessage($"[SWEEP SKIP] {symbol} last candle is a liquidity sweep — skipping");
             return;
         }
 
-        // ── Minimum daily range filter — skip dormant stocks ──────────────
-        // A stock must have moved at least 0.6% today to have enough intraday range
-        // for the trade to reach its profit target without hitting the stop.
-        // Guard: only apply after at least 20 minutes of today's candles exist so
-        // the range has had time to develop (avoids false rejection at 10:15 open).
         {
             var todayCandlesRange = candles.Where(c => c.Time.Date == nowEt.Date).ToList();
             if (todayCandlesRange.Count >= 20)
@@ -903,40 +669,27 @@ public class SimulatedBroker
         {
             if (_tradesToday >= MAX_TRADES_PER_DAY) return;
 
-            // ── Hourly rate limit — resets at the top of each clock-hour ──────
-            // Prevents burning all daily slots in the first 90 minutes.
-            // 3 entries/hour × 5.5 trading hours ≥ 10 max daily — pace is sustainable.
             var hourSlot = new DateTime(nowEt.Year, nowEt.Month, nowEt.Day, nowEt.Hour, 0, 0);
             if (hourSlot != _currentTradeHour) { _currentTradeHour = hourSlot; _tradesThisHour = 0; }
             if (_tradesThisHour >= MAX_TRADES_PER_HOUR) return;
 
             if (_positions.ContainsKey(symbol)) return;
-            // Include pending (submitted but unfilled) orders in the cap
             if (_positions.Count + _pendingEntryCount >= MAX_POSITIONS) return;
 
-            // Hard budget guard: don't open a new position if remaining cash < POSITION_SIZE.
-            // MAX_POSITIONS × POSITION_SIZE can exceed TOTAL_BUDGET (e.g. 3 × $2000 = $6000
-            // on a $4000 budget) — this check ensures we never actually overspend.
             decimal deployedCapital = _positions.Values.Sum(p => p.AvgPrice * p.Quantity)
-                                    + _pendingEntryCount * POSITION_SIZE; // conservative: reserve a full slot per pending order
+                                    + _pendingEntryCount * POSITION_SIZE;
             if (TOTAL_BUDGET - deployedCapital < POSITION_SIZE) return;
             if (_lastTradeTime.TryGetValue(symbol, out var lastTime))
             {
-                // Double cooldown if the last trade on this symbol was a loss
                 int cooldown = _lastTradeWasLoss.GetValueOrDefault(symbol)
                     ? COOLDOWN_SECONDS * 2
                     : COOLDOWN_SECONDS;
                 if ((DateTime.UtcNow - lastTime).TotalSeconds < cooldown) return;
             }
-            // Max 1 entry per symbol per day — if it lost once, conditions haven't changed enough to retry
             if (_dailyEntryCount.GetValueOrDefault(symbol) >= 2) return;
 
             int minutesSinceOpen = (nowEt.Hour - 9) * 60 + nowEt.Minute - 30;
 
-            // ── Setup quality gate ─────────────────────────────────────────────
-            // Score the current bar across trend/volume/ATR/regime/VWAP dimensions.
-            // Entries below MIN_SETUP_SCORE are skipped — removes marginal setups that
-            // pass individual strategy rules but lack broad-market alignment.
             int setupScore = ScoreSetup(symbol, candles);
             if (setupScore < MIN_SETUP_SCORE)
             {
@@ -944,17 +697,14 @@ public class SimulatedBroker
                 return;
             }
 
-            // ── STRATEGY DISPATCH ─────────────────────────────
-            // Try each strategy in priority order. First one to fire wins.
-            // Each strategy is individually gated by its enable flag —
-            // toggle them in Settings or bot-config.json without restarting.
-
             // 1. Opening Range Breakout (only after ORB window closes)
             if (STRATEGY_ORB_ENABLED && minutesSinceOpen > ORB_MINUTES)
                 if (TryOrbStrategy(symbol, candles, nowEt)) return;
 
-            // 2. Gap-and-Go (10:15–12:00 ET)
-            if (STRATEGY_GAP_GO_ENABLED && minutesSinceOpen >= 45 && minutesSinceOpen <= 150)
+            // CHANGE 5: Gap&Go end time — regime-dependent to avoid post-11am stale gaps
+            // TRENDING days: allow full 150-min window. Non-trending: cut to 120 min (11:00 ET).
+            int gapGoEnd = _marketRegime == "TRENDING" ? 150 : 120;
+            if (STRATEGY_GAP_GO_ENABLED && minutesSinceOpen >= 45 && minutesSinceOpen <= gapGoEnd)
                 if (TryGapAndGoStrategy(symbol, candles)) return;
 
             // 3. VWAP Bounce / Reclaim
@@ -986,26 +736,11 @@ public class SimulatedBroker
     // ══════════════════════════════════════════════════════════
     //  STRATEGY 8 — BOLLINGER BAND MEAN REVERSION
     // ══════════════════════════════════════════════════════════
-    // Complements RSI mean reversion with a price-based signal.
-    // RSI fires on oscillator extremes; Bollinger Bands fire when price
-    // actually touches the ±2σ envelope — catches slow grinds RSI misses.
-    //
-    // Rules (long):
-    //   • Price closes AT or BELOW lower band (−2σ)
-    //   • Stock is in uptrend (above SMA50)
-    //   • RSI < 40 (confirms selling pressure — avoids catching falling knives)
-    //   • Band width < 4% of price (squeeze condition — high-vol bands = already in big move)
-    //   • Not in SELL-OFF regime unless showing strong relative strength
-    //
-    // Rules (short): mirror image at upper band, below SMA50, SELL-OFF or CHOPPY regime.
-    // ──────────────────────────────────────────────────────────
+
     private bool TryBollingerMeanReversionStrategy(string symbol, List<Candle> candles)
     {
         if (candles.Count < 20) return false;
 
-        // ── Regime gate — same as TryMeanReversionStrategy ──────────────────
-        // Bollinger band touches at the extremes are reliable signals only in
-        // ranging/choppy markets. In trending days price hugs the band for hours.
         if (_marketRegime != "CHOPPY" && _marketRegime != "SELL-OFF") return false;
 
         var lastCandle = candles.Last();
@@ -1018,11 +753,9 @@ public class SimulatedBroker
         double prevRsi = ind.Rsi14Prev;
         decimal atr = ind.Atr14;
 
-        // Dormant + chaos filter
         if (close > 0 && (atr / close < MIN_ATR_PCT || (MAX_ATR_PCT > 0 && atr / close > MAX_ATR_PCT))) return false;
         if (sma20 <= 0) return false;
 
-        // ── Standard deviation of last 20 closes ──────────────
         var last20 = candles.TakeLast(20).Select(c => (double)c.Close).ToArray();
         double mean = last20.Average();
         double stdDev = Math.Sqrt(last20.Average(x => (x - mean) * (x - mean)));
@@ -1031,15 +764,11 @@ public class SimulatedBroker
         decimal upperBand = (decimal)(mean + 2.0 * stdDev);
         decimal lowerBand = (decimal)(mean - 2.0 * stdDev);
 
-        // Band width filter — wide bands mean a big move is already underway;
-        // reversion setups only make sense after a squeeze, not mid-expansion.
         decimal bandWidth = upperBand - lowerBand;
         if (sma20 > 0 && bandWidth / sma20 > 0.04m) return false;
 
-        // ── LONG: touch lower band in an uptrend ──────────────
-        // Require RSI turning upward — same falling-knife guard as TryMeanReversionStrategy.
         bool touchLower = close <= lowerBand && rsi < 40.0 && sma50 > 0 && close > sma50
-                        && rsi > prevRsi;  // RSI must be curling up — not still falling
+                        && rsi > prevRsi;
         if (touchLower && (_marketRegime != "SELL-OFF" || CheckStrongRelativeStrength(symbol, candles)))
         {
             decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
@@ -1049,10 +778,8 @@ public class SimulatedBroker
             return true;
         }
 
-        // ── SHORT: touch upper band in a downtrend ─────────────
-        // Require RSI turning downward — confirms the rally is stalling at the band.
         bool touchUpper = close >= upperBand && rsi > 60.0 && sma50 > 0 && close < sma50
-                        && rsi < prevRsi;  // RSI must be rolling over — confirms fade
+                        && rsi < prevRsi;
         if (touchUpper && _allowShorts)
         {
             decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
@@ -1064,15 +791,16 @@ public class SimulatedBroker
 
         return false;
     }
+
+    // ══════════════════════════════════════════════════════════
     //  STRATEGY 1 — OPENING RANGE BREAKOUT (ORB)
     // ══════════════════════════════════════════════════════════
 
     private bool TryOrbStrategy(string symbol, List<Candle> candles, DateTime nowEt)
     {
-        // ORB relies on follow-through after a breakout — exactly what doesn't happen
-        // in choppy conditions. False breakouts above ORB high (and fake breakdowns
-        // below ORB low) are the most common loss pattern on non-trending days.
-        if (_marketRegime == "CHOPPY") return false;
+        // CHANGE 6: Allow NORMAL regime for ORB — previously blocked clean setups on normal days.
+        // NORMAL requires a stricter 3-bar hold confirmation to compensate for reduced regime strength.
+        if (_marketRegime != "TRENDING" && _marketRegime != "SELL-OFF" && _marketRegime != "NORMAL") return false;
 
         if (!_orbRanges.TryGetValue(symbol, out var orb) || !orb.IsSet) return false;
         if (orb.High <= orb.Low) return false;
@@ -1085,33 +813,31 @@ public class SimulatedBroker
         double rsi = ind.Rsi14;
 
         if (close > 0 && atr / close < MIN_ATR_PCT) return false;
-        // Chaos ceiling
         if (MAX_ATR_PCT > 0 && close > 0 && atr / close > MAX_ATR_PCT) return false;
 
-        // ── Trend-strength filter — flat EMAs mean no real trend to break out into ──
         decimal orbSma20 = ind.Sma20; decimal orbSma50 = ind.Sma50;
         if (orbSma20 > 0 && orbSma50 > 0 && close > 0 && Math.Abs(orbSma20 - orbSma50) / close < 0.002m) return false;
 
         _vwap.TryGetValue(symbol, out decimal vwapVal);
 
-        // Lighter volume check: last bar volume >= 10-bar average catches fake pokes
-        // without requiring the full 5-bar expansion which is too strict on slow mornings.
         var last10Vols = candles.TakeLast(10).ToList();
         long avgVol10 = last10Vols.Count > 0 ? (long)last10Vols.Average(c => c.Volume) : 0;
         bool lastBarVolOk = candles.Last().Volume >= avgVol10;
 
-        // ── LONG: price breaks above ORB high ─────────────────
-        // Require the last 2 candles to have BOTH closed above ORB high — not just
-        // a single-bar poke. Single-bar pokes above ORB high are the most common
-        // bull-trap pattern in opening range strategies.
-        bool orbLongHold = candles.Count >= 2
-                        && candles.TakeLast(2).All(c => c.Close > orb.High);
+        // CHANGE 6 (continued): NORMAL regime requires 3-bar hold; TRENDING/SELL-OFF keep 2-bar hold.
+        // 3-bar hold significantly reduces false breakouts on lower-conviction normal days.
+        int requiredHoldBars = _marketRegime == "NORMAL" ? 3 : 2;
+
+        bool orbLongHold = candles.Count >= requiredHoldBars
+                        && candles.TakeLast(requiredHoldBars).All(c => c.Close > orb.High);
         if (orbLongHold && lastBarVolOk && rsi > RSI_LONG_MIN)
         {
-            // ── HARD BLOCK: No longs on SELL-OFF days or bearish SPY opens ──────
-            // Removed the CheckStrongRelativeStrength exception — relative-strength longs
-            // into a SELL-OFF regime have proven unreliable (the market drags everything
-            // down intraday even if the stock gapped up). Short side is far more reliable.
+            if (!_spyBullish)
+            {
+                LogMessage($"[ORB SKIP] {symbol} ORB_LONG blocked — SPY bias not bullish enough");
+                goto TryShortOrb;
+            }
+
             if (_marketRegime == "SELL-OFF")
             {
                 LogMessage($"[ORB SKIP] {symbol} ORB_LONG blocked — SELL-OFF regime");
@@ -1123,27 +849,19 @@ public class SimulatedBroker
                 goto TryShortOrb;
             }
 
-            // ── Stock daily direction filter ──────────────────────────────────
-            // Only take ORB_LONG if the stock is up or flat vs yesterday's close.
-            // Trying to go long on a stock that opened down and hasn't recovered
-            // means you're fighting two headwinds (gap fill risk + weak relative strength).
             if (_prevDayClose.TryGetValue(symbol, out decimal prevCloseOrb) && prevCloseOrb > 0)
             {
                 decimal stockDayPct = (close - prevCloseOrb) / prevCloseOrb;
-                if (stockDayPct < -0.002m)  // more than 0.2% below prev close
+                if (stockDayPct < -0.002m)
                 {
                     LogMessage($"[ORB SKIP] {symbol} ORB_LONG blocked — stock down {stockDayPct:P2} on day");
                     goto TryShortOrb;
                 }
             }
 
-            // 15-min trend filter — skip longs when price is below the 15-min EMA(20).
-            // Prevents false breakouts at 10:15 ET before the 15-min trend confirms.
             if (_ema20_15min.TryGetValue(symbol, out var ema15L) && ema15L.ema20 > 0
                 && close < ema15L.ema20) goto TryShortOrb;
 
-            // Skip if price is within 0.25% BELOW prev day high — too close to
-            // resistance ceiling. A real breakout clears prev day high convincingly.
             var (pdHigh, _) = GetPrevDayHL(symbol);
             if (pdHigh > 0 && close < pdHigh && close >= pdHigh * 0.9975m) goto TryShortOrb;
 
@@ -1156,20 +874,15 @@ public class SimulatedBroker
         }
 
         TryShortOrb:
-        // ── SHORT: price breaks below ORB low ──────────────────
-        // Short side is the preferred side during SELL-OFF and bearish SPY open sessions.
-        // Same 2-bar hold confirmation as the long side — single-bar pokes below
-        // ORB low are common liquidity sweeps that immediately reverse.
-        bool orbShortHold = candles.Count >= 2
-                         && candles.TakeLast(2).All(c => c.Close < orb.Low);
+        bool orbShortHold = candles.Count >= requiredHoldBars
+                         && candles.TakeLast(requiredHoldBars).All(c => c.Close < orb.Low);
         if (orbShortHold && lastBarVolOk && rsi < RSI_SHORT_MAX && _allowShorts)
         {
-            // 15-min trend filter — skip shorts when price is above the 15-min EMA(20).
+            if (!_spyBearish && _marketRegime != "SELL-OFF") return false;
+
             if (_ema20_15min.TryGetValue(symbol, out var ema15S) && ema15S.ema20 > 0
                 && close > ema15S.ema20) return false;
 
-            // Skip if price is within 0.25% ABOVE prev day low — too close to
-            // support floor. A real breakdown holds convincingly below prev day low.
             var (_, pdLow) = GetPrevDayHL(symbol);
             if (pdLow > 0 && close > pdLow && close <= pdLow * 1.0025m) return false;
 
@@ -1190,15 +903,12 @@ public class SimulatedBroker
 
     private bool TryGapAndGoStrategy(string symbol, List<Candle> candles)
     {
-        // Compute gap live: current price vs previous day close
         if (!_prevDayClose.TryGetValue(symbol, out decimal prevClose) || prevClose <= 0) return false;
         if (!_latestTick.TryGetValue(symbol, out decimal currentPrice) || currentPrice <= 0) return false;
         decimal gapPct = (currentPrice - prevClose) / prevClose;
 
         if (Math.Abs(gapPct) < GAP_GO_MIN_PCT) return false;
 
-        // Per-minute rate comparison — avoids partial-day bias (45-min volume vs full-day avg
-        // made the threshold impossible to pass every morning).
         var todayEt = GetEasternTime().Date;
         long todayVol = _dailyVolume.GetValueOrDefault(symbol);
         int minutesToday = Math.Max(1, (GetEasternTime().Hour - 9) * 60 + GetEasternTime().Minute - 30);
@@ -1224,7 +934,6 @@ public class SimulatedBroker
         if (close > 0 && atr / close < MIN_ATR_PCT) return false;
         if (gapPct > 0 && rsi > RSI_LONG_MIN && _marketRegime != "SELL-OFF" && !_spyOpenBearish)
         {
-            // SMA200: allow within 3% below — only block deep structural downtrends
             decimal sma200 = GetDailySma200(symbol);
             if (sma200 > 0 && close < sma200 * 0.97m) return false;
 
@@ -1236,12 +945,8 @@ public class SimulatedBroker
             return true;
         }
 
-        // Gap DOWN → short
         if (gapPct < 0 && rsi < RSI_SHORT_MAX && _allowShorts)
         {
-            // Daily SMA200: prefer stocks already in downtrends for shorts.
-            // Exception: in SELL-OFF regime stocks above SMA200 can still crash hard
-            // intraday (e.g. AAPL/MSFT on a broad selloff day) — don't block those.
             decimal sma200 = GetDailySma200(symbol);
             if (sma200 > 0 && close > sma200 && _marketRegime != "SELL-OFF") return false;
 
@@ -1266,7 +971,6 @@ public class SimulatedBroker
         _vwap.TryGetValue(symbol, out decimal vwapVal);
         if (vwapVal <= 0) return false;
 
-        // Need the last VWAP_CONFIRM_BARS candles ALL above VWAP — not just a 1-bar flicker
         if (candles.Count < VWAP_CONFIRM_BARS) return false;
         var recentBars = candles.TakeLast(VWAP_CONFIRM_BARS).ToList();
         bool allRecentAbove = recentBars.All(c => c.Close > vwapVal);
@@ -1282,13 +986,15 @@ public class SimulatedBroker
 
         if (close > 0 && atr / close < MIN_ATR_PCT) return false;
         bool vwapReclaim = !prevAbove && allRecentAbove;
-        // VWAP reclaim long: now requires volume confirmation.
-        // A reclaim on light volume reverses just as fast — it was producing
-        // 1-2 bar fake-outs that hit the hard stop right after min-hold expired.
-        if (vwapReclaim && volExp && rsi > RSI_LONG_MIN && _marketRegime != "SELL-OFF" && !_spyOpenBearish)
+
+        // CHANGE 7: Block VWAP reclaim longs on CHOPPY — coin-flip regime kills VWAP win rate.
+        // VWAP reclaims only work when there's a real trend carrying price above VWAP.
+        // In CHOPPY, price oscillates through VWAP repeatedly with no follow-through.
+        if (vwapReclaim && volExp && rsi > RSI_LONG_MIN
+            && _marketRegime != "SELL-OFF"
+            && _marketRegime != "CHOPPY"   // NEW: skip reclaims in choppy — no trend to sustain them
+            && !_spyOpenBearish)
         {
-            // Skip if price is pinned just under prev day high — VWAP reclaim into
-            // overhead resistance is a low-probability long setup.
             var (pdHigh, _) = GetPrevDayHL(symbol);
             if (pdHigh > 0 && close < pdHigh && close >= pdHigh * 0.997m) return false;
 
@@ -1299,12 +1005,9 @@ public class SimulatedBroker
             return true;
         }
 
-        // Rejection: previous bar above, now 2 bars confirmed below
         bool vwapRejection = prevAbove && allRecentBelow;
         if (vwapRejection && volExp && rsi < RSI_SHORT_MAX && _allowShorts)
         {
-            // Skip if price is just above prev day low — shorting into support floor
-            // is a low-probability short setup.
             var (_, pdLow) = GetPrevDayHL(symbol);
             if (pdLow > 0 && close > pdLow && close <= pdLow * 1.003m) return false;
 
@@ -1317,6 +1020,7 @@ public class SimulatedBroker
 
         return false;
     }
+
     // ══════════════════════════════════════════════════════════
     //  STRATEGY 4 — RSI MEAN REVERSION
     // ══════════════════════════════════════════════════════════
@@ -1325,9 +1029,6 @@ public class SimulatedBroker
     {
         if (candles.Count < 50) return false;
 
-        // ── Regime gate — mean reversion ONLY makes money in range/choppy markets ──
-        // In TRENDING or NORMAL days the strategy fades every breakout and loses.
-        // SELL-OFF is allowed because oversold bounces do occur in broad selloffs.
         if (_marketRegime != "CHOPPY" && _marketRegime != "SELL-OFF") return false;
 
         var lastCandle = candles.Last();
@@ -1339,15 +1040,11 @@ public class SimulatedBroker
         double prevRsi = ind.Rsi14Prev;
         decimal atr = ind.Atr14;
 
-        // Dormant + chaos filter
         if (close > 0 && (atr / close < MIN_ATR_PCT || (MAX_ATR_PCT > 0 && atr / close > MAX_ATR_PCT))) return false;
 
-        // Stock is in uptrend (above SMA50) but RSI has dipped — buy the dip.
-        // REQUIRE RSI turning upward (rsi > prevRsi): confirms reversal momentum,
-        // not just an oversold stock that keeps falling (falling knife guard).
         bool oversoldInUptrend = close > sma50 && rsi < RSI_OVERSOLD
-                               && rsi > prevRsi   // RSI must be curling up — not still falling
-                               && _marketRegime != "SELL-OFF"  // never fade in a SELL-OFF — oversold gets more oversold
+                               && rsi > prevRsi
+                               && _marketRegime != "SELL-OFF"
                                && !_spyOpenBearish;
         if (oversoldInUptrend)
         {
@@ -1359,11 +1056,8 @@ public class SimulatedBroker
             return true;
         }
 
-        // ── OVERBOUGHT FADE → short ───────────────────────────
-        // Stock is in downtrend (below SMA50) and RSI has spiked — fade the rally.
-        // REQUIRE RSI turning downward (rsi < prevRsi) — confirms the rally is stalling.
         bool overboughtInDowntrend = close < sma50 && rsi > RSI_OVERBOUGHT
-                                   && rsi < prevRsi;  // RSI must be rolling over — confirms fade
+                                   && rsi < prevRsi;
         if (overboughtInDowntrend && _allowShorts)
         {
             decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
@@ -1386,7 +1080,6 @@ public class SimulatedBroker
         var lastCandle = candles.Last();
         decimal close = lastCandle.Close;
 
-        // Use cached indicators — computed once per candle close in RefreshIndicatorCache()
         if (!_indicatorCache.TryGetValue(symbol, out var ind)) return false;
         decimal sma20 = ind.Sma20;
         decimal sma50 = ind.Sma50;
@@ -1398,83 +1091,58 @@ public class SimulatedBroker
         decimal atrPct = close > 0 ? atr / close : 0m;
 
         if (atrPct < MIN_ATR_PCT) return false;
-        // Chaos ceiling — skip when 1-min ATR is extreme (news spike, flash crash)
         if (MAX_ATR_PCT > 0 && atrPct > MAX_ATR_PCT) return false;
 
-        // ── Trend-strength filter — skip flat markets ──────────────────────────
-        // When SMA20 and SMA50 are within 0.2% of each other the EMAs are flat/tangled.
-        // Momentum strategies need a clear slope to work; flat EMAs = chop in disguise.
-        // This catches the "looks like NORMAL but actually sideways" sessions.
         if (sma20 > 0 && sma50 > 0 && close > 0)
         {
             decimal smaGap = Math.Abs(sma20 - sma50) / close;
-            if (smaGap < 0.002m) return false;  // EMAs too close — no real trend
+            if (smaGap < 0.002m) return false;
         }
 
-        // ── SCORE-BASED LONG ENTRY (need 3 of 5 conditions) ───
         _vwap.TryGetValue(symbol, out decimal vwapVal);
 
-        bool regimeStrong = _marketRegime != "SELL-OFF" && !_spyOpenBearish;
+        bool regimeStrong = _marketRegime != "SELL-OFF" && !_spyOpenBearish && _spyBullish;
         bool relativeStrength = CheckRelativeStrength(symbol, candles);
         bool rsiConfirm = rsi > RSI_LONG_MIN;
         bool aboveVwap = vwapVal <= 0 || close > vwapVal;
+        bool macdBullish = macdDir > 0;
 
-        // MACD direction: +1 when momentum is building in the long direction.
-        // Used as a score factor rather than a hard block so we don't miss trades
-        // when MACD is temporarily flat/neutral (common mid-session).
-        // (macdDir already loaded from indicator cache above)
-        bool macdBullish = macdDir > 0; // require actual positive MACD slope for long momentum
-
-        // Breakout or pullback-continuation signals
         decimal recentHigh = ind.RecentHigh8;
         decimal range = lastCandle.High - lastCandle.Low;
         decimal avgRange = candles.TakeLast(10).Average(c => c.High - c.Low);
-        bool expansion = range > avgRange * 1.3m; // lowered from 1.8 — 1.3x still confirms above-avg momentum
+        bool expansion = range > avgRange * 1.3m;
         bool choppyMode = _marketRegime == "CHOPPY";
 
         bool pullbackEntry = lastCandle.Low <= sma20 && lastCandle.Close > sma20
                               && rsi > 55 && close > sma50 && relativeStrength;
-        // breakoutSignal: require volatility compression (coil before expansion).
-        // Big moves almost always follow a tight consolidation where ATR contracts.
-        // Without compression the breakout is random noise, not stored energy releasing.
-        // Compression is only required for breakouts — pullback and trendContinuation
-        // entries already confirm via SMA alignment, so they don't need it.
         bool volCompressed = IsVolatilityCompressed(candles);
-        bool breakoutSignal = !choppyMode && expansion && volExp && close > recentHigh && volCompressed;
+        bool breakoutSignal = !choppyMode
+                           && (_marketRegime == "TRENDING" || _marketRegime == "SELL-OFF")
+                           && _spyBullish
+                           && expansion && volExp && close > recentHigh && volCompressed;
 
-        // trendContinuation: no full volume-expansion requirement; continuation setups often work on steady
-        // above-average participation rather than parabolic 5-bar spikes. Also removed UNKNOWN regime: firing before SPY has 30 bars (first ~30 min)
-        // means regime isn't known yet, which produced unreliable entries early in the session.
         bool trendContinuation = (_marketRegime == "NORMAL" || _marketRegime == "TRENDING")
+                               && _spyBullish
                                && close > sma20 && close > sma50
                                && rsi > 58 && relativeStrength;
 
         bool hasSignal = breakoutSignal || pullbackEntry || trendContinuation;
 
-        // TRENDING: only 3/5 needed — trend confirmed, fewer false signals.
-        // NORMAL:   4/5 — standard selectivity.
-        // CHOPPY:   5/5 — unanimous; false breakouts dominate choppy sessions.
-        //           (Was 3, which was backwards — causing excess entries on whipsaw days.)
-        // UNKNOWN:  4/5 — conservative until regime resolves.
         int required = _marketRegime == "TRENDING" ? 3
                      : _marketRegime == "CHOPPY" ? 5
                      : 4;
 
-        // Score: max 5 points
         int score = (regimeStrong ? 1 : 0)
                   + (relativeStrength ? 1 : 0)
                   + (rsiConfirm ? 1 : 0)
                   + (aboveVwap ? 1 : 0)
                   + (macdBullish ? 1 : 0);
 
-        // Breakouts still require volExp; pullbacks and trend continuation are allowed without a 5-bar spike.
         if (score >= required && hasSignal && (volExp || pullbackEntry || trendContinuation))
         {
-            // SMA200: allow within 3% below — only block deep structural downtrends
             decimal sma200 = GetDailySma200(symbol);
             if (sma200 > 0 && close < sma200 * 0.97m) return false;
 
-            // 15-min trend filter — skip if 1-min breakout opposes the 15-min trend
             if (_ema20_15min.TryGetValue(symbol, out var ema15ML) && ema15ML.ema20 > 0
                 && close < ema15ML.ema20) return false;
 
@@ -1486,19 +1154,18 @@ public class SimulatedBroker
             return true;
         }
 
-        // Shorts allowed in SELL-OFF, NORMAL, CHOPPY — individual stocks break down on any regime.
-        // Require score≥4 outside SELL-OFF for extra selectivity.
         bool inShortRegime = _marketRegime == "SELL-OFF" || _marketRegime == "NORMAL" || _marketRegime == "CHOPPY";
         if (inShortRegime && _allowShorts)
         {
             bool rsiShortConfirm = rsi < RSI_SHORT_MAX;
             bool belowVwap = vwapVal > 0 && close < vwapVal;
-            bool breakdownSignal = !choppyMode && expansion && volExp
+            bool bearishTape = _spyBearish || _marketRegime == "SELL-OFF";
+            bool breakdownSignal = !choppyMode && bearishTape && expansion && volExp
                                    && close < ind.RecentLow8 && volCompressed;
-            bool macdBearish = macdDir < 0; // symmetric with macdBullish — require actual negative slope, not just neutral
+            bool macdBearish = macdDir < 0;
 
             int shortScore = (rsiShortConfirm ? 1 : 0)
-                           + (!relativeStrength ? 1 : 0)  // weak vs SPY
+                           + (!relativeStrength ? 1 : 0)
                            + (belowVwap ? 1 : 0)
                            + (volExp ? 1 : 0)
                            + (macdBearish ? 1 : 0);
@@ -1506,12 +1173,9 @@ public class SimulatedBroker
             int shortRequired = _marketRegime == "SELL-OFF" ? 3 : 4;
             if (shortRequired <= shortScore && breakdownSignal)
             {
-                // Daily SMA200: prefer stocks already in downtrends.
-                // In SELL-OFF regime, skip — stocks can be above SMA200 and still crash.
                 decimal sma200 = GetDailySma200(symbol);
                 if (sma200 > 0 && close > sma200 && _marketRegime != "SELL-OFF") return false;
 
-                // 15-min trend filter — skip shorts when price is above 15-min EMA(20)
                 if (_ema20_15min.TryGetValue(symbol, out var ema15MS) && ema15MS.ema20 > 0
                     && close > ema15MS.ema20) return false;
 
@@ -1530,23 +1194,11 @@ public class SimulatedBroker
     // ══════════════════════════════════════════════════════════
     //  STRATEGY 6 — EMA POCKET (Triple Line Setup)
     // ══════════════════════════════════════════════════════════
-    // Based on the "triple line" concept: price resting in the pocket between
-    // the 9 EMA and 21 EMA near a key S/R level creates a trampoline-like rejection.
-    //
-    // Rules (long):
-    //   • 9 EMA > 21 EMA  (uptrend — EMAs in bullish order)
-    //   • EMAs are sloping (not flat) — slope checked over last 5 bars
-    //   • Price closed BETWEEN 9 EMA and 21 EMA (the "pocket")
-    //   • A key S/R level is within 1 ATR of current price (prev-day high/low or VWAP)
-    //   • RSI > 50 (momentum tiebreaker)
-    //   • Volume confirms (last bar ≥ avg)
-    // Rules (short): mirror image with EMAs inverted, RSI < 50
-    // ──────────────────────────────────────────────────────────
+
     private bool TryEmaPocketStrategy(string symbol, List<Candle> candles)
     {
         if (candles.Count < 30) return false;
 
-        // Use cached EMAs and indicators — no need to recompute from scratch
         if (!_indicatorCache.TryGetValue(symbol, out var ind)) return false;
 
         double ema9 = ind.Ema9;
@@ -1561,19 +1213,15 @@ public class SimulatedBroker
         _vwap.TryGetValue(symbol, out decimal vwapVal);
         var (pdHigh, pdLow) = GetPrevDayHL(symbol);
 
-        // EMA slope — must be moving, not flat. Require at least 0.05% move over 5 bars.
         double slopeThreshold = ema21Prev * 0.0005;
         bool ema9Rising = ema9 > ema9Prev + slopeThreshold;
         bool ema9Falling = ema9 < ema9Prev - slopeThreshold;
         bool ema21Rising = ema21 > ema21Prev + slopeThreshold;
         bool ema21Falling = ema21 < ema21Prev - slopeThreshold;
 
-        // Volume: last bar must be at or above 10-bar average
         long avgVol = (long)candles.TakeLast(10).Average(c => c.Volume);
         bool volOk = candles.Last().Volume >= avgVol;
 
-        // Key S/R proximity — at least one level within 1.0 × ATR of current price
-        // Levels used: prev-day high, prev-day low, VWAP
         bool nearLevel = false;
         if (pdHigh > 0 && Math.Abs(close - pdHigh) <= atr) nearLevel = true;
         if (pdLow > 0 && Math.Abs(close - pdLow) <= atr) nearLevel = true;
@@ -1582,7 +1230,6 @@ public class SimulatedBroker
 
         if (!volOk) return false;
 
-        // ── LONG: 9 EMA > 21 EMA, price pulled back into pocket ─
         bool bullishOrder = ema9 > ema21;
         bool inLongPocket = (double)close < ema9 && (double)close > ema21;
 
@@ -1599,7 +1246,6 @@ public class SimulatedBroker
             return true;
         }
 
-        // ── SHORT: 9 EMA < 21 EMA, price bounced up into pocket ─
         bool bearishOrder = ema9 < ema21;
         bool inShortPocket = (double)close > ema9 && (double)close < ema21;
 
@@ -1622,34 +1268,26 @@ public class SimulatedBroker
     // ══════════════════════════════════════════════════════════
     //  STRATEGY 7 — OUTSIDE CANDLE (Engulfing 3-Bar)
     // ══════════════════════════════════════════════════════════
-    // An outside (engulfing) candle that completely swallows the prior THREE candles
-    // signals institutional participation. The close position within the candle's
-    // range confirms direction (top 25% = bullish, bottom 25% = bearish).
-    // Trend filter: 30-min 50 EMA — only longs above it, only shorts below it.
-    // Location filter: highest-probability near prev-day H/L, VWAP, or ORB levels.
-    // ──────────────────────────────────────────────────────────
+
     private bool TryOutsideCandleStrategy(string symbol, List<Candle> candles)
     {
         if (candles.Count < 10) return false;
 
         var last4 = candles.TakeLast(4).ToList();
-        var outside = last4[3];  // most recent (just closed) candle
+        var outside = last4[3];
         var prior3 = last4.Take(3).ToList();
 
-        // ── Outside candle: must completely engulf all 3 prior candles ────
         decimal outerHigh = prior3.Max(c => c.High);
         decimal outerLow = prior3.Min(c => c.Low);
         bool isOutside = outside.High > outerHigh && outside.Low < outerLow;
         if (!isOutside) return false;
 
-        // Candle must have meaningful range (at least 0.3% of price) — filters doji noise
         decimal range = outside.High - outside.Low;
         if (range < outside.Close * 0.003m) return false;
 
-        // ── Close position within range ───────────────────────
         decimal closePosition = range > 0 ? (outside.Close - outside.Low) / range : 0.5m;
-        bool bullishClose = closePosition >= 0.75m;  // closed in top 25%
-        bool bearishClose = closePosition <= 0.25m;  // closed in bottom 25%
+        bool bullishClose = closePosition >= 0.75m;
+        bool bearishClose = closePosition <= 0.25m;
         if (!bullishClose && !bearishClose) return false;
 
         decimal close = outside.Close;
@@ -1661,12 +1299,8 @@ public class SimulatedBroker
         _vwap.TryGetValue(symbol, out decimal vwapVal);
         var (pdHigh, pdLow) = GetPrevDayHL(symbol);
 
-        // ── 30-min 50 EMA trend filter ────────────────────────
-        // Aggregate 1-min candles into 30-min bars and compute EMA(50) over those bars.
         double ema50_30min = Calc30MinEma(symbol, candles, 50);
 
-        // ── Location filter — near meaningful S/R ─────────────
-        // Outside candles "in the middle of nowhere" are lower probability.
         bool nearSR = false;
         if (pdHigh > 0 && Math.Abs(close - pdHigh) <= atr * 1.5m) nearSR = true;
         if (pdLow > 0 && Math.Abs(close - pdLow) <= atr * 1.5m) nearSR = true;
@@ -1678,16 +1312,13 @@ public class SimulatedBroker
         }
         if (!nearSR) return false;
 
-        // ── LONG: bullish outside candle, price above 30-min 50 EMA ──
         if (bullishClose && ema50_30min > 0 && (double)close > ema50_30min && rsi > 50)
         {
             if (_marketRegime == "SELL-OFF" || _spyOpenBearish)
                 return false;
 
-            // Stop goes below the low of the outside candle — per video rules
             decimal stopDistance = Math.Max(close - outside.Low, atr * HARD_STOP_ATR_MULT);
             stopDistance = Math.Max(stopDistance, MIN_STOP_DISTANCE);
-            // Require at least 2:1 R:R — if target (next S/R or VWAP) is too close, skip
             decimal target = vwapVal > close ? vwapVal : (pdHigh > close ? pdHigh : close + atr * 2);
             if (target - close < stopDistance * 2m) return false;
 
@@ -1698,7 +1329,6 @@ public class SimulatedBroker
             return true;
         }
 
-        // ── SHORT: bearish outside candle, price below 30-min 50 EMA ──
         if (bearishClose && ema50_30min > 0 && (double)close < ema50_30min && rsi < 50 && _allowShorts)
         {
             decimal sma200 = GetDailySma200(symbol);
@@ -1719,11 +1349,6 @@ public class SimulatedBroker
         return false;
     }
 
-    // ── Helper: aggregate 1-min candles into 30-min bars and compute EMA(period) ──
-    // Used by TryOutsideCandleStrategy for the 30-min 50 EMA trend filter.
-    // Returns 0 if not enough 30-min bars have formed yet.
-    // Cached per symbol per 30-min bar so the O(n) GroupBy only runs once per bar,
-    // not on every 1-min candle close (previous behaviour was ~30× redundant work).
     private double Calc30MinEma(string symbol, List<Candle> candles, int period)
     {
         if (candles == null || candles.Count < 2) return 0;
@@ -1731,11 +1356,9 @@ public class SimulatedBroker
         var barTime = new DateTime(lastCandle.Time.Year, lastCandle.Time.Month, lastCandle.Time.Day,
                                    lastCandle.Time.Hour, (lastCandle.Time.Minute / 30) * 30, 0);
 
-        // Return cached value if we are still inside the same 30-min bar
         if (_ema50_30min.TryGetValue(symbol, out var cached) && cached.barTime == barTime)
             return cached.ema50;
 
-        // New bar — recompute and cache
         var bars30 = candles
             .GroupBy(c => new DateTime(c.Time.Year, c.Time.Month, c.Time.Day,
                                        c.Time.Hour, (c.Time.Minute / 30) * 30, 0))
@@ -1752,18 +1375,7 @@ public class SimulatedBroker
     // ══════════════════════════════════════════════════════════
     //  SETUP QUALITY SCORER
     // ══════════════════════════════════════════════════════════
-    // Rates a potential entry 0–100 across five dimensions before any strategy
-    // fires. Entries below MIN_SETUP_SCORE are rejected wholesale — avoids taking
-    // technically valid strategy signals in a bad broad-market environment.
-    //
-    //  Dimension            Max pts   Logic
-    //  ─────────────────────────────────────────────────────────
-    //  Trend alignment        25      Price above/below SMA50; 15-min EMA20 aligned
-    //  Relative volume        25      Recent volume vs 5-bar average
-    //  ATR quality            20      ATR% within healthy MIN–MAX band
-    //  Regime alignment       20      TRENDING/NORMAL +pts; SELL-OFF/CHOPPY –pts
-    //  VWAP proximity         10      Price within 1.5× ATR of VWAP
-    // ──────────────────────────────────────────────────────────
+
     private int ScoreSetup(string symbol, List<Candle> candles)
     {
         if (candles == null || candles.Count < 50) return 0;
@@ -1772,61 +1384,46 @@ public class SimulatedBroker
         int score = 0;
         decimal lastClose = candles.Last().Close;
 
-        // ── Trend alignment (25 pts) ──────────────────────────────────────
-        // +15 if price is on the right side of SMA50 for a long/short signal
-        // +10 if the 15-min EMA20 agrees with the 1-min direction
         bool aboveSma50 = lastClose > ind.Sma50 && ind.Sma50 > 0;
-        if (aboveSma50) score += 15;    // bullish structure
-        else if (!aboveSma50 && ind.Sma50 > 0) score += 8;  // partial for shorts in downtrend
+        if (aboveSma50) score += 15;
+        else if (!aboveSma50 && ind.Sma50 > 0) score += 8;
 
         if (_ema20_15min.TryGetValue(symbol, out var ema15) && ema15.ema20 > 0)
         {
-            if (aboveSma50 && lastClose > ema15.ema20) score += 10;   // HTF confirms long
-            else if (!aboveSma50 && lastClose < ema15.ema20) score += 10; // HTF confirms short
+            if (aboveSma50 && lastClose > ema15.ema20) score += 10;
+            else if (!aboveSma50 && lastClose < ema15.ema20) score += 10;
         }
 
-        // ── Relative volume (25 pts) ──────────────────────────────────────
-        // Volume expansion is the single strongest signal that a move has participation.
         if (ind.VolExpansion) score += 25;
         else
         {
-            // Partial credit: recent 5-bar volume vs prior 5-bar (softer check)
             var last10 = candles.TakeLast(10).ToList();
             if (last10.Count >= 10)
             {
                 long prev5vol = last10.Take(5).Sum(c => c.Volume);
                 long recent5vol = last10.Skip(5).Take(5).Sum(c => c.Volume);
-                if (prev5vol > 0 && recent5vol > prev5vol * 1.3m) score += 10; // elevated but not extreme
+                if (prev5vol > 0 && recent5vol > prev5vol * 1.3m) score += 10;
             }
         }
 
-        // ── ATR quality (20 pts) ──────────────────────────────────────────
-        // Healthy ATR% (MIN_ATR_PCT–MAX_ATR_PCT): full points.
-        // Out of band: zero — either too choppy or too chaotic.
         if (lastClose > 0 && ind.Atr14 > 0)
         {
             decimal atrPct = ind.Atr14 / lastClose;
             if (atrPct >= MIN_ATR_PCT && (MAX_ATR_PCT <= 0 || atrPct <= MAX_ATR_PCT))
                 score += 20;
-            else if (atrPct >= MIN_ATR_PCT * 0.7m) // slightly below floor — partial
+            else if (atrPct >= MIN_ATR_PCT * 0.7m)
                 score += 8;
         }
 
-        // ── Regime alignment (20 pts) ─────────────────────────────────────
-        // TRENDING is the best environment for momentum entries.
-        // SELL-OFF blocks longs outright (handled separately); penalise score here too.
         score += _marketRegime switch
         {
             "TRENDING" => 20,
             "NORMAL" => 12,
             "CHOPPY" => 4,
             "SELL-OFF" => 0,
-            _ => 8   // UNKNOWN — give benefit of the doubt at startup
+            _ => 8
         };
 
-        // ── VWAP proximity (10 pts) ───────────────────────────────────────
-        // Price within 1.5× ATR of VWAP: trade is near a key intraday magnet.
-        // Not required — many breakout setups are far from VWAP — so it's a bonus.
         if (_vwap.TryGetValue(symbol, out decimal vwapNow) && vwapNow > 0 && ind.Atr14 > 0)
         {
             if (Math.Abs(lastClose - vwapNow) <= ind.Atr14 * 1.5m)
@@ -1843,25 +1440,14 @@ public class SimulatedBroker
     private void OpenPosition(string symbol, int qty, decimal price,
                            TradeSide side, bool isShort, string strategyTag)
     {
-        // Guard against nulls before touching any dictionary
         if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(strategyTag)) return;
-
-        // Block short selling if not enabled or no margin account
         if (isShort && !_allowShorts) return;
-
         if (qty <= 0 || qty > MAX_QTY_SANITY) return;
 
-        // ── SPY Directional Gate ──────────────────────────────────────────
-        // Skip longs when SPY EMA20 is in a confirmed downtrend.
-        // Skip shorts when SPY EMA20 is in a confirmed uptrend.
-        // Exception for longs: override if the stock is showing strong relative
-        // strength (e.g. energy on an oil spike while broader market sells off).
-        // Don't gate SPY itself — it's the benchmark, not a filtered trade.
         if (symbol != "SPY" && symbol != "QQQ" && symbol != "IWM")
         {
             if (!isShort && _spyBearish)
             {
-                // Allow if the stock is genuinely outperforming a down market
                 _marketData.TryGetValue(symbol, out var gateCandles);
                 if (gateCandles == null || !CheckStrongRelativeStrength(symbol, gateCandles))
                 {
@@ -1877,9 +1463,6 @@ public class SimulatedBroker
             }
         }
 
-        // ── Sector Diversification Filter ────────────────────────────────
-        // Prevent two highly-correlated positions from being open simultaneously.
-        // (e.g. NVDA long + AMD long = one semiconductor bet, not two.)
         if (_symbolSectors.TryGetValue(symbol, out string newSector))
         {
             foreach (var openPos in _positions.Values)
@@ -1893,12 +1476,7 @@ public class SimulatedBroker
             }
         }
 
-        // ── Minimum Risk:Reward check ─────────────────────────────────────
-        // Before submitting, verify the nearest realistic target gives at least
-        // MIN_RR_RATIO reward for the stop we're risking. Entries where the target
-        // (VWAP, prev-day high/low, or 2×ATR) is closer than 1.5× the stop are
-        // mathematically unprofitable at any reasonable win rate.
-        decimal stopDist = MIN_STOP_DISTANCE; // declared here so it's in scope for _pendingInitialRisk below
+        decimal stopDist = MIN_STOP_DISTANCE;
         if (_marketData.TryGetValue(symbol, out var rrCandles))
         {
             decimal atrForRR = SafeATR(rrCandles, 14);
@@ -1907,22 +1485,19 @@ public class SimulatedBroker
             _vwap.TryGetValue(symbol, out decimal vwapRR);
             var (pdHighRR, pdLowRR) = GetPrevDayHL(symbol);
 
-            // Estimate nearest meaningful target above (long) or below (short)
             decimal targetDist;
             if (!isShort)
             {
-                // Long: nearest overhead level
                 decimal toVwap = vwapRR > price ? vwapRR - price : decimal.MaxValue;
                 decimal toPdHigh = pdHighRR > price ? pdHighRR - price : decimal.MaxValue;
-                decimal toAtrTgt = atrForRR * 3.5m;  // fallback: 3.5 ATR — comfortably above MIN_RR_RATIO×2.0 ATR stop = 1.75 vs 1.5 minimum
+                decimal toAtrTgt = atrForRR * 3.5m;
                 targetDist = Math.Min(toVwap, Math.Min(toPdHigh, toAtrTgt));
             }
             else
             {
-                // Short: nearest floor level
                 decimal toVwap = vwapRR > 0 && vwapRR < price ? price - vwapRR : decimal.MaxValue;
                 decimal toPdLow = pdLowRR > 0 && pdLowRR < price ? price - pdLowRR : decimal.MaxValue;
-                decimal toAtrTgt = atrForRR * 3.5m;  // same fallback for symmetry
+                decimal toAtrTgt = atrForRR * 3.5m;
                 targetDist = Math.Min(toVwap, Math.Min(toPdLow, toAtrTgt));
             }
 
@@ -1933,17 +1508,11 @@ public class SimulatedBroker
             }
         }
 
-        // Store the strategy tag and initial risk so OnOrderFilled can stamp them onto the SimPosition.
-        // Lazy-init guard: if field is null for any reason, recreate it before use
         if (_pendingStrategyTag == null)
             _pendingStrategyTag = new ConcurrentDictionary<string, string>();
         _pendingStrategyTag[symbol] = strategyTag;
-        _pendingInitialRisk[symbol] = stopDist;  // preserves entry stop distance for R-based exit logic
+        _pendingInitialRisk[symbol] = stopDist;
 
-        // ── VIX awareness gate ────────────────────────────────────────────────
-        // VIX > REDUCE: halve qty on longs — fear is elevated, whipsaws are wider.
-        // VIX > NO_LONG: block all longs — historically above 35 long setups fail >70%.
-        // Shorts are not gated by VIX (fear helps short sellers).
         if (!isShort && _latestTick.TryGetValue("VIX", out decimal vixLevel) && vixLevel > 0)
         {
             if (vixLevel >= VIX_NO_LONG_THRESHOLD)
@@ -1958,42 +1527,30 @@ public class SimulatedBroker
             }
         }
 
-        // Reserve a slot immediately so concurrent candle events can't over-enter
         Interlocked.Increment(ref _pendingEntryCount);
-        // Track how many times this symbol has been entered today + hourly pace
         lock (_lock)
         {
             _dailyEntryCount[symbol] = _dailyEntryCount.GetValueOrDefault(symbol) + 1;
             _tradesThisHour++;
         }
 
-        // ── Bracket submission (preferred) vs single-leg fallback ─────────────
-        // If the broker adapter supports native brackets, submit entry + stop + target
-        // as a linked OCA group so the exchange manages the stop even if the bot dies.
-        // Local CheckHardStop / CheckExits remain active as a redundant safety layer.
-        // If brackets aren't supported (SupportsBrackets == false), fall back to the
-        // existing single LMT entry and rely solely on local stop management.
         bool usedBracket = false;
         if (RealBroker != null && RealBroker.SupportsBrackets)
         {
             _marketData.TryGetValue(symbol, out var bracketCandles);
             decimal atrBracket = SafeATR(bracketCandles, 14);
 
-            // Stop side: trigger at 1× ATR hard stop distance, limit 0.5 ATR further
-            // so we get a filled stop even in a fast tape while bounding worst-case fill.
             decimal stopTrigger = isShort
                 ? price + stopDist
                 : price - stopDist;
             decimal stopLimitPrice = isShort
-                ? stopTrigger + atrBracket * 0.5m   // short stop: limit above trigger
-                : stopTrigger - atrBracket * 0.5m;  // long stop:  limit below trigger
+                ? stopTrigger + atrBracket * 0.5m
+                : stopTrigger - atrBracket * 0.5m;
 
-            // First target: 2.4R (matches the CheckExits full-target logic)
             decimal targetPrice = isShort
                 ? price - stopDist * 2.4m
                 : price + stopDist * 2.4m;
 
-            // Round all bracket prices to valid tick size
             Func<decimal, decimal> tickRound = p => p >= 1.0m
                 ? Math.Round(p, 2, MidpointRounding.AwayFromZero)
                 : Math.Round(p, 4, MidpointRounding.AwayFromZero);
@@ -2016,21 +1573,16 @@ public class SimulatedBroker
 
         if (!usedBracket)
         {
-            // Fallback: single LMT entry — local stop management handles protection
             SubmitOrder(symbol, qty, price, side, strategyTag);
         }
 
         LogMessage($"[{strategyTag}] {symbol} x{qty} @ {price:F2} | regime={_marketRegime} | bracket={usedBracket}");
     }
+
     // ══════════════════════════════════════════════════════════
     //  EXIT LOGIC
     // ══════════════════════════════════════════════════════════
 
-    // ── Bracket cancellation helper ───────────────────────────────────────────
-    // Cancels both exchange-side bracket children (stop + target) and clears the IDs.
-    // Must be called BEFORE submitting any local exit order — otherwise the exchange
-    // stop/target and the local exit race each other, risking a double fill that
-    // doubles the closed quantity or accidentally opens a reversed position.
     private void CancelBracketChildren(SimPosition pos)
     {
         if (RealBroker == null) return;
@@ -2048,7 +1600,6 @@ public class SimulatedBroker
         }
     }
 
-    // Hard stop — runs every tick, no min-hold gate
     private void CheckHardStop(string symbol, decimal currentPrice)
     {
         lock (_lock)
@@ -2062,14 +1613,9 @@ public class SimulatedBroker
             decimal atrValue = SafeATR(candles, 14);
             decimal unrealizedLoss = pos.UnrealizedPnL(currentPrice);
 
-            // Hard stops are unconditional — no time gate.
-            // Risk management must always be price-based and immediate.
-            // A $2 flush in minute 2 is a real loss; waiting 5 minutes makes it worse.
-            // MIN_HOLD_SECONDS is intentionally kept ONLY in CheckExits for trailing/time stops.
             decimal dynamicDollarStop = Math.Max(MAX_LOSS_PER_TRADE, pos.Quantity * Math.Max(atrValue * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE));
             bool dollarStopHit = unrealizedLoss <= -dynamicDollarStop;
 
-            // ATR hard stop — fires on every tick from the moment we enter.
             bool atrStopHit = false;
             if (pos.IsShort)
             {
@@ -2082,37 +1628,22 @@ public class SimulatedBroker
                 atrStopHit = currentPrice < longHardStop;
             }
 
-            // No grace period — the ATR stop is already sized at 2× ATR which is wide
-            // enough to absorb normal entry spread/noise. Any grace window reintroduces
-            // a partial time-immunity — the exact problem we removed from MIN_HOLD_SECONDS.
-            // If the stop is hit in second 5, that is a real loss; exit immediately.
             if (atrStopHit || dollarStopHit)
             {
                 pos.ExitSubmitted = true;
                 string reason = dollarStopHit ? "MAX_LOSS_STOP" : "HARD_STOP";
                 TradeSide exitSide = pos.IsShort ? TradeSide.Buy : TradeSide.Sell;
 
-                // Cancel exchange bracket orders FIRST — hard stop is the override of last resort.
-                // Without this, the local MKT exit and the exchange stop-limit child race each
-                // other: both fill, doubling the closed quantity or opening an accidental reversal.
                 CancelBracketChildren(pos);
 
-                // Prefer STP-LMT with a 0.5-ATR protection band to reduce slippage on
-                // fast flushes. MKT is used only when ATR is unavailable (bot startup edge
-                // case) because a missed LMT leaves ExitSubmitted=true with the position
-                // still open. The 0.5-ATR band is wide enough to fill in all but a true
-                // halted-stock or circuit-breaker scenario — and in those cases MKT would
-                // be equally unfillable anyway.
-                // For shorts: stop is a BUY so limit is ABOVE the current price (worst acceptable fill).
-                // For longs:  stop is a SELL so limit is BELOW the current price.
                 string exitOrderType = "MKT";
                 decimal exitPrice = 0m;
                 if (atrValue > 0)
                 {
                     decimal band = atrValue * 0.5m;
                     exitPrice = pos.IsShort
-                        ? Math.Round(currentPrice + band, 2, MidpointRounding.AwayFromZero)  // buy stop: limit above
-                        : Math.Round(currentPrice - band, 2, MidpointRounding.AwayFromZero); // sell stop: limit below
+                        ? Math.Round(currentPrice + band, 2, MidpointRounding.AwayFromZero)
+                        : Math.Round(currentPrice - band, 2, MidpointRounding.AwayFromZero);
                     exitOrderType = "LMT";
                 }
 
@@ -2135,7 +1666,6 @@ public class SimulatedBroker
             decimal atrValue = SafeATR(candles, 14);
             TradeSide exitSide = pos.IsShort ? TradeSide.Buy : TradeSide.Sell;
 
-            // R-based exit framework — consistent across high-priced and low-priced symbols.
             decimal gainPerShare = pos.IsShort
                 ? pos.AvgPrice - currentPrice
                 : currentPrice - pos.AvgPrice;
@@ -2145,25 +1675,14 @@ public class SimulatedBroker
             if (oneR <= 0) oneR = MIN_STOP_DISTANCE;
             decimal rMultiple = gainPerShare / oneR;
 
-            // Track best price (HWM = highest price for longs, lowest for shorts)
             if (pos.IsShort)
                 pos.HighWaterMark = Math.Min(
                     pos.HighWaterMark == 0 ? currentPrice : pos.HighWaterMark, currentPrice);
             else
                 pos.HighWaterMark = Math.Max(pos.HighWaterMark, currentPrice);
 
-            // ── Bracket-aware exit logic ──────────────────────────────────────────
-            // When a bracket is active, the exchange owns the stop and take-profit.
-            // Local scale-out and trailing stop are skipped — they would conflict with
-            // the full-size exchange children, causing quantity mismatches or double fills.
-            // Only the time stop still fires locally (it's not replicated on the exchange);
-            // it cancels the bracket first before submitting the local exit.
-            // The local HARD stop in CheckHardStop is the ultimate emergency override.
             bool bracketActive = pos.BracketStopId > 0 || pos.BracketTargetId > 0;
 
-            // ── TIME STOP: 60 min and still not beyond +0.3R ─────────────────────
-            // Fires even when bracket is active — dead trades tie up capital.
-            // Cancel bracket first to prevent double exit.
             if (secondsHeld > 3600 && rMultiple < 0.30m)
             {
                 CancelBracketChildren(pos);
@@ -2172,11 +1691,8 @@ public class SimulatedBroker
                 return;
             }
 
-            // ── Local exit logic — skipped entirely when bracket is live ─────────
             if (bracketActive) return;
 
-            // ── SCALE-OUT 1: +1.25R → sell half ──────────────────────────────────
-            // Do NOT decrement pos.Quantity here — OnOrderFilled does it on actual fill.
             if (rMultiple >= 1.25m && !pos.PartialExitDone && pos.Quantity >= 2)
             {
                 int halfQty = pos.Quantity / 2;
@@ -2185,7 +1701,6 @@ public class SimulatedBroker
                 return;
             }
 
-            // ── REMAINDER: final target at +2.4R or giveback to +1.0R after extension ──
             if (pos.PartialExitDone && !pos.ExitSubmitted)
             {
                 if (rMultiple >= 1.75m)
@@ -2203,7 +1718,6 @@ public class SimulatedBroker
                 }
             }
 
-            // ── ATR TRAILING STOP — only after the trade has at least ~1.2R cushion ──
             decimal trailMult = pos.IsShort ? SHORT_ATR_TRAIL : ATR_TRAIL_MULT;
 
             bool trailHit;
@@ -2245,7 +1759,6 @@ public class SimulatedBroker
                 ? price + slippageBuffer
                 : price - slippageBuffer;
 
-            // Round to valid tick size — 2dp for stocks >= $1, 4dp for penny stocks
             adjusted = adjusted >= 1.0m
                 ? Math.Round(adjusted, 2, MidpointRounding.AwayFromZero)
                 : Math.Round(adjusted, 4, MidpointRounding.AwayFromZero);
@@ -2261,23 +1774,14 @@ public class SimulatedBroker
         { OrderId = orderId, Symbol = symbol, Side = side, Qty = qty };
     }
 
-    // Removes a live order from tracking without processing a fill.
-    // Called by IbClient when it cancels a bracket sibling so a stale cancel
-    // callback can't accidentally re-trigger exit logic.
     public void RemoveLiveOrder(int orderId) => _ordersById.TryRemove(orderId, out _);
 
-    // Called by IbClient immediately after SubmitBracketOrder places all three legs.
-    // Stages the child IDs so OnOrderFilled() can stamp them onto SimPosition when
-    // the entry fill arrives (the position doesn't exist yet at this point).
     public void RegisterBracketChildren(string symbol, int stopId, int targetId)
         => _pendingBracketChildren[symbol] = (stopId, targetId);
 
-    // Called by IbClient.error() on IBKR order rejection/cancellation.
-    // Frees the pending slot so the bot can enter new positions again.
     public void OnOrderRejected(int orderId)
     {
         if (!_ordersById.TryRemove(orderId, out var order)) return;
-        // Decrement only for entry orders — exits don't consume a pending slot.
         lock (_lock)
         {
             bool isEntry = !_positions.ContainsKey(order.Symbol);
@@ -2297,14 +1801,11 @@ public class SimulatedBroker
 
         lock (_lock)
         {
-            // ── OPENING A POSITION ────────────────────────────
-            // Long entry = BUY; Short entry = SELL (and flagged IsShortEntry)
             bool isShortEntry = order.Side == TradeSide.Sell && !_positions.ContainsKey(order.Symbol);
             bool isLongEntry = order.Side == TradeSide.Buy && !_positions.ContainsKey(order.Symbol);
 
             if (isLongEntry || isShortEntry)
             {
-                // Fill received — pending slot is now a real position
                 Interlocked.Decrement(ref _pendingEntryCount);
 
                 string tag = "";
@@ -2323,13 +1824,10 @@ public class SimulatedBroker
                     EntryTime = DateTime.UtcNow,
                     IsShort = isShortEntry,
                     StrategyTag = resolvedTag,
-                    EntryCommission = COMMISSION_PER_SIDE,  // track $1 entry commission for final record
-                    InitialRiskPerShare = initialRisk        // stop distance at entry for R-based exits
+                    EntryCommission = COMMISSION_PER_SIDE,
+                    InitialRiskPerShare = initialRisk
                 };
 
-                // Stamp bracket child IDs if this entry was part of a bracket order.
-                // From this point CheckHardStop/CheckExits see BracketStopId > 0 and
-                // skip conflicting local exit logic — the exchange owns the stop/target.
                 if (_pendingBracketChildren.TryRemove(order.Symbol, out var bracketIds))
                 {
                     _positions[order.Symbol].BracketStopId = bracketIds.stopId;
@@ -2339,51 +1837,36 @@ public class SimulatedBroker
                 }
 
                 _tradesToday++;
-
-                // $1 entry commission — charged the moment the buy/short order fills
                 _totalRealizedPnL -= COMMISSION_PER_SIDE;
 
                 string dir = isShortEntry ? "SHORT" : "BUY";
                 subject = $"🚀 {dir}: {order.Symbol} x{fillQty} @ {fillPrice:C2}";
                 body = $"{dir} {fillQty} shares @ {fillPrice:C2}  (commission: -$1)";
             }
-            // ── CLOSING A POSITION ────────────────────────────
             else if (_positions.TryGetValue(order.Symbol, out var pos))
             {
                 decimal grossPnl = pos.IsShort
                     ? (pos.AvgPrice - fillPrice) * fillQty
                     : (fillPrice - pos.AvgPrice) * fillQty;
 
-                // $1 exit commission — entry $1 was already charged at open
                 decimal netPnl = grossPnl - COMMISSION_PER_SIDE;
-
                 decimal holdMinutes = (decimal)(DateTime.UtcNow - pos.EntryTime).TotalMinutes;
 
                 _totalRealizedPnL += netPnl;
 
-                // Only count win/loss and remove position on FULL close
-                // Decrement on actual fill — not before (see CheckExits fix).
                 pos.Quantity -= fillQty;
                 bool isFullClose = pos.Quantity <= 0;
 
-                // Determine exit reason (sniff from last log line)
                 string exitReason = isFullClose ? "EXIT" : "PARTIAL";
                 foreach (var tag in new[]{ "ATR_TRAIL_EXIT","TIME_STOP","HARD_STOP",
                                            "MAX_LOSS_STOP","PARTIAL_TP_1","PARTIAL_TP_2","TRAIL_BACK_TO_1R","EOD_LIQUIDATE" })
                     if (_tradeHistoryLog.LastOrDefault()?.Contains(tag) == true)
                     { exitReason = tag; break; }
 
-                // On the final close, also absorb the entry commission so that the sum
-                // of all TradeRecord.NetPnL values for this position equals the true
-                // round-trip P&L (entryComm + all exit comms + gross P&L).
-                // Partial fills only carry their own exit commission.
                 decimal recordedNetPnl = isFullClose
                     ? netPnl - pos.EntryCommission
                     : netPnl;
 
-                // Record EVERY fill (partial and full) so the history panel is complete.
-                // Previously only full closes were recorded — this hid partial-exit fills
-                // like COIN's first sell (5@185.78, +$13.35) from the dashboard entirely.
                 _completedTrades.Add(new TradeRecord
                 {
                     Symbol = order.Symbol,
@@ -2401,7 +1884,6 @@ public class SimulatedBroker
                 });
                 if (_completedTrades.Count > 200) _completedTrades.RemoveAt(0);
 
-                // Mirror to the persistent all-time log (survives daily resets)
                 var allTradeRecord = new TradeRecord
                 {
                     Symbol = order.Symbol,
@@ -2426,11 +1908,10 @@ public class SimulatedBroker
 
                 if (isFullClose)
                 {
-                    // Win/loss on full round-trip net (entry + exit commission both included)
                     if (recordedNetPnl > 0)
                     {
                         _winCount++;
-                        _consecutiveLosses = 0;  // streak broken
+                        _consecutiveLosses = 0;
                     }
                     else
                     {
@@ -2504,7 +1985,7 @@ public class SimulatedBroker
         _prevBarAboveVwap.Clear();
         _dailyEntryCount.Clear();
         _lastTradeWasLoss.Clear();
-        _earningsBlacklist.Clear();   // new day — earnings blackout resets
+        _earningsBlacklist.Clear();
         _pendingEntryCount = 0;
         _completedTrades.Clear();
         _lastVolumeResetEt = nowEt.Date;
@@ -2530,7 +2011,6 @@ public class SimulatedBroker
             _haltTrading = true;
             _eodSent = true;
 
-            // Snapshot today's closing account value into the lifetime equity file
             SnapshotLifetimeEquity();
 
             foreach (var p in _positions.Values.ToList())
@@ -2554,8 +2034,6 @@ public class SimulatedBroker
     //  PERSISTENCE
     // ══════════════════════════════════════════════════════════
 
-    // ── Safe JSON file reader — tries primary then .bak ─────────────────────
-    // Returns the raw JSON string, or null if both files are absent/corrupt.
     private static string SafeReadJson(string path)
     {
         foreach (var candidate in new[] { path, path + ".bak" })
@@ -2572,28 +2050,15 @@ public class SimulatedBroker
         return null;
     }
 
-    // ── Atomic file write ─────────────────────────────────────────────────────
-    // File.WriteAllText truncates THEN writes — two-step, not atomic.
-    // If the process dies or a second thread races between those steps, the
-    // file ends up empty or corrupt (the "'F' is an invalid start" error).
-    //
-    // Fix: write to a .tmp file, then File.Replace() it into place.
-    // File.Replace is OS-atomic: the old file becomes .bak (our fallback),
-    // and the .tmp becomes the new primary — all in one kernel call.
     private static void AtomicWrite(string path, string content)
     {
         string tmp = path + ".tmp";
-        // Write to .tmp first — if this fails, the primary is untouched
         File.WriteAllText(tmp, content);
         string bak = path + ".bak";
         if (File.Exists(path))
-            // Replace primary with .tmp, saving old primary as .bak
             File.Replace(tmp, path, bak);
         else
-        {
-            // First-ever write — no primary exists yet, just rename .tmp
             File.Move(tmp, path);
-        }
     }
 
     public void SaveState()
@@ -2620,10 +2085,9 @@ public class SimulatedBroker
         }
         catch (Exception ex) { LogError("SaveState", ex.Message); }
     }
+
     public void LoadState()
     {
-        // Try primary file first, then .bak if primary is corrupt/missing.
-        // The .bak is written by AtomicWrite as the previous-known-good file.
         string primaryPath = StatePath("bot_state.json");
         string bakPath = primaryPath + ".bak";
 
@@ -2631,7 +2095,6 @@ public class SimulatedBroker
         if (File.Exists(primaryPath))
         {
             try { raw = File.ReadAllText(primaryPath); } catch { }
-            // Validate — a truncated/corrupt file may start with garbage
             if (string.IsNullOrWhiteSpace(raw) || raw[0] != '{')
             {
                 LogMessage($"[LoadState] Primary state file corrupt (first char='{(raw?.Length > 0 ? raw[0] : '?')}') — trying backup.");
@@ -2652,7 +2115,6 @@ public class SimulatedBroker
 
         if (raw == null)
         {
-            // No valid state file at all — still query IBKR positions on startup.
             _needsReconciliation = true;
             if (RealBroker?.IsReady == true)
                 RealBroker.RequestPositions();
@@ -2681,9 +2143,6 @@ public class SimulatedBroker
                 _completedTrades.Clear();
                 foreach (var t in data.CompletedTrades) _completedTrades.Add(t);
 
-                // Rebuild the string feed so the "Today's Trades" ticker-tape panel
-                // is populated on restart, not blank until the next fill.
-                // _tradeHistoryLog is never persisted directly — we reconstruct it here.
                 _tradeHistoryLog.Clear();
                 foreach (var t in _completedTrades.TakeLast(20))
                 {
@@ -2729,31 +2188,23 @@ public class SimulatedBroker
     //  IBKR POSITION RECONCILIATION
     // ══════════════════════════════════════════════════════════
 
-    // Read by IbClient.nextValidId() to know whether to fire reqPositions().
     public bool NeedsReconciliation => _needsReconciliation;
 
-    // Called by the watchdog after a successful reconnect.
-    // Clears the old snapshot and re-arms reconciliation so the next
-    // positionEnd() callback re-verifies IBKR's live state.
     public void RequestRereconcile()
     {
         lock (_lock)
         {
             _ibkrPositionSnapshot.Clear();
             _needsReconciliation = true;
-            _reconciled = false; // block new entries until IBKR confirms positions
+            _reconciled = false;
         }
         LogMessage("[WATCHDOG] Re-reconciliation armed — requesting fresh position snapshot.");
         if (RealBroker?.IsReady == true)
             RealBroker.RequestPositions();
     }
 
-    // Polled by Program.cs to know when it's safe to subscribe to live ticks.
     public bool IsReconciled => _reconciled;
 
-    // Called by Program.cs when the reconciliation wait times out (10s).
-    // Without this, _reconciled stays false and ExecuteStrategy() silently
-    // skips every tick for the entire session — bot connects but never trades.
     public void ForceReconcile()
     {
         lock (_lock)
@@ -2761,8 +2212,6 @@ public class SimulatedBroker
             if (_reconciled) return;
             _needsReconciliation = false;
 
-            // Process whatever partial position data arrived before the timeout.
-            // Better to work with incomplete IBKR data than throw it all away.
             if (_ibkrPositionSnapshot.Count > 0)
             {
                 LogMessage($"[RECONCILE] Forced after timeout — processing {_ibkrPositionSnapshot.Count} partial position(s) received.");
@@ -2801,37 +2250,24 @@ public class SimulatedBroker
             "Verify open positions in TWS.");
     }
 
-    // Called by IbClient.position() for every position IBKR reports.
     public void OnPositionReceived(string symbol, int qty, decimal avgCost)
     {
         if (string.IsNullOrEmpty(symbol)) return;
-        // qty < 0 = short position; qty == 0 = closed (IBKR sometimes sends these, skip)
         if (qty == 0) return;
         lock (_lock)
             _ibkrPositionSnapshot[symbol] = (qty, avgCost);
         Console.WriteLine($"[RECONCILE] ← {symbol} x{qty} @ {avgCost:F2}");
     }
 
-    // Called by IbClient.positionEnd() — performs the merge and unblocks trading.
-    // IBKR is always the source of truth.
-    //   In IBKR, not in saved state  →  inject  (the GILD scenario)
-    //   In saved state, not in IBKR  →  ghost; remove
-    //   In both                      →  correct qty / avgCost from IBKR
     public void OnReconciliationComplete()
     {
         List<string> ghosts;
         lock (_lock)
         {
-            if (!_needsReconciliation)
-            {
-                // positionEnd() can fire spuriously (e.g. after cancelPositions).
-                // Only act if we actually requested reconciliation.
-                return;
-            }
+            if (!_needsReconciliation) return;
 
             Console.WriteLine($"[RECONCILE] Snapshot received: {_ibkrPositionSnapshot.Count} position(s).");
 
-            // 1. Remove ghosts — in saved state but IBKR says closed
             ghosts = _positions.Keys
                 .Where(sym => !_ibkrPositionSnapshot.ContainsKey(sym))
                 .ToList();
@@ -2841,23 +2277,20 @@ public class SimulatedBroker
                 _positions.Remove(sym);
             }
 
-            // 2. Inject or correct from IBKR
             foreach (var (sym, (ibkrQty, ibkrCost)) in _ibkrPositionSnapshot)
             {
                 if (_positions.TryGetValue(sym, out var existing))
                 {
-                    // Correct stale qty / cost
                     if (existing.Quantity != ibkrQty || existing.AvgPrice != ibkrCost)
                     {
                         LogMessage($"[RECONCILE] Corrected {sym}: qty {existing.Quantity}→{ibkrQty}  cost {existing.AvgPrice:F2}→{ibkrCost:F2}");
                         existing.Quantity = ibkrQty;
                         existing.AvgPrice = ibkrCost;
-                        existing.HighWaterMark = ibkrCost; // restart trail conservatively
+                        existing.HighWaterMark = ibkrCost;
                     }
                 }
                 else
                 {
-                    // Held in IBKR but state file didn't know — inject it
                     LogMessage($"[RECONCILE] Injected: {sym} x{ibkrQty} @ {ibkrCost:F2}");
                     _positions[sym] = new SimPosition
                     {
@@ -2926,19 +2359,12 @@ public class SimulatedBroker
         LogMessage("[CANDLE ENGINE] Market data cleared.");
     }
 
-    // ── How many symbols we can subscribe given the current line budget ────────
-    // SAFETY: DATA_LINES_PER_SYMBOL <= 0 treated as 1 so it never falls back to
-    // _watchlist.Length, which would bypass the 100-line IBKR account limit.
     private int GetSubscriptionSlots()
     {
         int linesPerSym = Math.Max(1, DATA_LINES_PER_SYMBOL);
         return Math.Min(MAX_MARKET_DATA_LINES / linesPerSym, MAX_MARKET_DATA_LINES);
     }
 
-    // ── Priority order for which symbols get a live-data slot ─────────────────
-    //  1. Symbols with an open position     (must never lose their feed)
-    //  2. Symbols with recent candle activity (ATR ≥ threshold = volatile/moving)
-    //  3. Everything else in watchlist order
     private IEnumerable<string> GetPrioritizedWatchlist()
     {
         var withPosition = new HashSet<string>(_positions.Keys, StringComparer.OrdinalIgnoreCase);
@@ -2961,19 +2387,14 @@ public class SimulatedBroker
             LogMessage($"[DATA] Line budget: {MAX_MARKET_DATA_LINES} lines ÷ {DATA_LINES_PER_SYMBOL}/sym = {slots} slots. " +
                        $"Subscribing {toSubscribe.Count}/{_watchlist.Length} symbols ({skipped} skipped — raise MAX_MARKET_DATA_LINES or buy a Booster Pack).");
 
-        // ── Pass 1: 1-min historical data (3 days) — builds candle engine ──────
         foreach (var symbol in toSubscribe)
         {
             LogMessage($"[HIST] Requesting 1-min history: {symbol}...");
             RealBroker.RequestHistoricalData(symbol);
             _subscribedSymbols.Add(symbol);
-            await Task.Delay(1500); // IB pacing limit
+            await Task.Delay(1500);
         }
 
-        // ── Pass 2: daily historical data (1 year) — builds SMA200 + S/R ───────
-        // Requested for ALL watchlist symbols (not just the live-data slot budget)
-        // because daily bars don't consume a market data subscription line.
-        // IBKR pacing: 60 historical requests per 10 min → 1.5s gap is safe.
         LogMessage($"[HIST] Requesting daily bars for {_watchlist.Length} symbols (SMA200 + S/R levels)...");
         foreach (var symbol in _watchlist)
         {
@@ -2985,7 +2406,6 @@ public class SimulatedBroker
         _previousOrbMinutes = ORB_MINUTES;
     }
 
-    // ── Apply watchlist changes live without restart ───────────────────────────
     public async Task ApplyWatchlistDiff(string[] oldList, string[] newList)
     {
         if (RealBroker == null || !RealBroker.IsReady) return;
@@ -2993,7 +2413,6 @@ public class SimulatedBroker
         var added = newList.Except(oldList, StringComparer.OrdinalIgnoreCase).ToArray();
         var removed = oldList.Except(newList, StringComparer.OrdinalIgnoreCase).ToArray();
 
-        // ── Unsubscribe removed symbols first (frees slots before we add) ──────
         foreach (var sym in removed)
         {
             bool hasPosition;
@@ -3004,11 +2423,10 @@ public class SimulatedBroker
                 continue;
             }
             LogMessage($"[WATCHLIST] Unsubscribing removed symbol: {sym}");
-            try { RealBroker.CancelMarketData(sym); } catch { /* adapter may not support yet */ }
+            try { RealBroker.CancelMarketData(sym); } catch { }
             _subscribedSymbols.Remove(sym);
         }
 
-        // ── Subscribe new symbols respecting the line budget ──────────────────
         int slots = GetSubscriptionSlots();
         int available = slots - _subscribedSymbols.Count;
 
@@ -3031,13 +2449,10 @@ public class SimulatedBroker
             LogMessage($"[WATCHLIST] Subscribing new symbol: {sym}");
             RealBroker.RequestHistoricalData(sym);
             _subscribedSymbols.Add(sym);
-            await Task.Delay(1500); // IBKR pacing
+            await Task.Delay(1500);
         }
     }
 
-    // ── Re-evaluate halt state after P&L limits change ────────────────────────
-    // If the user loosened the limits, un-halt so trading can resume.
-    // If they tightened them and current PnL already breaches the new values, halt.
     public void ReevaluateHalt()
     {
         lock (_lock)
@@ -3082,15 +2497,6 @@ public class SimulatedBroker
         }
     }
 
-    // ── Daily candle ingestion ───────────────────────────────────────────────
-    // Called by IbClient.historicalData() for daily-bar requests.
-    // Keeps up to 250 days (> 1 year) per symbol.
-    // Side-effects:
-    //   • Updates _prevDayHighLevel / _prevDayLowLevel from the second-to-last bar
-    //     (yesterday's session) so S/R filters are always current.
-    //   • Overwrites _prevDayClose from the authoritative daily bar so the gap
-    //     calculation in TryGapAndGoStrategy uses a clean end-of-day close rather
-    //     than the 9:29 ET 1-min snapshot (which can be pre-market noise).
     public void AddDailyCandle(string symbol, DateTime date,
         decimal open, decimal high, decimal low, decimal close, long vol)
     {
@@ -3104,13 +2510,12 @@ public class SimulatedBroker
             }
             if (list.Count > 250) list.RemoveAt(0);
 
-            // Second-to-last bar = yesterday (last bar = today's partial session)
             if (list.Count >= 2)
             {
                 var yesterday = list[list.Count - 2];
                 _prevDayHighLevel[symbol] = yesterday.High;
                 _prevDayLowLevel[symbol] = yesterday.Low;
-                _prevDayClose[symbol] = yesterday.Close; // overwrite 9:29 snapshot
+                _prevDayClose[symbol] = yesterday.Close;
             }
         }
     }
@@ -3125,9 +2530,6 @@ public class SimulatedBroker
         catch { }
     }
 
-    // Loads today's intraday equity curve from disk on startup.
-    // Without this, the intraday chart panel is blank after every restart
-    // until the next fill — because _equityCurve is never persisted back.
     public void LoadEquityCurve()
     {
         try
@@ -3152,11 +2554,10 @@ public class SimulatedBroker
                         System.Globalization.NumberStyles.Any,
                         System.Globalization.CultureInfo.InvariantCulture,
                         out decimal v)) continue;
-                // Times are stored as UTC; convert to ET before date-filtering
                 var etTime = TimeZoneInfo.ConvertTimeFromUtc(
                     t.Kind == DateTimeKind.Utc ? t : DateTime.SpecifyKind(t, DateTimeKind.Utc),
                     Eastern);
-                if (etTime.Date != todayEt) continue;   // only restore today's points
+                if (etTime.Date != todayEt) continue;
                 _equityCurve.Add((t, v));
                 loaded++;
             }
@@ -3165,8 +2566,6 @@ public class SimulatedBroker
         catch (Exception ex) { LogError("LoadEquityCurve", ex.Message); }
     }
 
-    // Records today's closing account value. Called once at EOD.
-    // Upserts by date so restarting on the same day doesn't duplicate.
     private void SnapshotLifetimeEquity()
     {
         try
@@ -3209,7 +2608,6 @@ public class SimulatedBroker
         catch { }
     }
 
-    // ── Cross-day trade history ────────────────────────────────────────────────
     public void LoadAllTrades()
     {
         string raw = SafeReadJson(ALL_TRADES_FILE);
@@ -3272,16 +2670,11 @@ public class SimulatedBroker
     }
 
     // ══════════════════════════════════════════════════════════
-    //  DASHBOARD
-    // ══════════════════════════════════════════════════════════
-
-    // ══════════════════════════════════════════════════════════
-    //  HTTP DASHBOARD SERVER  →  http://localhost:5000/api/status
-    //  Open dashboard.html in any browser — auto-refreshes every second.
+    //  HTTP DASHBOARD SERVER
     // ══════════════════════════════════════════════════════════
 
     private static readonly string CONFIG_FILE = StatePath("bot-config.json");
-    private const string CONFIG_PASSWORD = "Efmukl123!"; // legacy fallback only — prefer BOT_CONFIG_PASSWORD env var
+    private const string CONFIG_PASSWORD = "Efmukl123!";
 
     private string EffectiveConfigPassword()
     {
@@ -3291,7 +2684,6 @@ public class SimulatedBroker
 
     private bool PasswordMatches(string? supplied) => supplied == EffectiveConfigPassword();
 
-    // ── Load configuration from bot-config.json (called at bot startup) ───────
     public void LoadConfig()
     {
         try
@@ -3350,7 +2742,6 @@ public class SimulatedBroker
             STRATEGY_OUTSIDE_CANDLE_ENABLED = GetB("STRATEGY_OUTSIDE_CANDLE", STRATEGY_OUTSIDE_CANDLE_ENABLED);
             DATA_LINES_PER_SYMBOL = GetI("DATA_LINES_PER_SYMBOL", DATA_LINES_PER_SYMBOL);
             MAX_MARKET_DATA_LINES = GetI("MAX_MARKET_DATA_LINES", MAX_MARKET_DATA_LINES);
-
             VIX_REDUCE_THRESHOLD = GetD("VIX_REDUCE_THRESHOLD", VIX_REDUCE_THRESHOLD);
             VIX_NO_LONG_THRESHOLD = GetD("VIX_NO_LONG_THRESHOLD", VIX_NO_LONG_THRESHOLD);
             MIN_SETUP_SCORE = GetI("MIN_SETUP_SCORE", MIN_SETUP_SCORE);
@@ -3375,8 +2766,6 @@ public class SimulatedBroker
                     var s = item.GetString();
                     if (!string.IsNullOrWhiteSpace(s)) list.Add(s.Trim().ToUpper());
                 }
-                // Cap at the subscription slot budget so a stale/inflated bot-config.json
-                // never loads more symbols than IBKR will allow without a Booster Pack.
                 int slotCap = DATA_LINES_PER_SYMBOL > 0
                     ? MAX_MARKET_DATA_LINES / DATA_LINES_PER_SYMBOL
                     : MAX_MARKET_DATA_LINES;
@@ -3396,7 +2785,6 @@ public class SimulatedBroker
         }
     }
 
-    // ── Persist current configuration to bot-config.json ──────────────────────
     private void SaveConfig()
     {
         try
@@ -3410,7 +2798,6 @@ public class SimulatedBroker
         }
     }
 
-    // ── Serialise all runtime config to JSON ──────────────────────────────────
     private string BuildConfigJson(bool pretty = false)
     {
         var wlJson = "[" + string.Join(",", _watchlist.Select(s => $"\"{s}\"")) + "]";
@@ -3508,20 +2895,15 @@ public class SimulatedBroker
             var path = ctx.Request.Url.AbsolutePath.ToLower();
             var method = ctx.Request.HttpMethod.ToUpper();
             string json;
-            // CORS pre-flight
+
             if (method == "OPTIONS")
             {
                 ctx.Response.StatusCode = 204;
                 ctx.Response.OutputStream.Close();
                 return;
             }
-
-
-
             else if (path == "/api/backtest")
             {
-                // Run full performance analysis + forward simulation
-                // Uses real all_trades + available 1-min candles + lifetime equity
                 try
                 {
                     List<TradeRecord> snapshot;
@@ -3568,7 +2950,6 @@ public class SimulatedBroker
                     using var doc = System.Text.Json.JsonDocument.Parse(body);
                     var root = doc.RootElement;
 
-                    // ── Password check ────────────────────────────────────────
                     if (!root.TryGetProperty("password", out var pwEl) ||
                         !PasswordMatches(pwEl.GetString()))
                     {
@@ -3679,17 +3060,14 @@ public class SimulatedBroker
                         }
                     }
 
-                    // ── Re-evaluate halt conditions with new limits ────────────
                     ReevaluateHalt();
 
-                    // ── Clear stale ORB ranges if the window size changed ──────
                     if (orbChanged)
                     {
                         _orbRanges.Clear();
                         LogMessage($"[CONFIG] ORB_MINUTES changed — cleared all opening ranges, will recompute.");
                     }
 
-                    // ── Subscribe/unsubscribe symbols diff (async, outside lock) ──
                     if (newWatchlist != null)
                         _ = Task.Run(() => ApplyWatchlistDiff(oldWatchlist, newWatchlist));
 
@@ -3704,8 +3082,6 @@ public class SimulatedBroker
             }
             else if (path == "/api/sell" && method == "POST")
             {
-                // Manually close a single open position at market price.
-                // Body: { "symbol": "AAPL", "password": "xxx" }
                 try
                 {
                     using var reader = new System.IO.StreamReader(ctx.Request.InputStream, System.Text.Encoding.UTF8);
@@ -3742,11 +3118,6 @@ public class SimulatedBroker
                         }
                         else
                         {
-                            // Force-override ExitSubmitted even if already true.
-                            // Root cause of "Sell doesn't work": bot submitted a LMT stop that
-                            // didn't fill (price gapped through), leaving ExitSubmitted=true but
-                            // the position still open. We force a new MKT order so the user can
-                            // always exit regardless of what the bot previously tried.
                             bool alreadyPending = pos.ExitSubmitted;
                             pos.ExitSubmitted = true;
                             TradeSide exitSide = pos.IsShort ? TradeSide.Buy : TradeSide.Sell;
@@ -3766,8 +3137,6 @@ public class SimulatedBroker
             }
             else if (path == "/api/liquidate" && method == "POST")
             {
-                // Liquidate ALL open positions at market price.
-                // Body: { "password": "xxx" }
                 try
                 {
                     using var reader = new System.IO.StreamReader(ctx.Request.InputStream, System.Text.Encoding.UTF8);
@@ -3790,8 +3159,6 @@ public class SimulatedBroker
                     {
                         foreach (var pos in _positions.Values.ToList())
                         {
-                            // Force-override ExitSubmitted — same reason as /api/sell.
-                            // Positions stuck with an unfilled LMT stop still get a fresh MKT order.
                             bool alreadyPending = pos.ExitSubmitted;
                             pos.ExitSubmitted = true;
                             TradeSide exitSide = pos.IsShort ? TradeSide.Buy : TradeSide.Sell;
@@ -3830,7 +3197,6 @@ public class SimulatedBroker
         List<Candle> snapshot;
         lock (candles) { snapshot = candles.ToList(); }
 
-        // Also include current in-progress candle so latest price is visible
         if (_currentMinuteCandle.TryGetValue(sym, out var live))
         {
             if (!snapshot.Any(c => c.Time == live.Time))
@@ -3862,7 +3228,6 @@ public class SimulatedBroker
             int total = _winCount + _lossCount;
             double wr = total > 0 ? (double)_winCount / total * 100 : 0;
 
-            // ── Positions ────────────────────────────────────────
             var posArr = new StringBuilder("[");
             bool first = true;
             foreach (var kv in _positions)
@@ -3879,7 +3244,6 @@ public class SimulatedBroker
             }
             posArr.Append("]");
 
-            // ── Equity curve (last 390 pts = full day at 1/min) ───
             var curve = _equityCurve.TakeLast(390).ToList();
             var curveArr = new StringBuilder("[");
             for (int i = 0; i < curve.Count; i++)
@@ -3889,22 +3253,14 @@ public class SimulatedBroker
             }
             curveArr.Append("]");
 
-            // ── Watchlist — every console column ─────────────────
-            // SYM | PRICE | VWAP | SMA20 | SMA50 | RSI | GAP% | VOL K | ATR% | ORB HI | ORB LO | TREND | SIGNAL | HOT
             var wlArr = new StringBuilder("[");
             bool wfirst = true;
             foreach (var sym in _watchlist)
             {
-                // Always emit every watchlist symbol — if candle data isn't loaded yet
-                // (historical request still in-flight or pacing delay) show placeholder
-                // values so the scanner displays the full list from the first poll.
                 _marketData.TryGetValue(sym, out var candles);
                 decimal price = candles?.LastOrDefault()?.Close ?? 0m;
-                // No candle data yet — emit a loading row so symbol is visible in UI
                 bool dataReady = price > 0m;
 
-                // Emit zero-value indicators when data not yet loaded.
-                // Candles may be null (never requested) or empty (request in-flight).
                 var candleList = candles ?? new List<Candle>();
                 decimal sma20 = dataReady ? SafeSMA(candleList, 20) : 0m;
                 decimal sma50 = dataReady ? SafeSMA(candleList, 50) : 0m;
@@ -3917,7 +3273,6 @@ public class SimulatedBroker
                 _latestTick.TryGetValue(sym, out decimal livePx);
                 decimal chgPct = prevClose > 0 && livePx > 0
                     ? (livePx - prevClose) / prevClose * 100 : gapPct;
-                // Use live tick price for display if candle close is stale/zero
                 if (price == 0m && livePx > 0) price = livePx;
                 long volK = _dailyVolume.GetValueOrDefault(sym) / 1000;
                 bool abvVwap = vwap > 0 && price > vwap;
@@ -3957,7 +3312,6 @@ public class SimulatedBroker
             }
             wlArr.Append("]");
 
-            // ── Recent trades (last 20, newest first) ─────────────
             var recentTrades = _tradeHistoryLog.TakeLast(20).Reverse().ToList();
             var tradeArr = new StringBuilder("[");
             for (int i = 0; i < recentTrades.Count; i++)
@@ -3967,7 +3321,6 @@ public class SimulatedBroker
             }
             tradeArr.Append("]");
 
-            // ── Structured completed trades (newest first) for history panel ──
             var histArr = new StringBuilder("[");
             var histList = _completedTrades.ToList();
             for (int i = histList.Count - 1; i >= 0; i--)
@@ -3980,15 +3333,11 @@ public class SimulatedBroker
 
             decimal cash = TOTAL_BUDGET - _positions.Values.Sum(p => p.AvgPrice * p.Quantity);
 
-            // ── Lifetime equity (all daily snapshots + today's live value) ────
-            // Today's point is injected live on every poll so the Portfolio Growth
-            // chart shows current-day P&L without waiting for EOD snapshot.
             var ltArr = new StringBuilder("[");
             lock (_lifetimeEquity)
             {
                 var pts = _lifetimeEquity.ToList();
                 var todayStr = et.Date.ToString("yyyy-MM-dd");
-                // Upsert today's live value — don't persist, just inject for the chart
                 bool todayExists = pts.Any(p => p.Date == todayStr);
                 if (!todayExists)
                     pts.Add(new LifetimeEquityPoint
@@ -4012,7 +3361,6 @@ public class SimulatedBroker
             }
             ltArr.Append("]");
 
-            // ── All-time trade history (newest first, last 500) ───────────────
             var allArr = new StringBuilder("[");
             lock (_allTrades)
             {
@@ -4084,13 +3432,11 @@ public class SimulatedBroker
                 ? "  ██ HALTED ██  "
                 : (_dashTick % 2 == 0 ? "  ● LIVE       " : "  ○ LIVE       ");
 
-            // ── TOP BAR ─────────────────────────────────────────
             sb.AppendLine(
                 $"  IBKR BOT  │  {now:ddd HH:mm:ss} PT  │  ET: {et:HH:mm}  │" +
                 $"  {regimeIcon}  │  {statusStr}".PadRight(W));
             sb.AppendLine(new string('═', W));
 
-            // ── PNL / STATS ROW ──────────────────────────────────
             string pnlColor = _totalRealizedPnL >= 0 ? "+" : "";
             string pnlBar = MakeProgressBar(_totalRealizedPnL, DAILY_PROFIT_GOAL, 20, '█', '░');
             string lossBar = MakeProgressBar(-_totalRealizedPnL, -MAX_DAILY_LOSS, 20, '▓', '░');
@@ -4104,7 +3450,6 @@ public class SimulatedBroker
                 $"W/L: {_winCount}/{_lossCount}  ({winRate:F0}%)");
             sb.AppendLine(new string('─', W));
 
-            // ── ACTIVE POSITIONS ─────────────────────────────────
             sb.AppendLine(
                 $"  POSITIONS ({_positions.Count}/{MAX_POSITIONS})   " +
                 $"{"DIR",-5}  {"SYMBOL",-6}  {"QTY",4}  {"ENTRY",8}  {"NOW",8}  " +
@@ -4144,12 +3489,10 @@ public class SimulatedBroker
             }
             sb.AppendLine(new string('─', W));
 
-            // ── EQUITY SPARKLINE ─────────────────────────────────
             sb.Append("  Equity  ");
             sb.AppendLine(MakeSparkline(_equityCurve, W - 12));
             sb.AppendLine(new string('─', W));
 
-            // ── MARKET SCANNER ───────────────────────────────────
             sb.AppendLine(
                 $"  {"SYM",-5}  {"PRICE",8}  {"VWAP",8}  {"SMA20",8}  {"SMA50",8}" +
                 $"  {"RSI",5}  {"GAP%",6}  {"VOL K",7}  {"ORB HI",8}  {"ORB LO",8}  TREND  SIGNAL");
@@ -4175,7 +3518,6 @@ public class SimulatedBroker
                 decimal orbHi = orb?.High ?? 0m;
                 decimal orbLo = orb?.Low ?? 0m;
 
-                // Detect which signal is active
                 string sig = "";
                 if (orb != null && orb.IsSet)
                 {
@@ -4202,7 +3544,6 @@ public class SimulatedBroker
 
             sb.AppendLine(new string('─', W));
 
-            // ── RULES FOOTER ─────────────────────────────────────
             sb.AppendLine(
                 $"  Budget:{TOTAL_BUDGET:C0}  PosSz:{POSITION_SIZE:C0}  " +
                 $"MaxPos:{MAX_POSITIONS}  Cooldown:{COOLDOWN_SECONDS / 60}min  " +
@@ -4212,7 +3553,6 @@ public class SimulatedBroker
                 $"Strategies: ORB | GAP-GO | VWAP | Momentum | MeanRev(off)");
             sb.AppendLine(new string('─', W));
 
-            // ── TRADE LOG ────────────────────────────────────────
             sb.AppendLine("  RECENT TRADES");
             var recent = _tradeHistoryLog.TakeLast(8).ToList();
             if (recent.Count == 0)
@@ -4223,7 +3563,6 @@ public class SimulatedBroker
 
             sb.AppendLine(new string('─', W));
 
-            // ── EVENT LOG ────────────────────────────────────────
             sb.AppendLine("  EVENT LOG");
             lock (_logQueue)
             {
@@ -4234,7 +3573,6 @@ public class SimulatedBroker
                     sb.AppendLine(new string(' ', W));
             }
 
-            // ── RENDER ───────────────────────────────────────────
             Console.SetCursorPosition(0, 0);
             Console.Write(sb.ToString());
 
@@ -4242,10 +3580,8 @@ public class SimulatedBroker
             for (int i = used; i < Console.WindowHeight - 1; i++)
                 Console.WriteLine(new string(' ', W));
         }
-        catch { /* never crash the dashboard thread */ }
+        catch { }
     }
-
-    // ── Dashboard helpers ──────────────────────────────────
 
     private static string MakeProgressBar(decimal value, decimal max,
                                           int width, char fill, char empty)
@@ -4292,14 +3628,6 @@ public class SimulatedBroker
         File.AppendAllText("errors.log",
             $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [{context}] {message}\n");
 
-    // ── MACD direction on 1-min candles ────────────────────────────────────
-    // Returns  +1 if MACD line is positive AND rising  (bullish momentum building)
-    // Returns  -1 if MACD line is negative AND falling (bearish momentum building)
-    // Returns   0 if neutral / not enough data
-    //
-    // Intentionally simplified — we only need direction, not exact value.
-    // Two EMA calculations per call (O(n) each). Called once per candle close,
-    // so CPU cost is negligible.
     private int SafeMACDDirection(List<Candle> candles)
     {
         if (candles == null || candles.Count < 30) return 0;
@@ -4309,17 +3637,15 @@ public class SimulatedBroker
         double ema26Now = CalcEMA(closes, 26);
         double macdNow = ema12Now - ema26Now;
 
-        // Compare vs 5 bars ago to determine direction of MACD line
         var closesPrev = closes.Take(closes.Length - 5).ToArray();
         if (closesPrev.Length < 26) return 0;
         double macdPrev = CalcEMA(closesPrev, 12) - CalcEMA(closesPrev, 26);
 
-        if (macdNow > 0 && macdNow > macdPrev) return 1;  // rising above zero
-        if (macdNow < 0 && macdNow < macdPrev) return -1;  // falling below zero
+        if (macdNow > 0 && macdNow > macdPrev) return 1;
+        if (macdNow < 0 && macdNow < macdPrev) return -1;
         return 0;
     }
 
-    // Exponential Moving Average — standard recursive formula
     private double CalcEMA(double[] data, int period)
     {
         if (data == null || data.Length < period) return data?.LastOrDefault() ?? 0;
@@ -4330,23 +3656,18 @@ public class SimulatedBroker
         return ema;
     }
 
-    // ── Refresh per-symbol indicator cache (called once per candle close) ──
-    // Computes all indicators ONE time and stores in _indicatorCache[symbol].
-    // All 7 strategies then read from the cache instead of recomputing —
-    // reduces per-candle compute from 7×O(n) to 1×O(n) per symbol.
     private void RefreshIndicatorCache(string symbol, List<Candle> candles)
     {
         if (candles == null || candles.Count < 30) return;
         var closes = candles.Select(c => (double)c.Close).ToArray();
         var closesPrev = closes.Length > 5 ? closes.Take(closes.Length - 5).ToArray() : closes;
 
-        // Candles minus the last bar — used to compute previous-bar RSI for turning-point detection
         var candlesM1 = candles.Count > 1 ? candles.Take(candles.Count - 1).ToList() : candles;
 
         var ind = new SymIndicators
         {
             Rsi14 = SafeRSI(candles, 14),
-            Rsi14Prev = SafeRSI(candlesM1, 14),   // 1 bar ago — confirms RSI is turning, not just at an extreme
+            Rsi14Prev = SafeRSI(candlesM1, 14),
             Atr14 = SafeATR(candles, 14),
             Sma20 = SafeSMA(candles, 20),
             Sma50 = SafeSMA(candles, 50),
@@ -4362,18 +3683,13 @@ public class SimulatedBroker
         _indicatorCache[symbol] = ind;
     }
 
-    // ── Refresh 15-min EMA(20) — higher-timeframe trend filter ──────────
-    // Rebuilds only when a new 15-min bar boundary is crossed; otherwise
-    // returns the cached value, skipping an O(n) GroupBy on every tick.
     private void Refresh15MinEma(string symbol, List<Candle> candles)
     {
         if (candles == null || candles.Count < 2) return;
         var lastBar = candles.Last();
-        // Current 15-min bar boundary
         var barTime = new DateTime(lastBar.Time.Year, lastBar.Time.Month, lastBar.Time.Day,
                                    lastBar.Time.Hour, (lastBar.Time.Minute / 15) * 15, 0);
 
-        // Return early if we already computed for this bar
         if (_ema20_15min.TryGetValue(symbol, out var cached) && cached.barTime == barTime)
             return;
 
@@ -4388,10 +3704,6 @@ public class SimulatedBroker
             _ema20_15min[symbol] = ((decimal)CalcEMA(bars15, 20), barTime);
     }
 
-    // ── Daily SMA200 lookup ────────────────────────────────────────────────
-    // Returns the 200-day SMA from the daily candle cache, or 0 if not enough
-    // history has been loaded yet (< 200 daily bars). Callers treat 0 as
-    // "filter disabled" so the bot never blocks trades due to missing data.
     private decimal GetDailySma200(string symbol)
     {
         if (!_dailyCandles.TryGetValue(symbol, out var daily)) return 0m;
@@ -4402,8 +3714,6 @@ public class SimulatedBroker
         }
     }
 
-    // ── Previous day High / Low (from daily candle cache) ─────────────────
-    // Falls back to (0, 0) if daily data not loaded — callers skip the check.
     private (decimal High, decimal Low) GetPrevDayHL(string symbol)
     {
         _prevDayHighLevel.TryGetValue(symbol, out decimal h);
@@ -4419,17 +3729,7 @@ public class SimulatedBroker
 
     public double SafeRSI(List<Candle> candles, int period)
     {
-        // Require enough candles for a proper seed period + at least one smoothed step.
-        // period * 2 gives a clean seed window — the strategy gate (50 candles) already
-        // ensures this passes for period=14 (needs 28).
         if (candles == null || candles.Count < period * 2) return 50;
-
-        // ── Wilder's Smoothed RSI ─────────────────────────────────────────────
-        // Step 1: seed with the simple average of the first `period` price changes.
-        // Step 2: apply Wilder's exponential smoothing for all remaining bars.
-        // This matches TradingView / Bloomberg / most platforms exactly.
-        // The old simple-average version was noisier and gave systematically
-        // different values than the thresholds (55, 43, 35, 65) were calibrated for.
 
         int seedStart = candles.Count - period * 2;
         double avgGain = 0, avgLoss = 0;
@@ -4443,7 +3743,6 @@ public class SimulatedBroker
         avgGain /= period;
         avgLoss /= period;
 
-        // Wilder's smoothing over the second half of the window
         for (int i = seedStart + period + 1; i < candles.Count; i++)
         {
             double diff = (double)(candles[i].Close - candles[i - 1].Close);
@@ -4475,7 +3774,7 @@ public class SimulatedBroker
                          Math.Max(Math.Abs(c.High - prev.Close),
                                   Math.Abs(c.Low - prev.Close)));
             if (i == start) atr = tr;
-            else atr = ((atr * (period - 1)) + tr) / period; // Wilder smoothing
+            else atr = ((atr * (period - 1)) + tr) / period;
         }
         return atr;
     }
@@ -4492,18 +3791,11 @@ public class SimulatedBroker
         return candles.TakeLast(lookback).Min(c => c.Low);
     }
 
-    // ── Liquidity Sweep Detector ──────────────────────────────────────────
-    // Detects when price spikes above/below a prior high/low but CLOSES back inside.
-    // Classic "stop hunt" pattern: market makers push price to trigger breakout orders,
-    // then reverse. Entering after a sweep almost always means entering into a reversal.
-    // Applied as a global pre-filter before any strategy fires — no point checking
-    // strategy conditions if the last candle is already a confirmed fake breakout.
     private bool IsLiquiditySweep(List<Candle> candles)
     {
         if (candles.Count < 22) return false;
 
         var last = candles.Last();
-        // Look at prior 20 candles (exclude the last) to define the range
         var prior = candles.TakeLast(21).Take(20).ToList();
         decimal prevHigh = prior.Max(c => c.High);
         decimal prevLow = prior.Min(c => c.Low);
@@ -4511,23 +3803,14 @@ public class SimulatedBroker
         decimal upperWick = last.High - Math.Max(last.Close, last.Open);
         decimal lowerWick = Math.Min(last.Close, last.Open) - last.Low;
         decimal body = Math.Abs(last.Close - last.Open);
-        // Zero-body candle (doji) — treat body as a tiny fraction so wick ratio is meaningful
         if (body < 0.001m) body = 0.001m;
 
-        // Sweep UP: spiked above range but closed back below prior high, with a large upper wick
         bool sweepUp = last.High > prevHigh && last.Close < prevHigh && upperWick > body * 1.5m;
-        // Sweep DOWN: spiked below range but closed back above prior low, with a large lower wick
         bool sweepDown = last.Low < prevLow && last.Close > prevLow && lowerWick > body * 1.5m;
 
         return sweepUp || sweepDown;
     }
 
-    // ── Volatility Compression Detector ──────────────────────────────────
-    // Big moves commonly follow a period where price "coils" into a narrow range.
-    // Returns true when the recent 20-bar average true range is ≤60% of the prior
-    // 40-bar average — indicating stored energy ready to release.
-    // Used selectively in TryMomentumStrategy for breakout signals only;
-    // not applied globally so VWAP / ORB / Gap&Go keep their own entry conditions.
     private bool IsVolatilityCompressed(List<Candle> candles)
     {
         if (candles.Count < 60) return false;
@@ -4544,7 +3827,6 @@ public class SimulatedBroker
         return avgRecentRange < avgPriorRange * 0.60m;
     }
 
-    // Returns true if recent 5 bars show clear volume expansion versus prior 5 bars.
     private bool CheckVolumeExpansion(List<Candle> candles)
     {
         if (candles.Count < 10) return false;
@@ -4554,8 +3836,6 @@ public class SimulatedBroker
         return recent5 > prev5 * VOL_EXPAND_MULT;
     }
 
-    // Returns true if this symbol outperformed SPY over the last 20 bars.
-    // Use for longs only; weak-vs-SPY names are often the best short candidates.
     private bool CheckRelativeStrength(string symbol, List<Candle> candles)
     {
         if (!_marketData.TryGetValue("SPY", out var spy) || spy.Count < 20) return true;
@@ -4564,9 +3844,6 @@ public class SimulatedBroker
         return symReturn > spyReturn;
     }
 
-    // Returns true ONLY when the stock is UP ≥0.5% today while SPY is DOWN on the day.
-    // Used as a SELL-OFF override for longs — catches sector-specific strength
-    // (e.g. energy stocks during an oil spike) on broad market selloff days.
     private bool CheckStrongRelativeStrength(string symbol, List<Candle> candles)
     {
         if (!_marketData.TryGetValue("SPY", out var spy) || spy.Count < 5) return false;
@@ -4576,22 +3853,17 @@ public class SimulatedBroker
         if (todaySym.Count < 2 || todaySpy.Count < 2) return false;
         decimal symDayReturn = candles.Last().Close / todaySym.First().Open - 1m;
         decimal spyDayReturn = spy.Last().Close / todaySpy.First().Open - 1m;
-        // Stock must be up ≥0.5% while SPY is negative on the day
         return symDayReturn >= 0.005m && spyDayReturn < 0m;
     }
 
-    // Unified position sizing: risk RISK_PCT of budget per trade
     private int CalcQty(decimal price, decimal stopDistance)
     {
-        // Enforce a price-relative floor: at least 0.3% of price
         decimal minStop = Math.Max(MIN_STOP_DISTANCE, price * 0.003m);
         if (stopDistance < minStop) stopDistance = minStop;
 
         decimal riskAmount = TOTAL_BUDGET * RISK_PCT;
         int qty = (int)(riskAmount / stopDistance);
 
-        // Cap by remaining available cash (not just POSITION_SIZE) so that when
-        // multiple positions are open, the new one can't overspend the budget.
         decimal deployedCapital = _positions.Values.Sum(p => p.AvgPrice * p.Quantity)
                                 + _pendingEntryCount * POSITION_SIZE;
         decimal remainingCash = Math.Max(0, TOTAL_BUDGET - deployedCapital);

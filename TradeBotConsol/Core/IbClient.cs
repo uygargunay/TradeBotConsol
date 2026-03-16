@@ -343,7 +343,7 @@ public class IbClient : EWrapper, IBroker
     // Fields 1 (BID) and 2 (ASK) are also captured for the spread filter.
     public void tickPrice(int tickerId, int field, double price, TickAttrib attribs)
     {
-        if (!_reqIdToSymbol.TryGetValue(tickerId, out string symbol)) return;
+        if (!_reqIdToSymbol.TryGetValue(tickerId, out var symbol)) return;
         if (price <= 0) return;
 
         // field 1 = BID, field 2 = ASK — store for spread filter
@@ -444,8 +444,8 @@ public class IbClient : EWrapper, IBroker
     {
         // Determine if this is a daily-bar request (reqId >= 30000)
         // or a 1-min request, and route accordingly.
-        bool isDaily = _dailyReqIdToSymbol.TryGetValue(reqId, out string dailySymbol);
-        string symbol = isDaily ? dailySymbol : null;
+        bool isDaily = _dailyReqIdToSymbol.TryGetValue(reqId, out var dailySymbol);
+        string? symbol = isDaily ? dailySymbol : null;
         if (!isDaily && !_reqIdToSymbol.TryGetValue(reqId, out symbol)) return;
 
         DateTime time;
