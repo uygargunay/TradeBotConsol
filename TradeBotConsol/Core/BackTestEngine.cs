@@ -109,6 +109,34 @@ public class RollingWinRate
     public int Window { get; set; }
 }
 
+public class ExitReasonStat
+{
+    public string ExitReason { get; set; }
+    public int Trades { get; set; }
+    public int Wins { get; set; }
+    public double WinRate { get; set; }
+    public decimal TotalPnL { get; set; }
+    public decimal AvgPnL { get; set; }
+}
+
+public class WeekdayStat
+{
+    public string Day { get; set; }
+    public int Trades { get; set; }
+    public int Wins { get; set; }
+    public double WinRate { get; set; }
+    public decimal TotalPnL { get; set; }
+}
+
+public class HourStat
+{
+    public string Hour { get; set; }
+    public int Trades { get; set; }
+    public int Wins { get; set; }
+    public double WinRate { get; set; }
+    public decimal TotalPnL { get; set; }
+}
+
 public class BacktestReport
 {
     public DateTime GeneratedAt { get; set; }
@@ -137,6 +165,12 @@ public class BacktestReport
     public decimal LargestWin { get; set; }
     public decimal LargestLoss { get; set; }
     public decimal AvgMae { get; set; }
+    public decimal MedianPnL { get; set; }
+    public decimal Expectancy { get; set; }
+    public decimal PayoffRatio { get; set; }
+    public decimal PercentProfitableDays { get; set; }
+    public int LongTrades { get; set; }
+    public int ShortTrades { get; set; }
 
     // ── Simulation-only aggregate ─────────────────────────────────────────
     public int SimTrades { get; set; }
@@ -153,6 +187,9 @@ public class BacktestReport
     public List<MonthlyPnL> ByMonth { get; set; } = new();
     public List<EquityPt> EquityCurve { get; set; } = new();
     public List<RollingWinRate> Rolling7Day { get; set; } = new();
+    public List<ExitReasonStat> ByExitReason { get; set; } = new();
+    public List<WeekdayStat> ByWeekday { get; set; } = new();
+    public List<HourStat> ByHour { get; set; } = new();
 }
 
 // ── Internal simulation position ──────────────────────────────────────────
@@ -309,14 +346,17 @@ public static class BacktestEngine
     private const decimal ATR_TRAIL_MULT = 2.0m;
     private const decimal TARGET_ATR_MULT = 2.4m;
     private const decimal COMMISSION = 2.0m;  // $1 each side
-    private const int MAX_POSITIONS = 2;
+    private const decimal ENTRY_SLIPPAGE_PCT = 0.0003m;
+    private const decimal EXIT_SLIPPAGE_PCT = 0.0003m;
+    private const int MAX_POSITIONS = 3;
+    private const int MAX_TRADES_PER_DAY = 6;
     private const int MIN_HOLD_SECONDS = 300;
-    private const double RSI_LONG_MIN = 65.0;
+    private const double RSI_LONG_MIN = 62.0;
     private const double RSI_SHORT_MAX = 35.0;
     private const int ORB_MINUTES = 30;
     private const decimal BREAK_EVEN_TRIGGER_R = 1.0m;
-    private static readonly HashSet<string> ApprovedSymbols = new(StringComparer.OrdinalIgnoreCase)
-    { "SPY","QQQ","IWM","NVDA","AMD","AAPL","AMZN","MSFT","META","AVGO","MU","NFLX" };
+    private static readonly HashSet<string> ExcludedSymbols = new(StringComparer.OrdinalIgnoreCase)
+    { "VIX" };
     private const decimal MIN_BREAKOUT_BODY_RATIO = 0.55m;
 
     // ── Public entry point ─────────────────────────────────────────────────────
@@ -376,6 +416,9 @@ public static class BacktestEngine
         report.ByPeriod = BuildPeriodStats(real, lifetimeEquity, capital);
         report.EquityCurve = BuildEquityCurve(real, lifetimeEquity, capital);
         report.Rolling7Day = BuildRollingWinRate(real, 7);
+        report.ByExitReason = BuildExitReasonBreakdown(real);
+        report.ByWeekday = BuildWeekdayBreakdown(real);
+        report.ByHour = BuildHourBreakdown(real);
 
         // Sim stats
         if (simTrades.Any())
@@ -416,6 +459,16 @@ public static class BacktestEngine
         r.AvgHoldMinutes = trades.Any() ? trades.Average(t => t.HoldMinutes) : 0;
         r.ProfitFactor = BtCalc.CalcProfitFactor(trades.Select(t => t.NetPnL));
         r.MaxDrawdown = BtCalc.CalcMaxDrawdown(trades.OrderBy(t => t.Date + t.Time).Select(t => t.NetPnL));
+        var orderedPnls = trades.Select(t => t.NetPnL).OrderBy(v => v).ToList();
+        if (orderedPnls.Count > 0)
+        {
+            int mid = orderedPnls.Count / 2;
+            r.MedianPnL = orderedPnls.Count % 2 == 1 ? orderedPnls[mid] : (orderedPnls[mid - 1] + orderedPnls[mid]) / 2m;
+        }
+        r.Expectancy = trades.Any() ? trades.Average(t => t.NetPnL) : 0m;
+        r.PayoffRatio = r.AvgLoss < 0 ? Math.Abs(r.AvgWin / r.AvgLoss) : 0m;
+        r.LongTrades = trades.Count(t => string.Equals(t.Side, "LONG", StringComparison.OrdinalIgnoreCase));
+        r.ShortTrades = trades.Count(t => string.Equals(t.Side, "SHORT", StringComparison.OrdinalIgnoreCase));
 
         // Consecutive streaks
         int consec = 0, maxL = 0, maxW = 0, curL = 0, curW = 0;
@@ -433,6 +486,7 @@ public static class BacktestEngine
             .Select(g => g.Sum(t => t.NetPnL))
             .ToList();
         r.SharpeRatio = BtCalc.CalcSharpe(dailyPnl);
+        r.PercentProfitableDays = dailyPnl.Any() ? (decimal)dailyPnl.Count(v => v > 0) / dailyPnl.Count * 100m : 0m;
 
         // AvgMae — only meaningful on sim trades (real trades lack intraday path data)
         var maeTrades = trades.Where(t => t.Mae > 0).ToList();
@@ -493,6 +547,61 @@ public static class BacktestEngine
                 };
             })
             .OrderByDescending(r => r.TotalPnL)
+            .ToList();
+    }
+
+    // ── Exit reason breakdown ──────────────────────────────────────────────────
+    private static List<ExitReasonStat> BuildExitReasonBreakdown(List<BtTrade> trades)
+    {
+        return trades
+            .GroupBy(t => string.IsNullOrWhiteSpace(t.ExitReason) ? "UNKNOWN" : t.ExitReason)
+            .Select(g => new ExitReasonStat
+            {
+                ExitReason = g.Key,
+                Trades = g.Count(),
+                Wins = g.Count(t => t.IsWin),
+                WinRate = g.Any() ? (double)g.Count(t => t.IsWin) / g.Count() * 100 : 0,
+                TotalPnL = g.Sum(t => t.NetPnL),
+                AvgPnL = g.Any() ? g.Average(t => t.NetPnL) : 0m
+            })
+            .OrderByDescending(x => x.Trades)
+            .ToList();
+    }
+
+    // ── Weekday breakdown ──────────────────────────────────────────────────────
+    private static List<WeekdayStat> BuildWeekdayBreakdown(List<BtTrade> trades)
+    {
+        var order = new[] { "Monday", "Tuesday", "Wednesday", "Thursday", "Friday" };
+        return trades
+            .Where(t => DateTime.TryParse(t.Date, out _))
+            .GroupBy(t => DateTime.Parse(t.Date).DayOfWeek)
+            .Select(g => new WeekdayStat
+            {
+                Day = g.Key.ToString(),
+                Trades = g.Count(),
+                Wins = g.Count(t => t.IsWin),
+                WinRate = g.Any() ? (double)g.Count(t => t.IsWin) / g.Count() * 100 : 0,
+                TotalPnL = g.Sum(t => t.NetPnL)
+            })
+            .OrderBy(x => Array.IndexOf(order, x.Day))
+            .ToList();
+    }
+
+    // ── Hour breakdown ─────────────────────────────────────────────────────────
+    private static List<HourStat> BuildHourBreakdown(List<BtTrade> trades)
+    {
+        return trades
+            .Where(t => !string.IsNullOrWhiteSpace(t.Time) && t.Time.Length >= 2)
+            .GroupBy(t => t.Time.Substring(0, 2))
+            .Select(g => new HourStat
+            {
+                Hour = g.Key + ":00",
+                Trades = g.Count(),
+                Wins = g.Count(t => t.IsWin),
+                WinRate = g.Any() ? (double)g.Count(t => t.IsWin) / g.Count() * 100 : 0,
+                TotalPnL = g.Sum(t => t.NetPnL)
+            })
+            .OrderBy(x => x.Hour)
             .ToList();
     }
 
@@ -736,11 +845,13 @@ public static class BacktestEngine
         var orbRanges = new Dictionary<string, (decimal High, decimal Low, bool IsSet, int MinuteCount)>();
         var prevClose = new Dictionary<string, decimal>();
         var lastDate = new Dictionary<string, DateTime>();
+        var tradesPerDay = new Dictionary<DateTime, int>();
+        var tradedToday = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // ── Replay ──────────────────────────────────────────────────────────
         foreach (var (symbol, candle) in allEvents)
         {
-            if (!ApprovedSymbols.Contains(symbol)) continue;
+            if (ExcludedSymbols.Contains(symbol)) continue;
             var etTime = candle.Time;  // already ET from the bot's candle data
 
             // Reset daily structures at each new trading day
@@ -751,6 +862,7 @@ public static class BacktestEngine
                 vwapAccum[symbol] = (sumPV: 0m, sumVol: 0L);
                 orbRanges[symbol] = (candle.High, candle.Low, false, 0);
                 lastDate[symbol] = etTime;
+                if (!tradesPerDay.ContainsKey(etTime.Date)) tradesPerDay[etTime.Date] = 0;
             }
 
             // Maintain rolling window
@@ -839,6 +951,8 @@ public static class BacktestEngine
 
                 if (exit)
                 {
+                    decimal exitSlip = Math.Max(0.01m, exitPrice * EXIT_SLIPPAGE_PCT);
+                    exitPrice = pos.IsShort ? exitPrice + exitSlip : exitPrice - exitSlip;
                     decimal gross = pos.IsShort
                         ? pos.Qty * (pos.EntryPrice - exitPrice)
                         : pos.Qty * (exitPrice - pos.EntryPrice);
@@ -877,6 +991,9 @@ public static class BacktestEngine
             // ── Try entry (only during valid hours, only when no open position) ──
             if (positions.ContainsKey(symbol)) continue;
             if (positions.Count >= MAX_POSITIONS) continue;
+            if (tradesPerDay.GetValueOrDefault(etTime.Date) >= MAX_TRADES_PER_DAY) continue;
+            string tradeKey = symbol + "|" + etTime.Date.ToString("yyyy-MM-dd");
+            if (tradedToday.Contains(tradeKey)) continue;
             if (etTime.Hour < 10 || (etTime.Hour == 10 && etTime.Minute < 15)) continue;
             if (etTime.Hour > 15 || (etTime.Hour == 15 && etTime.Minute >= 30)) continue;
             if (win.Count < 50) continue;
@@ -912,6 +1029,15 @@ public static class BacktestEngine
             bool volExp = BtCalc.IsVolExpansion(win);
             long avgVol10 = (long)win.TakeLast(10).Average(c => c.Volume);
             bool volOk = candle.Volume >= avgVol10;
+            int setupScore = 0;
+            if (sma50 > 0 && close > sma50) setupScore += 15;
+            if (sma20 > 0 && close > sma20) setupScore += 10;
+            if (vwap > 0 && close > vwap) setupScore += 10;
+            if (volExp) setupScore += 25;
+            decimal atrPct = close > 0 ? atr / close : 0m;
+            if (atrPct >= 0.003m && atrPct <= 0.02m) setupScore += 20;
+            setupScore += regime == "TRENDING" ? 15 : regime == "NORMAL" ? 10 : regime == "SELL-OFF" ? 5 : 0;
+            if (setupScore < 35) continue;
 
             BtPosition newPos = null;
 
@@ -923,7 +1049,7 @@ public static class BacktestEngine
 
                 // ORB_LONG: blocked in SELL-OFF or bearish SPY open
                 // Also requires stock to be UP or flat on the day (daily direction filter)
-                if (false && !blockLongs && orbLongHold && rsi > RSI_LONG_MIN && volOk && HasStrongBodyClose(candle, true))
+                if (!blockLongs && orbLongHold && rsi > RSI_LONG_MIN && volOk && HasStrongBodyClose(candle, true))
                 {
                     // Stock daily direction check: must be >= -0.2% vs prev candle day's last close
                     bool stockDayOk = true;
@@ -933,8 +1059,8 @@ public static class BacktestEngine
                             ? symAll.Where(c => c.Time.Date < etTime.Date).ToList() : new List<Candle>();
                         if (prevDayCandles.Any())
                         {
-                            decimal pdClose = prevDayCandles.Last().Close;
-                            if (pdClose > 0) stockDayOk = (close - pdClose) / pdClose >= -0.002m;
+                            decimal prevDayClose = prevDayCandles.Last().Close;
+                            if (prevDayClose > 0) stockDayOk = (close - prevDayClose) / prevDayClose >= -0.002m;
                         }
                     }
                     if (stockDayOk)
@@ -956,6 +1082,25 @@ public static class BacktestEngine
                 }
             }
 
+            // ── Gap and Go ─────────────────────────────────────────────────
+            if (newPos == null && prevClose.TryGetValue(symbol, out var pdClose) && pdClose > 0)
+            {
+                decimal gapPct = (close - pdClose) / pdClose;
+                decimal relVol = avgVol10 > 0 ? candle.Volume / (decimal)avgVol10 : 0m;
+                if (gapPct >= 0.02m && relVol >= 1.5m && !blockLongs && rsi > RSI_LONG_MIN && volOk && close > vwap)
+                {
+                    int qty = CalcQty(close, atr * HARD_STOP_ATR_MULT);
+                    if (qty > 0)
+                        newPos = new BtPosition { Symbol = symbol, IsShort = false, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "GAP_GO_LONG", Regime = regime, HardStop = close - atr * HARD_STOP_ATR_MULT, Target = close + atr * TARGET_ATR_MULT, AtrAtEntry = atr, WorstPrice = close };
+                }
+                else if (gapPct <= -0.02m && relVol >= 1.5m && rsi < RSI_SHORT_MAX && close < vwap)
+                {
+                    int qty = CalcQty(close, atr * HARD_STOP_ATR_MULT);
+                    if (qty > 0)
+                        newPos = new BtPosition { Symbol = symbol, IsShort = true, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "GAP_GO_SHORT", Regime = regime, HardStop = close + atr * HARD_STOP_ATR_MULT, Target = close - atr * TARGET_ATR_MULT, AtrAtEntry = atr, WorstPrice = close };
+                }
+            }
+
             // ── VWAP Reclaim (blocked in SELL-OFF and bearish open) ───────
             if (newPos == null && vwap > 0 && volExp && !blockLongs && HasStrongBodyClose(candle, true))
             {
@@ -965,6 +1110,18 @@ public static class BacktestEngine
                     int qty = CalcQty(close, atr * HARD_STOP_ATR_MULT);
                     if (qty > 0)
                         newPos = new BtPosition { Symbol = symbol, IsShort = false, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "VWAP_RECLAIM", Regime = regime, HardStop = close - atr * HARD_STOP_ATR_MULT, Target = close + atr * TARGET_ATR_MULT, AtrAtEntry = atr, WorstPrice = close };
+                }
+            }
+
+            // ── VWAP Reject Short ──────────────────────────────────────────
+            if (newPos == null && vwap > 0 && volExp && HasStrongBodyClose(candle, false))
+            {
+                bool reject = win.Count >= 3 && win[^1].Close < vwap && win[^2].Close < vwap && win[^3].Close >= vwap;
+                if (reject && rsi < RSI_SHORT_MAX)
+                {
+                    int qty = CalcQty(close, atr * HARD_STOP_ATR_MULT);
+                    if (qty > 0)
+                        newPos = new BtPosition { Symbol = symbol, IsShort = true, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "VWAP_REJECT_SHORT", Regime = regime, HardStop = close + atr * HARD_STOP_ATR_MULT, Target = close - atr * TARGET_ATR_MULT, AtrAtEntry = atr, WorstPrice = close };
                 }
             }
 
@@ -983,8 +1140,29 @@ public static class BacktestEngine
                 }
             }
 
+            // ── Momentum short continuation ────────────────────────────────
+            if (newPos == null && volExp && sma50 > 0 && close < sma20 && close < sma50 && HasStrongBodyClose(candle, false))
+            {
+                decimal recentLow = win.TakeLast(8).Min(c => c.Low);
+                bool breakdown = close < recentLow && rsi < RSI_SHORT_MAX && (regime == "SELL-OFF" || regime == "NORMAL");
+                if (breakdown)
+                {
+                    int qty = CalcQty(close, atr * HARD_STOP_ATR_MULT);
+                    if (qty > 0)
+                        newPos = new BtPosition { Symbol = symbol, IsShort = true, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "MOMENTUM_SHORT", Regime = regime, HardStop = close + atr * HARD_STOP_ATR_MULT, Target = close - atr * TARGET_ATR_MULT, AtrAtEntry = atr, WorstPrice = close };
+                }
+            }
 
-            if (newPos != null) positions[symbol] = newPos;
+            if (newPos != null)
+            {
+                decimal entrySlip = Math.Max(0.01m, close * ENTRY_SLIPPAGE_PCT);
+                newPos.EntryPrice = newPos.IsShort ? close - entrySlip : close + entrySlip;
+                newPos.HardStop = newPos.IsShort ? newPos.EntryPrice + atr * HARD_STOP_ATR_MULT : newPos.EntryPrice - atr * HARD_STOP_ATR_MULT;
+                newPos.Target = newPos.IsShort ? newPos.EntryPrice - atr * TARGET_ATR_MULT : newPos.EntryPrice + atr * TARGET_ATR_MULT;
+                positions[symbol] = newPos;
+                tradesPerDay[etTime.Date] = tradesPerDay.GetValueOrDefault(etTime.Date) + 1;
+                tradedToday.Add(tradeKey);
+            }
         }
 
         // Close any remaining open positions at end of data
@@ -994,6 +1172,8 @@ public static class BacktestEngine
             var lastCandle = allCandles.TryGetValue(kvp.Key, out var lc) ? lc.LastOrDefault() : null;
             if (lastCandle == null) continue;
             decimal exitPrice = lastCandle.Close;
+            decimal exitSlip = Math.Max(0.01m, exitPrice * EXIT_SLIPPAGE_PCT);
+            exitPrice = pos.IsShort ? exitPrice + exitSlip : exitPrice - exitSlip;
             decimal gross = pos.IsShort ? pos.Qty * (pos.EntryPrice - exitPrice) : pos.Qty * (exitPrice - pos.EntryPrice);
             decimal net = gross - COMMISSION;
             decimal maeEod = pos.IsShort

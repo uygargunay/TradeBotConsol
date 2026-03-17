@@ -77,9 +77,6 @@ class Program
 
         // ── 5. START DASHBOARD + BACKGROUND LOOPS ───────────────────────────────
         broker.Start();
-
-        _ = broker.SendEmail("🤖 Bot Started", "Bot is running and reconciled.");
-
         _ = Task.Run(async () =>
         {
             while (true)

@@ -3160,6 +3160,7 @@ public class SimulatedBroker
                         foreach (var pos in _positions.Values.ToList())
                         {
                             bool alreadyPending = pos.ExitSubmitted;
+                            CancelBracketChildren(pos);
                             pos.ExitSubmitted = true;
                             TradeSide exitSide = pos.IsShort ? TradeSide.Buy : TradeSide.Sell;
                             string tag = alreadyPending ? "MANUAL_FORCE_LIQUIDATE" : "MANUAL_LIQUIDATE";
