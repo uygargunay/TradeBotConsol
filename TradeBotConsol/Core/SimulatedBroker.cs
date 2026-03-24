@@ -127,6 +127,7 @@ public class OpeningRange
 
 public class SimulatedBroker
 {
+   
     public IBroker RealBroker { get; set; }
     private readonly object _lock = new object();
 
@@ -136,9 +137,11 @@ public class SimulatedBroker
     private decimal POSITION_SIZE = 1200m;
     private int MIN_HOLD_SECONDS = 300;
     private decimal DAILY_PROFIT_GOAL = 200m;
-    // CHANGE 3: MAX_DAILY_LOSS -80 → -100 — avoids premature halt after 2 normal stops
+
+
+
     private decimal MAX_DAILY_LOSS = -100m;
-    private int COOLDOWN_SECONDS = 1800;
+    private int COOLDOWN_SECONDS = 900;          // was 1800
     private decimal ATR_TRAIL_MULT = 2.0m;
     private decimal SHORT_ATR_TRAIL = 1.8m;
     private decimal HARD_STOP_ATR_MULT = 2.0m;
@@ -147,27 +150,60 @@ public class SimulatedBroker
     private decimal MIN_STOP_DISTANCE = 0.10m;
     private int MAX_QTY_SANITY = 500;
     private decimal RISK_PCT = 0.005m;
-    private int ORB_MINUTES = 30;
-    private decimal VOL_EXPAND_MULT = 1.8m;
-    // CHANGE 2: RSI_LONG_MIN 65.0 → 62.0 — recovers valid momentum entries filtered too aggressively 
-    //uygar change this to 64 if too much loosing
-    private double RSI_LONG_MIN = 62.0;
-    private double RSI_SHORT_MAX = 35.0;
+    private int ORB_MINUTES = 25;               // was 30
+    private decimal VOL_EXPAND_MULT = 1.6m;     // was 1.8
+    private double RSI_LONG_MIN = 60.0;         // was 62.0
+    private double RSI_SHORT_MAX = 38.0;        // was 35.0
     private double RSI_OVERSOLD = 32.0;
     private double RSI_OVERBOUGHT = 68.0;
-    private decimal GAP_GO_MIN_PCT = 0.020m;
-    private decimal GAP_GO_REL_VOL = 1.8m;
-    private int VWAP_CONFIRM_BARS = 2;
-    private int MAX_TRADES_PER_DAY = 6;
-    private decimal MIN_ATR_PCT = 0.003m;
+    private decimal GAP_GO_MIN_PCT = 0.015m;    // was 0.020
+    private decimal GAP_GO_REL_VOL = 1.5m;      // was 1.8
+    private int VWAP_CONFIRM_BARS = 1;          // was 2
+    private int MAX_TRADES_PER_DAY = 8;         // was 6
+    private decimal MIN_ATR_PCT = 0.0025m;      // was 0.003
     private decimal MAX_ATR_PCT = 0.015m;
-    private decimal MIN_RR_RATIO = 1.5m;
+    private decimal MIN_RR_RATIO = 1.4m;        // was 1.5
 
     private decimal VIX_REDUCE_THRESHOLD = 25m;
     private decimal VIX_NO_LONG_THRESHOLD = 35m;
 
-    // CHANGE 1: MIN_SETUP_SCORE 40 → 45 — filters the weakest 15-20% of setups
-    private int MIN_SETUP_SCORE = 45;
+    private int MIN_SETUP_SCORE = 40;           // was 45
+
+
+
+    //change back uygar
+    //// CHANGE 3: MAX_DAILY_LOSS -80 → -100 — avoids premature halt after 2 normal stops
+    //private decimal MAX_DAILY_LOSS = -100m;
+    //private int COOLDOWN_SECONDS = 1800;
+    //private decimal ATR_TRAIL_MULT = 2.0m;
+    //private decimal SHORT_ATR_TRAIL = 1.8m;
+    //private decimal HARD_STOP_ATR_MULT = 2.0m;
+    //private decimal MAX_LOSS_PER_TRADE = 40m;
+    //private decimal COMMISSION_PER_SIDE = 1m;
+    //private decimal MIN_STOP_DISTANCE = 0.10m;
+    //private int MAX_QTY_SANITY = 500;
+    //private decimal RISK_PCT = 0.005m;
+    //private int ORB_MINUTES = 30;
+    //private decimal VOL_EXPAND_MULT = 1.8m;
+    //// CHANGE 2: RSI_LONG_MIN 65.0 → 62.0 — recovers valid momentum entries filtered too aggressively 
+    ////uygar change this to 64 if too much loosing
+    //private double RSI_LONG_MIN = 62.0;
+    //private double RSI_SHORT_MAX = 35.0;
+    //private double RSI_OVERSOLD = 32.0;
+    //private double RSI_OVERBOUGHT = 68.0;
+    //private decimal GAP_GO_MIN_PCT = 0.020m;
+    //private decimal GAP_GO_REL_VOL = 1.8m;
+    //private int VWAP_CONFIRM_BARS = 2;
+    //private int MAX_TRADES_PER_DAY = 6;
+    //private decimal MIN_ATR_PCT = 0.003m;
+    //private decimal MAX_ATR_PCT = 0.015m;
+    //private decimal MIN_RR_RATIO = 1.5m;
+
+    //private decimal VIX_REDUCE_THRESHOLD = 25m;
+    //private decimal VIX_NO_LONG_THRESHOLD = 35m;
+
+    //// CHANGE 1: MIN_SETUP_SCORE 40 → 45 — filters the weakest 15-20% of setups
+    //private int MIN_SETUP_SCORE = 45;
 
     private int MAX_CONSECUTIVE_LOSSES = 3;
 
@@ -578,7 +614,7 @@ public class SimulatedBroker
         var nowEt = GetEasternTime();
         if (nowEt.DayOfWeek == DayOfWeek.Saturday || nowEt.DayOfWeek == DayOfWeek.Sunday) return;
         if (nowEt.Hour < 9 || (nowEt.Hour == 9 && nowEt.Minute < 32)) return;
-        if (nowEt.Hour > 14 || (nowEt.Hour == 14 && nowEt.Minute >= 30)) return;
+        if (nowEt.Hour > 15 || (nowEt.Hour == 15 && nowEt.Minute >= 30)) return;
 
         // ── CHANGE 4: OpEx Friday filter ──────────────────────────────────────
         // 3rd Friday of month = quarterly options expiration. Volume spikes are
@@ -614,7 +650,7 @@ public class SimulatedBroker
         if (candles.TakeLast(300).Sum(c => c.Volume) < 500_000) return;
 
         decimal lastPrice = candles.Last().Close;
-        if (lastPrice < 10m) return;
+        //if (lastPrice < 5m) return;
 
         if (_indicatorCache.TryGetValue(symbol, out var preInd))
         {
@@ -1441,6 +1477,12 @@ public class SimulatedBroker
                            TradeSide side, bool isShort, string strategyTag)
     {
         if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(strategyTag)) return;
+
+        // Invert every entry while preserving the existing signal-generation logic.
+        // A long signal becomes a short entry, and a short signal becomes a long entry.
+        side = side == TradeSide.Buy ? TradeSide.Sell : TradeSide.Buy;
+        isShort = !isShort;
+
         if (isShort && !_allowShorts) return;
         if (qty <= 0 || qty > MAX_QTY_SANITY) return;
 
@@ -2674,7 +2716,7 @@ public class SimulatedBroker
     // ══════════════════════════════════════════════════════════
 
     private static readonly string CONFIG_FILE = StatePath("bot-config.json");
-    private const string CONFIG_PASSWORD = "Efmukl123!";
+    private const string CONFIG_PASSWORD = "a";
 
     private string EffectiveConfigPassword()
     {
