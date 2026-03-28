@@ -327,6 +327,12 @@ public class SimulatedBroker
     private DateTime _lastMemorySave = DateTime.MinValue;
     private DateTime _lastStateSave = DateTime.MinValue;
 
+    // ── Status API caching — avoids re-serializing 500 trades on every poll ──
+    private string _cachedAllTradesJson = "[]";
+    private int _cachedAllTradesCount = -1;
+    private string _cachedLifetimeJson = "[]";
+    private int _cachedLifetimeCount = -1;
+
     private volatile bool _reconciled = false;
     private volatile bool _needsReconciliation = false;
     private readonly Dictionary<string, (int qty, decimal avgCost)> _ibkrPositionSnapshot = new();
@@ -4055,11 +4061,18 @@ public class SimulatedBroker
                 decimal price = candles?.LastOrDefault()?.Close ?? 0m;
                 bool dataReady = price > 0m;
 
-                var candleList = candles ?? new List<Candle>();
-                decimal sma20 = dataReady ? SafeSMA(candleList, 20) : 0m;
-                decimal sma50 = dataReady ? SafeSMA(candleList, 50) : 0m;
-                double rsi = dataReady ? SafeRSI(candleList, 14) : 0.0;
-                decimal atr = dataReady ? SafeATR(candleList, 14) : 0m;
+                // Use cached indicators instead of recomputing on every poll
+                decimal sma20 = 0m, sma50 = 0m, atr = 0m;
+                double rsi = 0.0;
+                int macdDir = 0;
+                if (dataReady && _indicatorCache.TryGetValue(sym, out var indC))
+                {
+                    sma20 = indC.Sma20;
+                    sma50 = indC.Sma50;
+                    rsi = indC.Rsi14;
+                    atr = indC.Atr14;
+                    macdDir = indC.MacdDir;
+                }
                 decimal atrPct = price > 0 ? atr / price * 100 : 0;
                 _vwap.TryGetValue(sym, out decimal vwap);
                 _prevDayClose.TryGetValue(sym, out decimal prevClose);
@@ -4076,7 +4089,7 @@ public class SimulatedBroker
 
                 decimal sma200 = GetDailySma200(sym);
                 var (pdHi, pdLo) = GetPrevDayHL(sym);
-                int macdDir = dataReady ? SafeMACDDirection(candleList) : 0;
+                // macdDir already set from _indicatorCache above
 
                 _orbRanges.TryGetValue(sym, out var orb);
                 decimal orbHi = orb?.High ?? 0m;
@@ -4159,23 +4172,30 @@ public class SimulatedBroker
             }
             ltArr.Append("]");
 
-            var allArr = new StringBuilder("[");
+            // allTrades — only re-serialize when count changes (500 trade loop is expensive)
             lock (_allTrades)
             {
-                var all = _allTrades.ToList();
-                int start = Math.Max(0, all.Count - 500);
-                bool firstAt = true;
-                for (int i = all.Count - 1; i >= start; i--)
+                int currentCount = _allTrades.Count;
+                if (currentCount != _cachedAllTradesCount)
                 {
-                    var t = all[i];
-                    if (!firstAt) allArr.Append(",");
-                    allArr.Append($@"{{""sym"":""{t.Symbol}"",""side"":""{t.Side}"",""strat"":""{t.Strategy}"",""qty"":{t.Qty},""entry"":{t.Entry:F2},""exit"":{t.Exit:F2},""pnl"":{t.NetPnL:F2},""min"":{t.HoldMinutes:F0},""reason"":""{t.ExitReason}"",""time"":""{t.Time}"",""date"":""{t.Date}""}}");
-                    firstAt = false;
+                    _cachedAllTradesCount = currentCount;
+                    var allArr = new StringBuilder("[");
+                    var all = _allTrades.ToList();
+                    int start = Math.Max(0, all.Count - 500);
+                    bool firstAt = true;
+                    for (int i = all.Count - 1; i >= start; i--)
+                    {
+                        var t = all[i];
+                        if (!firstAt) allArr.Append(",");
+                        allArr.Append($@"{{""sym"":""{t.Symbol}"",""side"":""{t.Side}"",""strat"":""{t.Strategy}"",""qty"":{t.Qty},""entry"":{t.Entry:F2},""exit"":{t.Exit:F2},""pnl"":{t.NetPnL:F2},""min"":{t.HoldMinutes:F0},""reason"":""{t.ExitReason}"",""time"":""{t.Time}"",""date"":""{t.Date}""}}");
+                        firstAt = false;
+                    }
+                    allArr.Append("]");
+                    _cachedAllTradesJson = allArr.ToString();
                 }
             }
-            allArr.Append("]");
 
-            return $@"{{""time"":""{now:yyyy-MM-dd HH:mm:ss} PT"",""et"":""{et:HH:mm:ss} ET"",""regime"":""{_marketRegime}"",""spyBullish"":{(_spyBullish ? "true" : "false")},""spyBearish"":{(_spyBearish ? "true" : "false")},""halted"":{(_haltTrading ? "true" : "false")},""reconciled"":{(_reconciled ? "true" : "false")},""pnl"":{_totalRealizedPnL:F2},""goal"":{DAILY_PROFIT_GOAL:F2},""maxLoss"":{MAX_DAILY_LOSS:F2},""trades"":{_tradesToday},""maxTrades"":{MAX_TRADES_PER_DAY},""wins"":{_winCount},""losses"":{_lossCount},""wr"":{wr:F1},""cash"":{cash:F2},""budget"":{TOTAL_BUDGET:F2},""initialBudget"":{TOTAL_BUDGET:F2},""positions"":{posArr},""curve"":{curveArr},""watchlist"":{wlArr},""feed"":{tradeArr},""hist"":{histArr},""lifetimeCurve"":{ltArr},""allTrades"":{allArr}}}";
+            return $@"{{""time"":""{now:yyyy-MM-dd HH:mm:ss} PT"",""et"":""{et:HH:mm:ss} ET"",""regime"":""{_marketRegime}"",""spyBullish"":{(_spyBullish ? "true" : "false")},""spyBearish"":{(_spyBearish ? "true" : "false")},""halted"":{(_haltTrading ? "true" : "false")},""reconciled"":{(_reconciled ? "true" : "false")},""pnl"":{_totalRealizedPnL:F2},""goal"":{DAILY_PROFIT_GOAL:F2},""maxLoss"":{MAX_DAILY_LOSS:F2},""trades"":{_tradesToday},""maxTrades"":{MAX_TRADES_PER_DAY},""wins"":{_winCount},""losses"":{_lossCount},""wr"":{wr:F1},""cash"":{cash:F2},""budget"":{TOTAL_BUDGET:F2},""initialBudget"":{TOTAL_BUDGET:F2},""positions"":{posArr},""curve"":{curveArr},""watchlist"":{wlArr},""feed"":{tradeArr},""hist"":{histArr},""lifetimeCurve"":{ltArr},""allTrades"":{_cachedAllTradesJson}}}";
         }
     }
 

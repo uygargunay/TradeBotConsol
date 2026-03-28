@@ -2612,8 +2612,12 @@
         document.querySelector('th[data-k="atr"]').classList.add('desc');
 
         // ── Main render ──
+        let _prevTradeCount = -1;
+        let _prevPosFingerprint = '';
+        let _prevScannerFingerprint = '';
+
         function render(d) {
-            // Topbar
+            // Topbar — always update (cheap)
             $('t-pnl').textContent = fmtS(d.pnl); $('t-pnl').className = 'val ' + clr(d.pnl);
             $('t-wr').textContent = d.wr.toFixed(1) + '%';
             $('t-tr').textContent = d.trades + ' / ' + d.maxTrades;
@@ -2682,15 +2686,21 @@
                 }).join('');
             }
 
-            // Scanner
+            // Scanner — only rebuild if watchlist data actually changed
             rawWL = d.watchlist;
-            renderScanner();
+            const scanFp = d.watchlist.map(w => w.s + w.price.toFixed(2) + w.rsi.toFixed(0)).join('|');
+            if (scanFp !== _prevScannerFingerprint) {
+                _prevScannerFingerprint = scanFp;
+                renderScanner();
+            }
 
-            // Trade history
-            if (d.hist) renderTradeHistory(d.hist, d.pnl, d.wins, d.losses, d.wr);
-
-            // All-time trade history
-            if (d.allTrades) renderAllTradeHistory(d.allTrades);
+            // Trade history — only rebuild when trade count changes
+            const tradeCount = (d.hist ? d.hist.length : 0) + (d.allTrades ? d.allTrades.length : 0);
+            if (tradeCount !== _prevTradeCount) {
+                _prevTradeCount = tradeCount;
+                if (d.hist) renderTradeHistory(d.hist, d.pnl, d.wins, d.losses, d.wr);
+                if (d.allTrades) renderAllTradeHistory(d.allTrades);
+            }
 
             // Update detail stats if open (charts refresh every 30s via their own fetch)
             if (selectedSym) {
@@ -2725,7 +2735,7 @@
         initDetailCharts();
         loadConfigFromAPI(); // pre-load config in background so settings modal is ready instantly
         poll();
-        setInterval(poll, 250);
+        setInterval(poll, 2000);
 
         // ══════════════════════════════════════════════════════════
         //  SELL / LIQUIDATE — PASSWORD-PROTECTED MANUAL EXITS
