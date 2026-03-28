@@ -121,13 +121,21 @@ public class OpeningRange
     public bool IsSet { get; set; }
 }
 
+public sealed class PatternSignal
+{
+    public string Tag { get; set; } = "";
+    public bool Bullish { get; set; }
+    public int Score { get; set; }
+    public string Reason { get; set; } = "";
+}
+
 // ══════════════════════════════════════════════════════════
 //  SIMULATED BROKER
 // ══════════════════════════════════════════════════════════
 
 public class SimulatedBroker
 {
-   
+
     public IBroker RealBroker { get; set; }
     private readonly object _lock = new object();
 
@@ -145,7 +153,7 @@ public class SimulatedBroker
     private decimal ATR_TRAIL_MULT = 2.0m;
     private decimal SHORT_ATR_TRAIL = 1.8m;
     private decimal HARD_STOP_ATR_MULT = 2.0m;
-    private decimal MAX_LOSS_PER_TRADE = 40m;
+    private decimal MAX_LOSS_PER_TRADE = 80m;
     private decimal COMMISSION_PER_SIDE = 1m;
     private decimal MIN_STOP_DISTANCE = 0.10m;
     private int MAX_QTY_SANITY = 500;
@@ -205,7 +213,7 @@ public class SimulatedBroker
     //// CHANGE 1: MIN_SETUP_SCORE 40 → 45 — filters the weakest 15-20% of setups
     //private int MIN_SETUP_SCORE = 45;
 
-    private int MAX_CONSECUTIVE_LOSSES = 3;
+    private int MAX_CONSECUTIVE_LOSSES = 6;
 
     private bool STRATEGY_ORB_ENABLED = true;
     private bool STRATEGY_GAP_GO_ENABLED = true;
@@ -213,8 +221,14 @@ public class SimulatedBroker
     private bool STRATEGY_MEAN_REV_ENABLED = false;
     private bool STRATEGY_BB_MR_ENABLED = false;
     private bool STRATEGY_MOMENTUM_ENABLED = true;
-    private bool STRATEGY_EMA_POCKET_ENABLED = false;
+    private bool STRATEGY_EMA_POCKET_ENABLED = true;
     private bool STRATEGY_OUTSIDE_CANDLE_ENABLED = false;
+    private bool STRATEGY_CANDLE_PATTERNS_ENABLED = true;
+    private bool STRATEGY_MICRO_PULLBACK_ENABLED = true;
+    private bool EARLY_PATTERN_ENTRY_ENABLED = true;
+    private int PATTERN_MIN_SCORE = 45;
+    private int INTRABAR_SIGNAL_COOLDOWN_SECONDS = 15;
+    private decimal FAST_VOL_MULT = 1.30m;
     private int DATA_LINES_PER_SYMBOL = 1;
     private int MAX_MARKET_DATA_LINES = 95;
 
@@ -279,6 +293,8 @@ public class SimulatedBroker
 
     private readonly ConcurrentDictionary<string, decimal> _latestBid = new();
     private readonly ConcurrentDictionary<string, decimal> _latestAsk = new();
+    private readonly ConcurrentDictionary<string, DateTime> _latestBidAskUpdateUtc = new();
+    private readonly ConcurrentDictionary<string, DateTime> _latestTradeUpdateUtc = new();
 
     private bool MIDDAY_FILTER_ENABLED = true;
 
@@ -292,6 +308,8 @@ public class SimulatedBroker
 
     private readonly HashSet<string> _earningsBlacklist = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, (int stopId, int targetId)> _pendingBracketChildren = new();
+    private readonly ConcurrentDictionary<string, bool> _pendingEntrySymbols = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DateTime> _lastIntrabarSignalUtc = new(StringComparer.OrdinalIgnoreCase);
 
     private int _pendingEntryCount = 0;
 
@@ -391,6 +409,7 @@ public class SimulatedBroker
         try
         {
             _latestTick[symbol] = price;
+            _latestTradeUpdateUtc[symbol] = DateTime.UtcNow;
 
             var nowEt = GetEasternTime();
             var minute = new DateTime(nowEt.Year, nowEt.Month, nowEt.Day,
@@ -443,6 +462,7 @@ public class SimulatedBroker
 
             CheckHardStop(symbol, price);
             CheckExits(symbol, price);
+            TryEarlyPatternEntry(symbol, current);
 
             if ((DateTime.UtcNow - _lastMemorySave).TotalMinutes >= 1)
             {
@@ -465,6 +485,33 @@ public class SimulatedBroker
     {
         if (bid > 0) _latestBid[symbol] = bid;
         if (ask > 0) _latestAsk[symbol] = ask;
+        if (bid > 0 || ask > 0) _latestBidAskUpdateUtc[symbol] = DateTime.UtcNow;
+    }
+
+    private (decimal price, string source, double ageSec, decimal bid, decimal ask, decimal last) GetDisplayQuote(string symbol, decimal fallbackPrice = 0m)
+    {
+        _latestTick.TryGetValue(symbol, out decimal last);
+        _latestBid.TryGetValue(symbol, out decimal bid);
+        _latestAsk.TryGetValue(symbol, out decimal ask);
+
+        _latestTradeUpdateUtc.TryGetValue(symbol, out var lastTradeUtc);
+        _latestBidAskUpdateUtc.TryGetValue(symbol, out var lastQuoteUtc);
+
+        bool hasLast = last > 0;
+        bool hasBidAsk = bid > 0 && ask > 0 && ask >= bid;
+        double tradeAgeSec = hasLast && lastTradeUtc != default ? Math.Max(0, (DateTime.UtcNow - lastTradeUtc).TotalSeconds) : double.PositiveInfinity;
+        double quoteAgeSec = hasBidAsk && lastQuoteUtc != default ? Math.Max(0, (DateTime.UtcNow - lastQuoteUtc).TotalSeconds) : double.PositiveInfinity;
+
+        if (hasLast && tradeAgeSec <= 3)
+            return (last, "last", tradeAgeSec, bid, ask, last);
+
+        if (hasBidAsk)
+            return ((bid + ask) / 2m, "mid", quoteAgeSec, bid, ask, last);
+
+        if (hasLast)
+            return (last, "last-stale", tradeAgeSec, bid, ask, last);
+
+        return (fallbackPrice, fallbackPrice > 0 ? "bar" : "none", double.PositiveInfinity, bid, ask, last);
     }
 
     private void UpdateVwap(string symbol, decimal price, long size)
@@ -595,63 +642,119 @@ public class SimulatedBroker
     }
 
     // ══════════════════════════════════════════════════════════
-    //  EXECUTE STRATEGY — DISPATCHER
+    //  UNIVERSAL ENTRY GATES
+    //  Shared by ExecuteStrategy (closed-bar) and TryEarlyPatternEntry (intrabar).
+    //  Every check that limits entry eligibility lives here — no path may bypass them.
     // ══════════════════════════════════════════════════════════
 
-    public void ExecuteStrategy(string symbol, bool prevBarAboveVwap = false, bool currBarAboveVwap = false)
+    private bool PassesEntryGates(string symbol, out int minutesSinceOpen)
     {
-        CheckDailyReset();
-        if (_haltTrading) return;
-
-        if (!_watchlist.Contains(symbol, StringComparer.OrdinalIgnoreCase)) return;
-
-        if (!_reconciled)
-        {
-            LogMessage("[SKIP] Waiting for IBKR position reconciliation before trading.");
-            return;
-        }
+        minutesSinceOpen = -1;
+        if (_haltTrading) return false;
+        if (!_watchlist.Contains(symbol, StringComparer.OrdinalIgnoreCase)) return false;
+        if (!_reconciled) return false;
 
         var nowEt = GetEasternTime();
-        if (nowEt.DayOfWeek == DayOfWeek.Saturday || nowEt.DayOfWeek == DayOfWeek.Sunday) return;
-        if (nowEt.Hour < 9 || (nowEt.Hour == 9 && nowEt.Minute < 32)) return;
-        if (nowEt.Hour > 15 || (nowEt.Hour == 15 && nowEt.Minute >= 30)) return;
+        if (nowEt.DayOfWeek == DayOfWeek.Saturday || nowEt.DayOfWeek == DayOfWeek.Sunday) return false;
+        if (nowEt.Hour < 9 || (nowEt.Hour == 9 && nowEt.Minute < 32)) return false;
+        if (nowEt.Hour > 15 || (nowEt.Hour == 15 && nowEt.Minute >= 30)) return false;
 
-        // ── CHANGE 4: OpEx Friday filter ──────────────────────────────────────
-        // 3rd Friday of month = quarterly options expiration. Volume spikes are
-        // options-driven noise, not directional. MMs pin to max-pain levels,
-        // breakouts reverse violently. Cap at 2 trades on these days.
         bool isOpExFriday = nowEt.DayOfWeek == DayOfWeek.Friday
             && nowEt.Day >= 15 && nowEt.Day <= 21;
-        if (isOpExFriday && _tradesToday >= 2)
-        {
-            LogMessage($"[OPEX SKIP] OpEx Friday — capped at 2 trades, skipping new entries");
-            return;
-        }
+        if (isOpExFriday && _tradesToday >= 2) return false;
 
-        if (_earningsBlacklist.Contains(symbol))
-        {
-            LogMessage($"[EARNINGS SKIP] {symbol} is on today's earnings blacklist — no new entries");
-            return;
-        }
+        if (_earningsBlacklist.Contains(symbol)) return false;
 
         if (MIDDAY_FILTER_ENABLED &&
             _marketRegime != "TRENDING" &&
             (nowEt.Hour == 11 && nowEt.Minute >= 45 ||
              nowEt.Hour == 12 ||
              nowEt.Hour == 13 && nowEt.Minute < 05))
+            return false;
+
+        if (!_marketData.TryGetValue(symbol, out var candles) || candles.Count < 50) return false;
+        if (candles.TakeLast(300).Sum(c => c.Volume) < 500_000) return false;
+
+        decimal lastPrice = candles.Last().Close;
+
+        // Spread check
+        if (_latestBid.TryGetValue(symbol, out decimal bid) &&
+            _latestAsk.TryGetValue(symbol, out decimal ask) &&
+            bid > 0 && ask > 0)
+        {
+            decimal mid = (ask + bid) / 2m;
+            decimal spreadPct = mid > 0 ? (ask - bid) / mid : 0m;
+            const decimal maxSpreadPct = 0.0015m;
+            if (spreadPct > maxSpreadPct) return false;
+        }
+
+        // Liquidity sweep
+        if (candles.Count >= 11 && IsLiquiditySweep(candles)) return false;
+
+        // Daily range dormancy
+        {
+            var todayCandlesRange = candles.Where(c => c.Time.Date == nowEt.Date).ToList();
+            if (todayCandlesRange.Count >= 20)
+            {
+                decimal dayHigh = todayCandlesRange.Max(c => c.High);
+                decimal dayLow = todayCandlesRange.Min(c => c.Low);
+                decimal dayRngPct = lastPrice > 0 ? (dayHigh - dayLow) / lastPrice : 0m;
+                if (dayRngPct < 0.006m) return false;
+            }
+        }
+
+        // Position / budget / rate limits (needs lock)
+        lock (_lock)
+        {
+            if (_tradesToday >= MAX_TRADES_PER_DAY) return false;
+
+            var hourSlot = new DateTime(nowEt.Year, nowEt.Month, nowEt.Day, nowEt.Hour, 0, 0);
+            if (hourSlot != _currentTradeHour) { _currentTradeHour = hourSlot; _tradesThisHour = 0; }
+            if (_tradesThisHour >= MAX_TRADES_PER_HOUR) return false;
+
+            if (_positions.ContainsKey(symbol)) return false;
+            if (_pendingEntrySymbols.ContainsKey(symbol)) return false;
+            if (_positions.Count + _pendingEntryCount >= MAX_POSITIONS) return false;
+
+            decimal deployedCapital = _positions.Values.Sum(p => p.AvgPrice * p.Quantity)
+                                    + _pendingEntryCount * POSITION_SIZE;
+            if (TOTAL_BUDGET - deployedCapital < POSITION_SIZE) return false;
+
+            if (_lastTradeTime.TryGetValue(symbol, out var lastTime))
+            {
+                int cooldown = _lastTradeWasLoss.GetValueOrDefault(symbol)
+                    ? COOLDOWN_SECONDS * 2
+                    : COOLDOWN_SECONDS;
+                if ((DateTime.UtcNow - lastTime).TotalSeconds < cooldown) return false;
+            }
+            if (_dailyEntryCount.GetValueOrDefault(symbol) >= 2) return false;
+        }
+
+        minutesSinceOpen = (nowEt.Hour - 9) * 60 + nowEt.Minute - 30;
+
+        // Setup quality
+        int setupScore = ScoreSetup(symbol, candles);
+        if (setupScore < MIN_SETUP_SCORE) return false;
+
+        return true;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  EXECUTE STRATEGY — DISPATCHER
+    // ══════════════════════════════════════════════════════════
+
+    public void ExecuteStrategy(string symbol, bool prevBarAboveVwap = false, bool currBarAboveVwap = false)
+    {
+        CheckDailyReset();
+
+        if (!PassesEntryGates(symbol, out int minutesSinceOpen))
             return;
 
         if (!_marketData.TryGetValue(symbol, out var candles) || candles.Count < 50)
-        {
-            LogMessage($"[SKIP] {symbol} not enough candles: {candles?.Count ?? 0}");
             return;
-        }
 
-        if (candles.TakeLast(300).Sum(c => c.Volume) < 500_000) return;
-
+        // Quick-reject: skip symbols with no interesting indicator state
         decimal lastPrice = candles.Last().Close;
-        //if (lastPrice < 5m) return;
-
         if (_indicatorCache.TryGetValue(symbol, out var preInd))
         {
             bool orbActive = _orbRanges.TryGetValue(symbol, out var preOrb) && preOrb.IsSet
@@ -667,80 +770,26 @@ public class SimulatedBroker
                 return;
         }
 
-        if (_latestBid.TryGetValue(symbol, out decimal bid) &&
-            _latestAsk.TryGetValue(symbol, out decimal ask) &&
-            bid > 0 && ask > 0)
-        {
-            decimal spreadPct = (ask - bid) / ask;
-            const decimal maxSpreadPct = 0.0015m;
-            if (spreadPct > maxSpreadPct)
-            {
-                LogMessage($"[REJECT] {symbol} spread {spreadPct:P3} > hard max {maxSpreadPct:P3} (bid={bid:F2} ask={ask:F2})");
-                return;
-            }
-        }
-
-        if (candles.Count >= 11 && IsLiquiditySweep(candles))
-        {
-            LogMessage($"[SWEEP SKIP] {symbol} last candle is a liquidity sweep — skipping");
-            return;
-        }
-
-        {
-            var todayCandlesRange = candles.Where(c => c.Time.Date == nowEt.Date).ToList();
-            if (todayCandlesRange.Count >= 20)
-            {
-                decimal dayHigh = todayCandlesRange.Max(c => c.High);
-                decimal dayLow = todayCandlesRange.Min(c => c.Low);
-                decimal dayRngPct = lastPrice > 0 ? (dayHigh - dayLow) / lastPrice : 0m;
-                if (dayRngPct < 0.006m)
-                {
-                    LogMessage($"[RANGE SKIP] {symbol} daily range {dayRngPct:P2} < 0.6% — stock too dormant");
-                    return;
-                }
-            }
-        }
-
         lock (_lock)
         {
-            if (_tradesToday >= MAX_TRADES_PER_DAY) return;
+            var nowEt = GetEasternTime();
 
-            var hourSlot = new DateTime(nowEt.Year, nowEt.Month, nowEt.Day, nowEt.Hour, 0, 0);
-            if (hourSlot != _currentTradeHour) { _currentTradeHour = hourSlot; _tradesThisHour = 0; }
-            if (_tradesThisHour >= MAX_TRADES_PER_HOUR) return;
+            // 0. Candlestick anticipation / reversal-continuation layer
+            if (STRATEGY_CANDLE_PATTERNS_ENABLED)
+                if (TryCandlestickPatternStrategy(symbol, candles, intrabar: false)) return;
 
-            if (_positions.ContainsKey(symbol)) return;
-            if (_positions.Count + _pendingEntryCount >= MAX_POSITIONS) return;
-
-            decimal deployedCapital = _positions.Values.Sum(p => p.AvgPrice * p.Quantity)
-                                    + _pendingEntryCount * POSITION_SIZE;
-            if (TOTAL_BUDGET - deployedCapital < POSITION_SIZE) return;
-            if (_lastTradeTime.TryGetValue(symbol, out var lastTime))
-            {
-                int cooldown = _lastTradeWasLoss.GetValueOrDefault(symbol)
-                    ? COOLDOWN_SECONDS * 2
-                    : COOLDOWN_SECONDS;
-                if ((DateTime.UtcNow - lastTime).TotalSeconds < cooldown) return;
-            }
-            if (_dailyEntryCount.GetValueOrDefault(symbol) >= 2) return;
-
-            int minutesSinceOpen = (nowEt.Hour - 9) * 60 + nowEt.Minute - 30;
-
-            int setupScore = ScoreSetup(symbol, candles);
-            if (setupScore < MIN_SETUP_SCORE)
-            {
-                LogMessage($"[QUALITY SKIP] {symbol} setup score {setupScore} < {MIN_SETUP_SCORE} — skipping");
-                return;
-            }
+            // 0b. Micro-pullback: catch 1-2 bar pullbacks after impulse moves
+            if (STRATEGY_MICRO_PULLBACK_ENABLED)
+                if (TryMicroPullbackStrategy(symbol, candles)) return;
 
             // 1. Opening Range Breakout (only after ORB window closes)
-            if (STRATEGY_ORB_ENABLED && minutesSinceOpen > ORB_MINUTES)
+            if (STRATEGY_ORB_ENABLED && minutesSinceOpen >= ORB_MINUTES)
                 if (TryOrbStrategy(symbol, candles, nowEt)) return;
 
-            // CHANGE 5: Gap&Go end time — regime-dependent to avoid post-11am stale gaps
-            // TRENDING days: allow full 150-min window. Non-trending: cut to 120 min (11:00 ET).
+            // Gap&Go should be available earlier than the old 45-minute gate.
+            // Strong gaps often do their real move in the first 20-40 minutes.
             int gapGoEnd = _marketRegime == "TRENDING" ? 150 : 120;
-            if (STRATEGY_GAP_GO_ENABLED && minutesSinceOpen >= 45 && minutesSinceOpen <= gapGoEnd)
+            if (STRATEGY_GAP_GO_ENABLED && minutesSinceOpen >= 20 && minutesSinceOpen <= gapGoEnd)
                 if (TryGapAndGoStrategy(symbol, candles)) return;
 
             // 3. VWAP Bounce / Reclaim
@@ -759,13 +808,9 @@ public class SimulatedBroker
             if (STRATEGY_MOMENTUM_ENABLED)
                 if (TryMomentumStrategy(symbol, candles)) return;
 
-            // 6. EMA Pocket
+            // 6. EMA Pocket — catches pullbacks to EMA9/21 pocket near key levels
             if (STRATEGY_EMA_POCKET_ENABLED)
                 if (TryEmaPocketStrategy(symbol, candles)) return;
-
-            // 7. Outside Candle
-            if (STRATEGY_OUTSIDE_CANDLE_ENABLED)
-                TryOutsideCandleStrategy(symbol, candles);
         }
     }
 
@@ -860,9 +905,9 @@ public class SimulatedBroker
         long avgVol10 = last10Vols.Count > 0 ? (long)last10Vols.Average(c => c.Volume) : 0;
         bool lastBarVolOk = candles.Last().Volume >= avgVol10;
 
-        // CHANGE 6 (continued): NORMAL regime requires 3-bar hold; TRENDING/SELL-OFF keep 2-bar hold.
-        // 3-bar hold significantly reduces false breakouts on lower-conviction normal days.
-        int requiredHoldBars = _marketRegime == "NORMAL" ? 3 : 2;
+        // ORB was materially late because it waited for multiple fully closed bars beyond the range.
+        // TRENDING / SELL-OFF now allow the first clean hold bar; NORMAL still needs 2 bars.
+        int requiredHoldBars = _marketRegime == "NORMAL" ? 2 : 1;
 
         bool orbLongHold = candles.Count >= requiredHoldBars
                         && candles.TakeLast(requiredHoldBars).All(c => c.Close > orb.High);
@@ -1408,6 +1453,612 @@ public class SimulatedBroker
         return ema;
     }
 
+    private void TryEarlyPatternEntry(string symbol, Candle current)
+    {
+        if (!EARLY_PATTERN_ENTRY_ENABLED) return;
+        if (current == null) return;
+
+        // ── Run the FULL universal gate stack — same gates as ExecuteStrategy ──
+        // This was the #1 architectural bug: the intrabar path previously bypassed
+        // earnings blacklist, spread check, daily range, trade limits, budget,
+        // cooldown-after-loss, setup score, and more.
+        if (!PassesEntryGates(symbol, out _)) return;
+
+        // Intrabar-specific cooldown (separate from per-symbol cooldown in gates)
+        if (_lastIntrabarSignalUtc.TryGetValue(symbol, out var lastSig)
+            && (DateTime.UtcNow - lastSig).TotalSeconds < INTRABAR_SIGNAL_COOLDOWN_SECONDS)
+            return;
+
+        if (!_marketData.TryGetValue(symbol, out var completed) || completed.Count < 50) return;
+
+        List<Candle> snapshot;
+        lock (completed)
+        {
+            snapshot = completed.TakeLast(120)
+                .Select(c => new Candle { Time = c.Time, Open = c.Open, High = c.High, Low = c.Low, Close = c.Close, Volume = c.Volume })
+                .ToList();
+        }
+        snapshot.Add(new Candle
+        {
+            Time = current.Time,
+            Open = current.Open,
+            High = current.High,
+            Low = current.Low,
+            Close = current.Close,
+            Volume = current.Volume
+        });
+
+        if (TryCandlestickPatternStrategy(symbol, snapshot, intrabar: true))
+            _lastIntrabarSignalUtc[symbol] = DateTime.UtcNow;
+    }
+
+    private bool TryCandlestickPatternStrategy(string symbol, List<Candle> candles, bool intrabar)
+    {
+        if (candles == null || candles.Count < 3) return false;
+
+        var pattern = DetectBestPattern(candles);
+        if (pattern.Score < PATTERN_MIN_SCORE) return false;
+
+        decimal close = candles.Last().Close;
+        decimal atr = SafeATR(candles, 14);
+        if (close <= 0 || atr <= 0) return false;
+
+        decimal atrPct = close > 0 ? atr / close : 0m;
+        if (atrPct < MIN_ATR_PCT * 0.75m) return false;
+        if (MAX_ATR_PCT > 0 && atrPct > MAX_ATR_PCT * 1.30m) return false;
+
+        double rsi = SafeRSI(candles, 14);
+        double prevRsi = SafeRSI(candles.Take(candles.Count - 1).ToList(), 14);
+        _vwap.TryGetValue(symbol, out decimal vwapVal);
+
+        // Volume check: HIGH-SCORE patterns (>= 65) can fire without volume confirmation.
+        // This is the KEY change — the old code blocked virtually all pattern entries
+        // because volume expansion rarely aligns with the exact pattern completion bar.
+        bool fastVol = HasFastVolumeSurge(candles, intrabar ? FAST_VOL_MULT : Math.Max(1.15m, FAST_VOL_MULT - 0.10m));
+        bool volOk = fastVol || CheckVolumeExpansion(candles);
+        bool highScorePattern = pattern.Score >= 65;
+        if (!volOk && !highScorePattern) return false;
+
+        decimal stopDistance = Math.Max(atr * (intrabar ? 1.50m : HARD_STOP_ATR_MULT), MIN_STOP_DISTANCE);
+        int qty = CalcQty(close, stopDistance);
+        if (qty <= 0) return false;
+
+        if (pattern.Bullish)
+        {
+            if (_marketRegime == "SELL-OFF" && !CheckStrongRelativeStrength(symbol, candles)) return false;
+            if (_spyOpenBearish) return false;
+
+            // Relaxed VWAP: allow slightly below VWAP (within 0.3% or 0.5 ATR)
+            bool nearOrAboveVwap = vwapVal <= 0 || close >= vwapVal - atr * 0.5m;
+            bool rsiOk = rsi >= 44 || rsi > prevRsi;  // relaxed from 48
+            if (!nearOrAboveVwap && !CheckStrongRelativeStrength(symbol, candles)) return false;
+            if (!rsiOk) return false;
+
+            string tag = $"PATTERN_{pattern.Tag}_LONG";
+            OpenPosition(symbol, qty, close, TradeSide.Buy, false, tag);
+            LogMessage($"[PATTERN] {(intrabar ? "EARLY" : "CLOSE")} {symbol} bullish {pattern.Tag} score={pattern.Score} rsi={rsi:F0} vol={volOk}");
+            return true;
+        }
+
+        if (!_allowShorts) return false;
+        bool nearOrBelowVwap = vwapVal > 0 && close <= vwapVal + atr * 0.5m;
+        bool bearishTape = _spyBearish || _marketRegime == "SELL-OFF" || _marketRegime == "NORMAL";
+        bool shortRsiOk = rsi <= 56 || rsi < prevRsi;  // relaxed from 52
+        if (!nearOrBelowVwap && _marketRegime != "SELL-OFF") return false;
+        if (!bearishTape || !shortRsiOk) return false;
+
+        string shortTag = $"PATTERN_{pattern.Tag}_SHORT";
+        OpenPosition(symbol, qty, close, TradeSide.Sell, true, shortTag);
+        LogMessage($"[PATTERN] {(intrabar ? "EARLY" : "CLOSE")} {symbol} bearish {pattern.Tag} score={pattern.Score} rsi={rsi:F0} vol={volOk}");
+        return true;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  STRATEGY 9 — MICRO PULLBACK (1-2 bar dip after impulse)
+    //  Catches entries BEFORE the breakout is confirmed — this is
+    //  the "enter early" strategy that addresses the core timing problem.
+    // ══════════════════════════════════════════════════════════
+
+    private bool TryMicroPullbackStrategy(string symbol, List<Candle> candles)
+    {
+        if (candles.Count < 15) return false;
+        if (!_indicatorCache.TryGetValue(symbol, out var ind)) return false;
+
+        decimal close = candles.Last().Close;
+        decimal atr = ind.Atr14;
+        double rsi = ind.Rsi14;
+        if (close <= 0 || atr <= 0) return false;
+        decimal atrPct = atr / close;
+        if (atrPct < MIN_ATR_PCT || (MAX_ATR_PCT > 0 && atrPct > MAX_ATR_PCT)) return false;
+
+        _vwap.TryGetValue(symbol, out decimal vwapVal);
+        var last = candles[^1];
+        var prev = candles[^2];
+
+        // ── LONG micro-pullback ──
+        // Look for: strong impulse bar(s) up, then 1-2 small pullback bars, 
+        // then current bar reclaims and closes in upper 60% of its range.
+        // This catches the move 1-2 bars BEFORE momentum/ORB would trigger.
+        if (!_spyOpenBearish && _marketRegime != "SELL-OFF")
+        {
+            // Find impulse: look back 3-6 bars for a strong bullish candle
+            int impulseIdx = -1;
+            for (int i = candles.Count - 4; i >= Math.Max(0, candles.Count - 7); i--)
+            {
+                var c = candles[i];
+                decimal body = c.Close - c.Open;
+                decimal range = c.High - c.Low;
+                if (body > atr * 0.6m && range > 0 && body / range >= 0.55m && c.Volume > 0)
+                {
+                    // Confirm it was a real impulse — volume above avg
+                    double avgVol = candles.Skip(Math.Max(0, i - 10)).Take(10).Average(x => (double)x.Volume);
+                    if (c.Volume >= avgVol * 1.2)
+                    { impulseIdx = i; break; }
+                }
+            }
+
+            if (impulseIdx >= 0)
+            {
+                var impulse = candles[impulseIdx];
+                // Bars between impulse and current should be small pullbacks
+                bool validPullback = true;
+                decimal pullbackLow = decimal.MaxValue;
+                for (int i = impulseIdx + 1; i < candles.Count - 1; i++)
+                {
+                    var pb = candles[i];
+                    decimal pbBody = Math.Abs(pb.Close - pb.Open);
+                    if (pbBody > Body(impulse) * 0.70m) { validPullback = false; break; }
+                    pullbackLow = Math.Min(pullbackLow, pb.Low);
+                }
+
+                // Pullback should not retrace more than 60% of impulse body
+                decimal impulseBody = impulse.Close - impulse.Open;
+                decimal retracement = impulse.Close - pullbackLow;
+                bool shallowPullback = impulseBody > 0 && retracement <= impulseBody * 0.60m;
+
+                // Current bar must show reclaim: close in upper 60% of its range
+                decimal lastRange = last.High - last.Low;
+                decimal closePos = lastRange > 0 ? (last.Close - last.Low) / lastRange : 0.5m;
+                bool reclaimBar = closePos >= 0.60m && last.Close > last.Open;
+
+                if (validPullback && shallowPullback && reclaimBar && rsi >= 48)
+                {
+                    bool aboveVwap = vwapVal <= 0 || close >= vwapVal * 0.998m;
+                    if (aboveVwap || CheckStrongRelativeStrength(symbol, candles))
+                    {
+                        decimal stopDistance = Math.Max(Math.Max(close - pullbackLow, atr * 1.5m), MIN_STOP_DISTANCE);
+                        int qty = CalcQty(close, stopDistance);
+                        if (qty > 0)
+                        {
+                            OpenPosition(symbol, qty, close, TradeSide.Buy, false, "MICRO_PB_LONG");
+                            LogMessage($"[MICRO PB] {symbol} LONG impulse@{impulse.Close:F2} pullback-low={pullbackLow:F2} reclaim@{close:F2}");
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── SHORT micro-pullback ──
+        if (_allowShorts && (_marketRegime == "SELL-OFF" || _marketRegime == "NORMAL" || _spyBearish))
+        {
+            int impulseIdx = -1;
+            for (int i = candles.Count - 4; i >= Math.Max(0, candles.Count - 7); i--)
+            {
+                var c = candles[i];
+                decimal body = c.Open - c.Close;
+                decimal range = c.High - c.Low;
+                if (body > atr * 0.6m && range > 0 && body / range >= 0.55m)
+                {
+                    double avgVol = candles.Skip(Math.Max(0, i - 10)).Take(10).Average(x => (double)x.Volume);
+                    if (c.Volume >= avgVol * 1.2)
+                    { impulseIdx = i; break; }
+                }
+            }
+
+            if (impulseIdx >= 0)
+            {
+                var impulse = candles[impulseIdx];
+                bool validPullback = true;
+                decimal pullbackHigh = decimal.MinValue;
+                for (int i = impulseIdx + 1; i < candles.Count - 1; i++)
+                {
+                    var pb = candles[i];
+                    decimal pbBody = Math.Abs(pb.Close - pb.Open);
+                    if (pbBody > Body(impulse) * 0.70m) { validPullback = false; break; }
+                    pullbackHigh = Math.Max(pullbackHigh, pb.High);
+                }
+
+                decimal impulseBody = impulse.Open - impulse.Close;
+                decimal retracement = pullbackHigh - impulse.Close;
+                bool shallowPullback = impulseBody > 0 && retracement <= impulseBody * 0.60m;
+
+                decimal lastRange = last.High - last.Low;
+                decimal closePos = lastRange > 0 ? (last.Close - last.Low) / lastRange : 0.5m;
+                bool rejectBar = closePos <= 0.40m && last.Close < last.Open;
+
+                if (validPullback && shallowPullback && rejectBar && rsi <= 52)
+                {
+                    bool belowVwap = vwapVal > 0 && close <= vwapVal * 1.002m;
+                    if (belowVwap || _marketRegime == "SELL-OFF")
+                    {
+                        decimal stopDistance = Math.Max(Math.Max(pullbackHigh - close, atr * 1.5m), MIN_STOP_DISTANCE);
+                        int qty = CalcQty(close, stopDistance);
+                        if (qty > 0)
+                        {
+                            OpenPosition(symbol, qty, close, TradeSide.Sell, true, "MICRO_PB_SHORT");
+                            LogMessage($"[MICRO PB] {symbol} SHORT impulse@{impulse.Close:F2} pullback-high={pullbackHigh:F2} reject@{close:F2}");
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  COMPREHENSIVE PATTERN DETECTION
+    //  Detects 14 candlestick patterns with context-aware scoring.
+    //  Scores are boosted when patterns appear at key levels (VWAP, S/R)
+    //  and when volume confirms. This is the main "enter early" engine.
+    // ══════════════════════════════════════════════════════════
+
+    private PatternSignal DetectBestPattern(List<Candle> candles)
+    {
+        var none = new PatternSignal();
+        if (candles == null || candles.Count < 3) return none;
+
+        var patterns = new List<PatternSignal>();
+        var last = candles[^1];
+        var prev = candles[^2];
+        decimal atr = SafeATR(candles, 14);
+        decimal tol = Math.Max(last.Close * 0.0020m, atr * 0.18m);
+
+        bool prevBear = prev.Close < prev.Open;
+        bool prevBull = prev.Close > prev.Open;
+        bool lastBull = last.Close > last.Open;
+        bool lastBear = last.Close < last.Open;
+        decimal prevBodyLow = Math.Min(prev.Open, prev.Close);
+        decimal prevBodyHigh = Math.Max(prev.Open, prev.Close);
+        decimal lastBodyLow = Math.Min(last.Open, last.Close);
+        decimal lastBodyHigh = Math.Max(last.Open, last.Close);
+        decimal lastBody = Body(last);
+        decimal prevBody = Body(prev);
+
+        // Context bonus: patterns at key levels are much more reliable
+        int contextBonus = 0;
+        _vwap.TryGetValue(candles[^1].Close > 0 ? "" : "", out _); // dummy to get symbol - we compute below
+        bool volumeConfirm = candles.Count >= 6 && HasFastVolumeSurge(candles, 1.20m);
+        if (volumeConfirm) contextBonus += 8;
+
+        // Check if recent bars show a preceding trend (patterns are only valid after a move)
+        decimal move5 = candles.Count >= 6 ? candles[^1].Close - candles[^6].Close : 0m;
+        bool hadDownMove = move5 < -atr * 0.5m;
+        bool hadUpMove = move5 > atr * 0.5m;
+
+        // ── 1. BULLISH ENGULFING ──
+        // Previous bar bearish, current bar's body fully engulfs previous body, high volume
+        if (prevBear && lastBull && lastBodyLow <= prevBodyLow && lastBodyHigh >= prevBodyHigh
+            && lastBody >= prevBody * 0.90m)  // body should be meaningful
+        {
+            int score = 62 + contextBonus;
+            if (hadDownMove) score += 6;  // more reliable after a down move
+            if (lastBody > prevBody * 1.5m) score += 4;  // strong engulfing
+            patterns.Add(new PatternSignal { Tag = "BULL_ENGULFING", Bullish = true, Score = score, Reason = "bullish engulfing" });
+        }
+
+        // ── 2. BEARISH ENGULFING ──
+        if (prevBull && lastBear && lastBodyHigh >= prevBodyHigh && lastBodyLow <= prevBodyLow
+            && lastBody >= prevBody * 0.90m)
+        {
+            int score = 62 + contextBonus;
+            if (hadUpMove) score += 6;
+            if (lastBody > prevBody * 1.5m) score += 4;
+            patterns.Add(new PatternSignal { Tag = "BEAR_ENGULFING", Bullish = false, Score = score, Reason = "bearish engulfing" });
+        }
+
+        // ── 3. HAMMER (bullish reversal single bar) ──
+        // Small body at top, long lower wick >= 2x body, tiny upper wick
+        if (lastBody > 0 && LowerWick(last) >= lastBody * 2.0m && UpperWick(last) <= lastBody * 0.60m)
+        {
+            int score = 55 + contextBonus;
+            if (hadDownMove) score += 8;  // hammer after a drop is a strong signal
+            if (lastBull) score += 3;     // green hammer slightly better
+            patterns.Add(new PatternSignal { Tag = "HAMMER", Bullish = true, Score = score, Reason = "hammer" });
+        }
+
+        // ── 4. SHOOTING STAR (bearish reversal single bar) ──
+        if (lastBody > 0 && UpperWick(last) >= lastBody * 2.0m && LowerWick(last) <= lastBody * 0.60m)
+        {
+            int score = 55 + contextBonus;
+            if (hadUpMove) score += 8;
+            if (lastBear) score += 3;
+            patterns.Add(new PatternSignal { Tag = "SHOOTING_STAR", Bullish = false, Score = score, Reason = "shooting star" });
+        }
+
+        // ── 5. INVERTED HAMMER (bullish, after down move) ──
+        // Long upper wick, small body at bottom — buyers tried to push up
+        if (lastBody > 0 && UpperWick(last) >= lastBody * 2.0m && LowerWick(last) <= lastBody * 0.50m
+            && hadDownMove)
+        {
+            int score = 52 + contextBonus;
+            if (lastBull) score += 3;
+            patterns.Add(new PatternSignal { Tag = "INV_HAMMER", Bullish = true, Score = score, Reason = "inverted hammer" });
+        }
+
+        // ── 6. HANGING MAN (bearish, after up move) ──
+        // Long lower wick, small body at top — same shape as hammer but context differs
+        if (lastBody > 0 && LowerWick(last) >= lastBody * 2.0m && UpperWick(last) <= lastBody * 0.50m
+            && hadUpMove)
+        {
+            int score = 52 + contextBonus;
+            if (lastBear) score += 3;
+            patterns.Add(new PatternSignal { Tag = "HANGING_MAN", Bullish = false, Score = score, Reason = "hanging man" });
+        }
+
+        // ── 7. DOJI (indecision — use as confirmation with context) ──
+        if (lastBody > 0 && lastBody <= (last.High - last.Low) * 0.10m && (last.High - last.Low) >= atr * 0.3m)
+        {
+            // Doji after a move signals reversal
+            if (hadDownMove && LowerWick(last) > UpperWick(last))
+                patterns.Add(new PatternSignal { Tag = "DRAGONFLY_DOJI", Bullish = true, Score = 50 + contextBonus, Reason = "dragonfly doji" });
+            if (hadUpMove && UpperWick(last) > LowerWick(last))
+                patterns.Add(new PatternSignal { Tag = "GRAVESTONE_DOJI", Bullish = false, Score = 50 + contextBonus, Reason = "gravestone doji" });
+        }
+
+        // ── 8. PIERCING LINE (bullish 2-bar) ──
+        // Previous bearish, current opens below prev low, closes above prev midpoint
+        if (prevBear && lastBull && last.Open <= prev.Low && last.Close > (prev.Open + prev.Close) / 2m
+            && last.Close < prev.Open)
+        {
+            int score = 60 + contextBonus;
+            if (hadDownMove) score += 5;
+            patterns.Add(new PatternSignal { Tag = "PIERCING_LINE", Bullish = true, Score = score, Reason = "piercing line" });
+        }
+
+        // ── 9. DARK CLOUD COVER (bearish 2-bar) ──
+        // Previous bullish, current opens above prev high, closes below prev midpoint
+        if (prevBull && lastBear && last.Open >= prev.High && last.Close < (prev.Open + prev.Close) / 2m
+            && last.Close > prev.Open)
+        {
+            int score = 60 + contextBonus;
+            if (hadUpMove) score += 5;
+            patterns.Add(new PatternSignal { Tag = "DARK_CLOUD", Bullish = false, Score = score, Reason = "dark cloud cover" });
+        }
+
+        // ── 10. TWEEZER BOTTOM / TOP ──
+        if (Math.Abs(last.Low - prev.Low) <= tol && lastBull && prevBear)
+        {
+            int score = 56 + contextBonus;
+            if (hadDownMove) score += 5;
+            patterns.Add(new PatternSignal { Tag = "TWEEZER_BOTTOM", Bullish = true, Score = score, Reason = "tweezer bottom" });
+        }
+        if (Math.Abs(last.High - prev.High) <= tol && lastBear && prevBull)
+        {
+            int score = 56 + contextBonus;
+            if (hadUpMove) score += 5;
+            patterns.Add(new PatternSignal { Tag = "TWEEZER_TOP", Bullish = false, Score = score, Reason = "tweezer top" });
+        }
+
+        // ── 3-bar patterns ──
+        if (candles.Count >= 3)
+        {
+            var a = candles[^3];
+            var b = candles[^2];
+            var c = candles[^1];
+            decimal aBody = Body(a);
+            decimal bBody = Body(b);
+            decimal cBody = Body(c);
+            decimal aMid = (a.Open + a.Close) / 2m;
+
+            // ── 11. MORNING STAR ──
+            bool morningStar = a.Close < a.Open                        // first bar bearish
+                             && bBody <= Math.Max(aBody, cBody) * 0.50m // middle bar small (indecision)
+                             && c.Close > c.Open                        // third bar bullish
+                             && c.Close >= aMid;                        // closes above first bar midpoint
+            if (morningStar)
+            {
+                int score = 68 + contextBonus;
+                if (hadDownMove) score += 5;
+                patterns.Add(new PatternSignal { Tag = "MORNING_STAR", Bullish = true, Score = score, Reason = "morning star" });
+            }
+
+            // ── 12. EVENING STAR ──
+            bool eveningStar = a.Close > a.Open
+                             && bBody <= Math.Max(aBody, cBody) * 0.50m
+                             && c.Close < c.Open
+                             && c.Close <= aMid;
+            if (eveningStar)
+            {
+                int score = 68 + contextBonus;
+                if (hadUpMove) score += 5;
+                patterns.Add(new PatternSignal { Tag = "EVENING_STAR", Bullish = false, Score = score, Reason = "evening star" });
+            }
+
+            // ── 13. BULLISH ABANDONED BABY (gapped morning star) ──
+            if (a.Close < a.Open && b.High < Math.Min(a.Close, a.Open)
+                && c.Close > c.Open && c.Low > Math.Max(b.Open, b.Close))
+            {
+                patterns.Add(new PatternSignal { Tag = "BULL_ABANDONED_BABY", Bullish = true, Score = 75 + contextBonus, Reason = "bullish abandoned baby" });
+            }
+
+            // ── 14. BEARISH ABANDONED BABY ──
+            if (a.Close > a.Open && b.Low > Math.Max(a.Close, a.Open)
+                && c.Close < c.Open && c.High < Math.Min(b.Open, b.Close))
+            {
+                patterns.Add(new PatternSignal { Tag = "BEAR_ABANDONED_BABY", Bullish = false, Score = 75 + contextBonus, Reason = "bearish abandoned baby" });
+            }
+
+            // ── 15. THREE INSIDE UP (harami confirmation) ──
+            // Bar A bearish, Bar B inside A (harami), Bar C closes above A's open
+            bool threeInsideUp = a.Close < a.Open
+                               && bBody < aBody
+                               && Math.Min(b.Open, b.Close) >= Math.Min(a.Open, a.Close)
+                               && Math.Max(b.Open, b.Close) <= Math.Max(a.Open, a.Close)
+                               && c.Close > c.Open && c.Close > a.Open;
+            if (threeInsideUp)
+            {
+                int score = 65 + contextBonus;
+                if (hadDownMove) score += 5;
+                patterns.Add(new PatternSignal { Tag = "THREE_INSIDE_UP", Bullish = true, Score = score, Reason = "three inside up" });
+            }
+
+            // ── 16. THREE INSIDE DOWN ──
+            bool threeInsideDown = a.Close > a.Open
+                                 && bBody < aBody
+                                 && Math.Min(b.Open, b.Close) >= Math.Min(a.Open, a.Close)
+                                 && Math.Max(b.Open, b.Close) <= Math.Max(a.Open, a.Close)
+                                 && c.Close < c.Open && c.Close < a.Open;
+            if (threeInsideDown)
+            {
+                int score = 65 + contextBonus;
+                if (hadUpMove) score += 5;
+                patterns.Add(new PatternSignal { Tag = "THREE_INSIDE_DOWN", Bullish = false, Score = score, Reason = "three inside down" });
+            }
+        }
+
+        // ── 4-bar patterns (soldiers/crows) ──
+        if (candles.Count >= 4)
+        {
+            var x = candles[^3];
+            var y = candles[^2];
+            var z = candles[^1];
+            bool soldiers = x.Close > x.Open && y.Close > y.Open && z.Close > z.Open
+                            && y.Close > x.Close && z.Close > y.Close
+                            && y.Open >= Math.Min(x.Open, x.Close) // each opens within prior body
+                            && z.Open >= Math.Min(y.Open, y.Close)
+                            && LowerWick(y) <= Body(y) && LowerWick(z) <= Body(z);
+            bool crows = x.Close < x.Open && y.Close < y.Open && z.Close < z.Open
+                         && y.Close < x.Close && z.Close < y.Close
+                         && y.Open <= Math.Max(x.Open, x.Close)
+                         && z.Open <= Math.Max(y.Open, y.Close)
+                         && UpperWick(y) <= Body(y) && UpperWick(z) <= Body(z);
+            if (soldiers)
+                patterns.Add(new PatternSignal { Tag = "THREE_WHITE_SOLDIERS", Bullish = true, Score = 74 + contextBonus, Reason = "three white soldiers" });
+            if (crows)
+                patterns.Add(new PatternSignal { Tag = "THREE_BLACK_CROWS", Bullish = false, Score = 74 + contextBonus, Reason = "three black crows" });
+        }
+
+        // ── HEAD AND SHOULDERS ──
+        var hs = DetectHeadAndShoulders(candles, atr);
+        if (hs.Score > 0) patterns.Add(hs);
+
+        // ── DOUBLE TOP / DOUBLE BOTTOM (15-bar window) ──
+        var dbl = DetectDoubleTopBottom(candles, atr);
+        if (dbl.Score > 0) patterns.Add(dbl);
+
+        return patterns.OrderByDescending(p => p.Score).FirstOrDefault() ?? none;
+    }
+
+    private PatternSignal DetectHeadAndShoulders(List<Candle> candles, decimal atr)
+    {
+        var none = new PatternSignal();
+        if (candles == null || candles.Count < 11 || atr <= 0) return none;
+
+        // Use a wider window (11 bars) for more reliable detection
+        var w = candles.TakeLast(11).ToList();
+        var highs = new List<int>();
+        var lows = new List<int>();
+        for (int i = 1; i < w.Count - 1; i++)
+        {
+            if (w[i].High > w[i - 1].High && w[i].High > w[i + 1].High) highs.Add(i);
+            if (w[i].Low < w[i - 1].Low && w[i].Low < w[i + 1].Low) lows.Add(i);
+        }
+
+        if (highs.Count >= 3)
+        {
+            var h = highs.TakeLast(3).ToList();
+            decimal ls = w[h[0]].High;
+            decimal head = w[h[1]].High;
+            decimal rs = w[h[2]].High;
+            decimal shoulderDiff = Math.Abs(ls - rs);
+            decimal neckline = Math.Min(
+                w.Skip(h[0]).Take(Math.Max(1, h[1] - h[0] + 1)).Min(c => c.Low),
+                w.Skip(h[1]).Take(Math.Max(1, h[2] - h[1] + 1)).Min(c => c.Low));
+            if (head > ls + atr * 0.30m && head > rs + atr * 0.30m
+                && shoulderDiff <= atr * 0.50m && w.Last().Close < neckline)
+                return new PatternSignal { Tag = "HEAD_SHOULDERS", Bullish = false, Score = 72, Reason = "head and shoulders neckline break" };
+        }
+
+        if (lows.Count >= 3)
+        {
+            var l = lows.TakeLast(3).ToList();
+            decimal ls = w[l[0]].Low;
+            decimal head = w[l[1]].Low;
+            decimal rs = w[l[2]].Low;
+            decimal shoulderDiff = Math.Abs(ls - rs);
+            decimal neckline = Math.Max(
+                w.Skip(l[0]).Take(Math.Max(1, l[1] - l[0] + 1)).Max(c => c.High),
+                w.Skip(l[1]).Take(Math.Max(1, l[2] - l[1] + 1)).Max(c => c.High));
+            if (head < ls - atr * 0.30m && head < rs - atr * 0.30m
+                && shoulderDiff <= atr * 0.50m && w.Last().Close > neckline)
+                return new PatternSignal { Tag = "INV_HEAD_SHOULDERS", Bullish = true, Score = 72, Reason = "inverse head and shoulders neckline break" };
+        }
+
+        return none;
+    }
+
+    private PatternSignal DetectDoubleTopBottom(List<Candle> candles, decimal atr)
+    {
+        var none = new PatternSignal();
+        if (candles == null || candles.Count < 15 || atr <= 0) return none;
+
+        var w = candles.TakeLast(15).ToList();
+
+        // Double Bottom: two lows within tolerance, with a higher bar between them
+        decimal low1 = decimal.MaxValue, low2 = decimal.MaxValue;
+        int low1Idx = -1, low2Idx = -1;
+
+        // Find first low in first half
+        for (int i = 1; i < 8; i++)
+            if (w[i].Low < low1) { low1 = w[i].Low; low1Idx = i; }
+        // Find second low in second half
+        for (int i = 8; i < w.Count - 1; i++)
+            if (w[i].Low < low2) { low2 = w[i].Low; low2Idx = i; }
+
+        if (low1Idx > 0 && low2Idx > 0 && Math.Abs(low1 - low2) <= atr * 0.40m)
+        {
+            // Must have a meaningful bounce between the two lows
+            decimal peakBetween = w.Skip(low1Idx).Take(low2Idx - low1Idx + 1).Max(c => c.High);
+            decimal bounceSize = peakBetween - Math.Max(low1, low2);
+            if (bounceSize >= atr * 0.5m && w.Last().Close > peakBetween * 0.995m)
+                return new PatternSignal { Tag = "DOUBLE_BOTTOM", Bullish = true, Score = 70, Reason = "double bottom neckline break" };
+        }
+
+        // Double Top: two highs within tolerance
+        decimal high1 = decimal.MinValue, high2 = decimal.MinValue;
+        int high1Idx = -1, high2Idx = -1;
+
+        for (int i = 1; i < 8; i++)
+            if (w[i].High > high1) { high1 = w[i].High; high1Idx = i; }
+        for (int i = 8; i < w.Count - 1; i++)
+            if (w[i].High > high2) { high2 = w[i].High; high2Idx = i; }
+
+        if (high1Idx > 0 && high2Idx > 0 && Math.Abs(high1 - high2) <= atr * 0.40m)
+        {
+            decimal troughBetween = w.Skip(high1Idx).Take(high2Idx - high1Idx + 1).Min(c => c.Low);
+            decimal dip = Math.Min(high1, high2) - troughBetween;
+            if (dip >= atr * 0.5m && w.Last().Close < troughBetween * 1.005m)
+                return new PatternSignal { Tag = "DOUBLE_TOP", Bullish = false, Score = 70, Reason = "double top neckline break" };
+        }
+
+        return none;
+    }
+
+    private bool HasFastVolumeSurge(List<Candle> candles, decimal mult = 1.30m)
+    {
+        if (candles == null || candles.Count < 6) return false;
+        var recent = candles.TakeLast(6).ToList();
+        double baseline = recent.Take(5).Average(c => (double)c.Volume);
+        return baseline > 0 && recent.Last().Volume >= baseline * (double)mult;
+    }
+
+    private decimal Body(Candle c) => Math.Abs(c.Close - c.Open);
+    private decimal UpperWick(Candle c) => c.High - Math.Max(c.Open, c.Close);
+    private decimal LowerWick(Candle c) => Math.Min(c.Open, c.Close) - c.Low;
+
     // ══════════════════════════════════════════════════════════
     //  SETUP QUALITY SCORER
     // ══════════════════════════════════════════════════════════
@@ -1456,7 +2107,7 @@ public class SimulatedBroker
             "TRENDING" => 20,
             "NORMAL" => 12,
             "CHOPPY" => 4,
-            "SELL-OFF" => 0,
+            "SELL-OFF" => 6,  // was 0 — shorts and relative-strength longs can work
             _ => 8
         };
 
@@ -1465,6 +2116,12 @@ public class SimulatedBroker
             if (Math.Abs(lastClose - vwapNow) <= ind.Atr14 * 1.5m)
                 score += 10;
         }
+
+        if (HasFastVolumeSurge(candles)) score += 10;
+
+        var pattern = DetectBestPattern(candles);
+        if (pattern.Score > 0)
+            score += Math.Min(30, Math.Max(10, pattern.Score / 3 + 5));
 
         return Math.Clamp(score, 0, 100);
     }
@@ -1478,13 +2135,31 @@ public class SimulatedBroker
     {
         if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(strategyTag)) return;
 
-        // Invert every entry while preserving the existing signal-generation logic.
-        // A long signal becomes a short entry, and a short signal becomes a long entry.
-        side = side == TradeSide.Buy ? TradeSide.Sell : TradeSide.Buy;
-        isShort = !isShort;
+        // ── BUG FIX: validate side/isShort/tag consistency ──
+        // The trade log showed LONG trades tagged as GAP_GO_SHORT etc.
+        // Force consistency: if tag says SHORT, side must be Sell & isShort=true
+        if (strategyTag.EndsWith("_SHORT", StringComparison.OrdinalIgnoreCase))
+        {
+            if (side != TradeSide.Sell || !isShort)
+            {
+                LogMessage($"[BUG GUARD] {strategyTag} {symbol} tag says SHORT but side={side} isShort={isShort} — fixing");
+                side = TradeSide.Sell;
+                isShort = true;
+            }
+        }
+        else if (strategyTag.EndsWith("_LONG", StringComparison.OrdinalIgnoreCase))
+        {
+            if (side != TradeSide.Buy || isShort)
+            {
+                LogMessage($"[BUG GUARD] {strategyTag} {symbol} tag says LONG but side={side} isShort={isShort} — fixing");
+                side = TradeSide.Buy;
+                isShort = false;
+            }
+        }
 
         if (isShort && !_allowShorts) return;
         if (qty <= 0 || qty > MAX_QTY_SANITY) return;
+        if (_pendingEntrySymbols.ContainsKey(symbol)) return;
 
         if (symbol != "SPY" && symbol != "QQQ" && symbol != "IWM")
         {
@@ -1550,11 +2225,6 @@ public class SimulatedBroker
             }
         }
 
-        if (_pendingStrategyTag == null)
-            _pendingStrategyTag = new ConcurrentDictionary<string, string>();
-        _pendingStrategyTag[symbol] = strategyTag;
-        _pendingInitialRisk[symbol] = stopDist;
-
         if (!isShort && _latestTick.TryGetValue("VIX", out decimal vixLevel) && vixLevel > 0)
         {
             if (vixLevel >= VIX_NO_LONG_THRESHOLD)
@@ -1569,6 +2239,15 @@ public class SimulatedBroker
             }
         }
 
+        // ── ALL GUARDS PASSED — now commit to the entry ──
+        // Tag + risk are set AFTER all guards so they can't be polluted
+        // by a blocked attempt that returns early.
+        if (_pendingStrategyTag == null)
+            _pendingStrategyTag = new ConcurrentDictionary<string, string>();
+        _pendingStrategyTag[symbol] = strategyTag;
+        _pendingInitialRisk[symbol] = stopDist;
+
+        _pendingEntrySymbols[symbol] = true;
         Interlocked.Increment(ref _pendingEntryCount);
         lock (_lock)
         {
@@ -1829,6 +2508,7 @@ public class SimulatedBroker
             bool isEntry = !_positions.ContainsKey(order.Symbol);
             if (isEntry) Interlocked.Decrement(ref _pendingEntryCount);
         }
+        _pendingEntrySymbols.TryRemove(order.Symbol, out _);
         LogMessage($"[REJECTED] orderId={orderId} {order.Side} {order.Symbol} x{order.Qty} — slot freed.");
         _ = SendEmail($"⚠️ Order Rejected: {order.Symbol}",
             $"IBKR rejected orderId={orderId} {order.Side} {order.Symbol} x{order.Qty}.Check errors.log.");
@@ -1849,6 +2529,7 @@ public class SimulatedBroker
             if (isLongEntry || isShortEntry)
             {
                 Interlocked.Decrement(ref _pendingEntryCount);
+                _pendingEntrySymbols.TryRemove(order.Symbol, out _);
 
                 string tag = "";
                 decimal initialRisk = 0m;
@@ -2782,6 +3463,12 @@ public class SimulatedBroker
             STRATEGY_MOMENTUM_ENABLED = GetB("STRATEGY_MOMENTUM", STRATEGY_MOMENTUM_ENABLED);
             STRATEGY_EMA_POCKET_ENABLED = GetB("STRATEGY_EMA_POCKET", STRATEGY_EMA_POCKET_ENABLED);
             STRATEGY_OUTSIDE_CANDLE_ENABLED = GetB("STRATEGY_OUTSIDE_CANDLE", STRATEGY_OUTSIDE_CANDLE_ENABLED);
+            STRATEGY_CANDLE_PATTERNS_ENABLED = GetB("STRATEGY_CANDLE_PATTERNS", STRATEGY_CANDLE_PATTERNS_ENABLED);
+            STRATEGY_MICRO_PULLBACK_ENABLED = GetB("STRATEGY_MICRO_PULLBACK", STRATEGY_MICRO_PULLBACK_ENABLED);
+            EARLY_PATTERN_ENTRY_ENABLED = GetB("EARLY_PATTERN_ENTRY", EARLY_PATTERN_ENTRY_ENABLED);
+            PATTERN_MIN_SCORE = GetI("PATTERN_MIN_SCORE", PATTERN_MIN_SCORE);
+            INTRABAR_SIGNAL_COOLDOWN_SECONDS = GetI("INTRABAR_SIGNAL_COOLDOWN_SECONDS", INTRABAR_SIGNAL_COOLDOWN_SECONDS);
+            FAST_VOL_MULT = GetD("FAST_VOL_MULT", FAST_VOL_MULT);
             DATA_LINES_PER_SYMBOL = GetI("DATA_LINES_PER_SYMBOL", DATA_LINES_PER_SYMBOL);
             MAX_MARKET_DATA_LINES = GetI("MAX_MARKET_DATA_LINES", MAX_MARKET_DATA_LINES);
             VIX_REDUCE_THRESHOLD = GetD("VIX_REDUCE_THRESHOLD", VIX_REDUCE_THRESHOLD);
@@ -2885,6 +3572,12 @@ public class SimulatedBroker
             $"\"STRATEGY_MOMENTUM\":{(STRATEGY_MOMENTUM_ENABLED ? "true" : "false")}",
             $"\"STRATEGY_EMA_POCKET\":{(STRATEGY_EMA_POCKET_ENABLED ? "true" : "false")}",
             $"\"STRATEGY_OUTSIDE_CANDLE\":{(STRATEGY_OUTSIDE_CANDLE_ENABLED ? "true" : "false")}",
+            $"\"STRATEGY_CANDLE_PATTERNS\":{(STRATEGY_CANDLE_PATTERNS_ENABLED ? "true" : "false")}",
+            $"\"STRATEGY_MICRO_PULLBACK\":{(STRATEGY_MICRO_PULLBACK_ENABLED ? "true" : "false")}",
+            $"\"EARLY_PATTERN_ENTRY\":{(EARLY_PATTERN_ENTRY_ENABLED ? "true" : "false")}",
+            $"\"PATTERN_MIN_SCORE\":{PATTERN_MIN_SCORE}",
+            $"\"INTRABAR_SIGNAL_COOLDOWN_SECONDS\":{INTRABAR_SIGNAL_COOLDOWN_SECONDS}",
+            $"\"FAST_VOL_MULT\":{FAST_VOL_MULT:F2}",
             $"\"DATA_LINES_PER_SYMBOL\":{DATA_LINES_PER_SYMBOL}",
             $"\"MAX_MARKET_DATA_LINES\":{MAX_MARKET_DATA_LINES}",
             $"\"VIX_REDUCE_THRESHOLD\":{VIX_REDUCE_THRESHOLD:F1}",
@@ -2943,6 +3636,57 @@ public class SimulatedBroker
                 ctx.Response.StatusCode = 204;
                 ctx.Response.OutputStream.Close();
                 return;
+            }
+            else if (path == "/api/backtest/historical")
+            {
+                try
+                {
+                    var query = ctx.Request.QueryString;
+                    string fromStr = query["from"] ?? "";
+                    string toStr = query["to"] ?? "";
+
+                    List<TradeRecord> snapshot;
+                    lock (_allTrades) { snapshot = _allTrades.ToList(); }
+
+                    // Filter by date range if provided
+                    if (!string.IsNullOrEmpty(fromStr))
+                        snapshot = snapshot.Where(t => string.Compare(t.Date, fromStr, StringComparison.Ordinal) >= 0).ToList();
+                    if (!string.IsNullOrEmpty(toStr))
+                        snapshot = snapshot.Where(t => string.Compare(t.Date, toStr, StringComparison.Ordinal) <= 0).ToList();
+
+                    // Filter candle data to the same range for simulation
+                    var filteredCandles = new ConcurrentDictionary<string, List<Candle>>();
+                    DateTime fromDt = DateTime.TryParse(fromStr, out var fd) ? fd : DateTime.MinValue;
+                    DateTime toDt = DateTime.TryParse(toStr, out var td) ? td.AddDays(1) : DateTime.MaxValue;
+                    foreach (var kvp in _marketData)
+                    {
+                        List<Candle> filtered;
+                        lock (kvp.Value)
+                        {
+                            filtered = kvp.Value
+                                .Where(c => c.Time >= fromDt && c.Time < toDt)
+                                .ToList();
+                        }
+                        if (filtered.Count > 0)
+                            filteredCandles[kvp.Key] = filtered;
+                    }
+
+                    var filteredEquity = _lifetimeEquity
+                        .Where(e => string.Compare(e.Date, fromStr, StringComparison.Ordinal) >= 0
+                                 && string.Compare(e.Date, toStr, StringComparison.Ordinal) <= 0)
+                        .ToList();
+
+                    var report = BacktestEngine.Analyze(
+                        snapshot,
+                        filteredCandles,
+                        filteredEquity,
+                        TOTAL_BUDGET);
+                    json = JsonSerializer.Serialize(report);
+                }
+                catch (Exception ex)
+                {
+                    json = $"{{\"error\":\"{ex.Message.Replace("\"", "'")}\"}}";
+                }
             }
             else if (path == "/api/backtest")
             {
@@ -3059,6 +3803,12 @@ public class SimulatedBroker
                         STRATEGY_MOMENTUM_ENABLED = GetB("STRATEGY_MOMENTUM", STRATEGY_MOMENTUM_ENABLED);
                         STRATEGY_EMA_POCKET_ENABLED = GetB("STRATEGY_EMA_POCKET", STRATEGY_EMA_POCKET_ENABLED);
                         STRATEGY_OUTSIDE_CANDLE_ENABLED = GetB("STRATEGY_OUTSIDE_CANDLE", STRATEGY_OUTSIDE_CANDLE_ENABLED);
+                        STRATEGY_CANDLE_PATTERNS_ENABLED = GetB("STRATEGY_CANDLE_PATTERNS", STRATEGY_CANDLE_PATTERNS_ENABLED);
+                        STRATEGY_MICRO_PULLBACK_ENABLED = GetB("STRATEGY_MICRO_PULLBACK", STRATEGY_MICRO_PULLBACK_ENABLED);
+                        EARLY_PATTERN_ENTRY_ENABLED = GetB("EARLY_PATTERN_ENTRY", EARLY_PATTERN_ENTRY_ENABLED);
+                        PATTERN_MIN_SCORE = GetI("PATTERN_MIN_SCORE", PATTERN_MIN_SCORE);
+                        INTRABAR_SIGNAL_COOLDOWN_SECONDS = GetI("INTRABAR_SIGNAL_COOLDOWN_SECONDS", INTRABAR_SIGNAL_COOLDOWN_SECONDS);
+                        FAST_VOL_MULT = GetD("FAST_VOL_MULT", FAST_VOL_MULT);
                         DATA_LINES_PER_SYMBOL = GetI("DATA_LINES_PER_SYMBOL", DATA_LINES_PER_SYMBOL);
                         MAX_MARKET_DATA_LINES = GetI("MAX_MARKET_DATA_LINES", MAX_MARKET_DATA_LINES);
                         VIX_REDUCE_THRESHOLD = GetD("VIX_REDUCE_THRESHOLD", VIX_REDUCE_THRESHOLD);
@@ -3276,7 +4026,8 @@ public class SimulatedBroker
             foreach (var kv in _positions)
             {
                 var p = kv.Value;
-                decimal px = _latestTick.TryGetValue(p.Symbol, out var tp) ? tp : p.CurrentPrice;
+                var posQuote = GetDisplayQuote(p.Symbol, p.CurrentPrice > 0 ? p.CurrentPrice : p.AvgPrice);
+                decimal px = posQuote.price > 0 ? posQuote.price : p.CurrentPrice;
                 decimal unrl = p.UnrealizedPnL(px);
                 decimal pnlPt = p.AvgPrice > 0
                     ? (px - p.AvgPrice) / p.AvgPrice * (p.IsShort ? -1 : 1) * 100 : 0;
@@ -3313,10 +4064,12 @@ public class SimulatedBroker
                 _vwap.TryGetValue(sym, out decimal vwap);
                 _prevDayClose.TryGetValue(sym, out decimal prevClose);
                 decimal gapPct = prevClose > 0 ? (price - prevClose) / prevClose * 100 : 0;
-                _latestTick.TryGetValue(sym, out decimal livePx);
-                decimal chgPct = prevClose > 0 && livePx > 0
-                    ? (livePx - prevClose) / prevClose * 100 : gapPct;
-                if (price == 0m && livePx > 0) price = livePx;
+                var quote = GetDisplayQuote(sym, price);
+                decimal displayPrice = quote.price > 0 ? quote.price : price;
+                decimal chgPct = prevClose > 0 && displayPrice > 0
+                    ? (displayPrice - prevClose) / prevClose * 100 : gapPct;
+                if (price == 0m && displayPrice > 0) price = displayPrice;
+                else if (displayPrice > 0) price = displayPrice;
                 long volK = _dailyVolume.GetValueOrDefault(sym) / 1000;
                 bool abvVwap = vwap > 0 && price > vwap;
                 string trend = price > sma50 ? "UP" : "NEUT";
@@ -3351,7 +4104,9 @@ public class SimulatedBroker
 
                 if (!wfirst) wlArr.Append(",");
                 wfirst = false;
-                wlArr.Append($@"{{""s"":""{sym}"",""price"":{price:F2},""vwap"":{vwap:F2},""sma20"":{sma20:F2},""sma50"":{sma50:F2},""sma200"":{sma200:F2},""rsi"":{rsi:F1},""gap"":{gapPct:F2},""chg"":{chgPct:F2},""vol"":{volK},""atr"":{atrPct:F2},""orbHi"":{orbHi:F2},""orbLo"":{orbLo:F2},""pdHi"":{pdHi:F2},""pdLo"":{pdLo:F2},""macd"":{macdDir},""trend"":""{trend}"",""sig"":""{sig}"",""hot"":{(hot ? "true" : "false")},""abvVwap"":{(abvVwap ? "true" : "false")}}}");
+                string pxSrc = quote.source;
+                string ageJson = double.IsFinite(quote.ageSec) ? quote.ageSec.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) : "9999";
+                wlArr.Append($@"{{""s"":""{sym}"",""price"":{price:F2},""last"":{quote.last:F2},""bid"":{quote.bid:F2},""ask"":{quote.ask:F2},""pxSrc"":""{pxSrc}"",""ageSec"":{ageJson},""vwap"":{vwap:F2},""sma20"":{sma20:F2},""sma50"":{sma50:F2},""sma200"":{sma200:F2},""rsi"":{rsi:F1},""gap"":{gapPct:F2},""chg"":{chgPct:F2},""vol"":{volK},""atr"":{atrPct:F2},""orbHi"":{orbHi:F2},""orbLo"":{orbLo:F2},""pdHi"":{pdHi:F2},""pdLo"":{pdLo:F2},""macd"":{macdDir},""trend"":""{trend}"",""sig"":""{sig}"",""hot"":{(hot ? "true" : "false")},""abvVwap"":{(abvVwap ? "true" : "false")}}}");
             }
             wlArr.Append("]");
 

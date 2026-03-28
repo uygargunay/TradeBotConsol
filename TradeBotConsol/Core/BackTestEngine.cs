@@ -345,6 +345,12 @@ public static class BacktestEngine
     private const decimal HARD_STOP_ATR_MULT = 2.0m;
     private const decimal ATR_TRAIL_MULT = 2.0m;
     private const decimal TARGET_ATR_MULT = 2.4m;
+    private const decimal FIXED_PROFIT_TARGET_PCT = 0.0100m;
+    private const decimal FIXED_STOP_LOSS_PCT = 0.0100m;
+    private const decimal SCALP_PROFIT_TARGET_PCT = 0.0035m;
+    private const decimal SCALP_STOP_LOSS_PCT = 0.0025m;
+    private const int SCALP_MAX_HOLD_SECONDS = 900;
+    private const bool REVERSE_SIGNALS = false;
     private const decimal COMMISSION = 2.0m;  // $1 each side
     private const decimal ENTRY_SLIPPAGE_PCT = 0.0003m;
     private const decimal EXIT_SLIPPAGE_PCT = 0.0003m;
@@ -911,42 +917,31 @@ public static class BacktestEngine
                 if (etTime.Hour == 15 && etTime.Minute >= 25)
                 { exit = true; reason = "EOD"; }
 
-                // Hard stop (check candle high/low)
-                if (!exit && !pos.IsShort && candle.Low <= pos.HardStop)
-                { exit = true; exitPrice = pos.HardStop; reason = "STOP"; }
-                if (!exit && pos.IsShort && candle.High >= pos.HardStop)
-                { exit = true; exitPrice = pos.HardStop; reason = "STOP"; }
+                bool isScalp = (pos.Strategy ?? "").StartsWith("SCALP_", StringComparison.OrdinalIgnoreCase);
+                decimal profitPct = isScalp ? SCALP_PROFIT_TARGET_PCT : FIXED_PROFIT_TARGET_PCT;
+                decimal stopPct = isScalp ? SCALP_STOP_LOSS_PCT : FIXED_STOP_LOSS_PCT;
 
-                decimal oneR = Math.Max(pos.AtrAtEntry * HARD_STOP_ATR_MULT, 0.10m);
-
-                // Target
-                if (!exit && !pos.IsShort && candle.High >= pos.Target)
-                { exit = true; exitPrice = pos.Target; reason = "TARGET"; }
-                if (!exit && pos.IsShort && candle.Low <= pos.Target)
-                { exit = true; exitPrice = pos.Target; reason = "TARGET"; }
-
-                // Trail / breakeven protection (once min-hold passed)
                 if (!exit && (etTime - pos.EntryTime).TotalSeconds >= MIN_HOLD_SECONDS)
                 {
-                    if (!pos.IsShort)
-                    {
-                        pos.HighWater = Math.Max(pos.HighWater, candle.High);
-                        decimal trail = pos.HighWater - pos.AtrAtEntry * ATR_TRAIL_MULT;
-                        decimal breakEven = pos.HighWater >= pos.EntryPrice + oneR * BREAK_EVEN_TRIGGER_R ? pos.EntryPrice : decimal.MinValue;
-                        decimal activeStop = Math.Max(trail, breakEven);
-                        if (candle.Low <= activeStop && activeStop > pos.EntryPrice * 0.995m)
-                        { exit = true; exitPrice = activeStop; reason = activeStop == breakEven ? "BREAK_EVEN" : "TRAIL"; }
-                    }
-                    else
-                    {
-                        pos.LowWater = Math.Min(pos.LowWater, candle.Low);
-                        decimal trail = pos.LowWater + pos.AtrAtEntry * ATR_TRAIL_MULT;
-                        decimal breakEven = pos.LowWater <= pos.EntryPrice - oneR * BREAK_EVEN_TRIGGER_R ? pos.EntryPrice : decimal.MaxValue;
-                        decimal activeStop = Math.Min(trail, breakEven);
-                        if (candle.High >= activeStop && activeStop < pos.EntryPrice * 1.005m)
-                        { exit = true; exitPrice = activeStop; reason = activeStop == breakEven ? "BREAK_EVEN" : "TRAIL"; }
-                    }
-                    positions[symbol] = pos;
+                    decimal targetPx = pos.IsShort
+                        ? pos.EntryPrice * (1m - profitPct)
+                        : pos.EntryPrice * (1m + profitPct);
+                    decimal stopPx = pos.IsShort
+                        ? pos.EntryPrice * (1m + stopPct)
+                        : pos.EntryPrice * (1m - stopPct);
+
+                    if (!pos.IsShort && candle.High >= targetPx)
+                    { exit = true; exitPrice = targetPx; reason = isScalp ? "SCALP_TP" : "FIXED_TP"; }
+                    if (!exit && pos.IsShort && candle.Low <= targetPx)
+                    { exit = true; exitPrice = targetPx; reason = isScalp ? "SCALP_TP" : "FIXED_TP"; }
+
+                    if (!exit && !pos.IsShort && candle.Low <= stopPx)
+                    { exit = true; exitPrice = stopPx; reason = isScalp ? "SCALP_SL" : "FIXED_SL"; }
+                    if (!exit && pos.IsShort && candle.High >= stopPx)
+                    { exit = true; exitPrice = stopPx; reason = isScalp ? "SCALP_SL" : "FIXED_SL"; }
+
+                    if (!exit && isScalp && (etTime - pos.EntryTime).TotalSeconds >= SCALP_MAX_HOLD_SECONDS)
+                    { exit = true; exitPrice = candle.Close; reason = "SCALP_TIME_EXIT"; }
                 }
 
                 if (exit)
@@ -994,7 +989,7 @@ public static class BacktestEngine
             if (tradesPerDay.GetValueOrDefault(etTime.Date) >= MAX_TRADES_PER_DAY) continue;
             string tradeKey = symbol + "|" + etTime.Date.ToString("yyyy-MM-dd");
             if (tradedToday.Contains(tradeKey)) continue;
-            if (etTime.Hour < 10 || (etTime.Hour == 10 && etTime.Minute < 15)) continue;
+            if (etTime.Hour < 9 || (etTime.Hour == 9 && etTime.Minute < 35)) continue;
             if (etTime.Hour > 15 || (etTime.Hour == 15 && etTime.Minute >= 30)) continue;
             if (win.Count < 50) continue;
 
@@ -1040,6 +1035,67 @@ public static class BacktestEngine
             if (setupScore < 35) continue;
 
             BtPosition newPos = null;
+
+            // ── Candlestick pattern entry (runs FIRST — early signals) ──
+            if (newPos == null && win.Count >= 6)
+            {
+                var patternResult = DetectBtPattern(win, atr);
+                if (patternResult.score >= 55)
+                {
+                    if (patternResult.bullish && !blockLongs && rsi >= 44 && (vwap <= 0 || close >= vwap - atr * 0.5m) && volOk)
+                    {
+                        int qty = CalcQty(close, atr * HARD_STOP_ATR_MULT);
+                        if (qty > 0)
+                            newPos = new BtPosition { Symbol = symbol, IsShort = false, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = $"PATTERN_{patternResult.tag}_LONG", Regime = regime, HardStop = close - atr * HARD_STOP_ATR_MULT, Target = close + atr * TARGET_ATR_MULT, AtrAtEntry = atr, WorstPrice = close };
+                    }
+                    else if (!patternResult.bullish && rsi <= 56 && (vwap > 0 && close <= vwap + atr * 0.5m))
+                    {
+                        int qty = CalcQty(close, atr * HARD_STOP_ATR_MULT);
+                        if (qty > 0)
+                            newPos = new BtPosition { Symbol = symbol, IsShort = true, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = $"PATTERN_{patternResult.tag}_SHORT", Regime = regime, HardStop = close + atr * HARD_STOP_ATR_MULT, Target = close - atr * TARGET_ATR_MULT, AtrAtEntry = atr, WorstPrice = close };
+                    }
+                }
+            }
+
+            // ── Micro pullback (catches entry after impulse + shallow retrace) ──
+            if (newPos == null && win.Count >= 8 && !blockLongs)
+            {
+                bool foundImpulse = false;
+                decimal pullbackLow = decimal.MaxValue;
+                for (int lookback = win.Count - 4; lookback >= Math.Max(0, win.Count - 7); lookback--)
+                {
+                    var imp = win[lookback];
+                    decimal impBody = imp.Close - imp.Open;
+                    decimal impRange = imp.High - imp.Low;
+                    if (impBody > atr * 0.6m && impRange > 0 && impBody / impRange >= 0.55m)
+                    {
+                        bool pbValid = true;
+                        for (int j = lookback + 1; j < win.Count - 1; j++)
+                        {
+                            if (Math.Abs(win[j].Close - win[j].Open) > impBody * 0.70m) { pbValid = false; break; }
+                            pullbackLow = Math.Min(pullbackLow, win[j].Low);
+                        }
+                        decimal retrace = imp.Close - pullbackLow;
+                        if (pbValid && impBody > 0 && retrace <= impBody * 0.60m)
+                        {
+                            decimal lastRange = candle.High - candle.Low;
+                            decimal closePos = lastRange > 0 ? (candle.Close - candle.Low) / lastRange : 0.5m;
+                            if (closePos >= 0.60m && candle.Close > candle.Open && rsi >= 48)
+                            {
+                                foundImpulse = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (foundImpulse)
+                {
+                    decimal stopDist = Math.Max(Math.Max(close - pullbackLow, atr * 1.5m), 0.10m);
+                    int qty = CalcQty(close, stopDist);
+                    if (qty > 0)
+                        newPos = new BtPosition { Symbol = symbol, IsShort = false, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "MICRO_PB_LONG", Regime = regime, HardStop = close - stopDist, Target = close + atr * TARGET_ATR_MULT, AtrAtEntry = atr, WorstPrice = close };
+                }
+            }
 
             // ── ORB strategy ─────────────────────────────────────────────
             if (orbRanges.TryGetValue(symbol, out orb) && orb.IsSet && regime != "CHOPPY")
@@ -1155,6 +1211,9 @@ public static class BacktestEngine
 
             if (newPos != null)
             {
+                if (REVERSE_SIGNALS)
+                    newPos.IsShort = !newPos.IsShort;
+
                 decimal entrySlip = Math.Max(0.01m, close * ENTRY_SLIPPAGE_PCT);
                 newPos.EntryPrice = newPos.IsShort ? close - entrySlip : close + entrySlip;
                 newPos.HardStop = newPos.IsShort ? newPos.EntryPrice + atr * HARD_STOP_ATR_MULT : newPos.EntryPrice - atr * HARD_STOP_ATR_MULT;
@@ -1208,6 +1267,188 @@ public static class BacktestEngine
         if (range <= 0) return false;
         decimal closePos = (candle.Close - candle.Low) / range;
         return bullish ? closePos >= MIN_BREAKOUT_BODY_RATIO : closePos <= (1m - MIN_BREAKOUT_BODY_RATIO);
+    }
+
+    private static (int score, string tag, bool bullish) DetectBtPattern(IReadOnlyList<Candle> candles, decimal atr)
+    {
+        if (candles == null || candles.Count < 3 || atr <= 0) return (0, "", false);
+
+        var last = candles[^1];
+        var prev = candles[^2];
+        decimal tol = Math.Max(last.Close * 0.002m, atr * 0.18m);
+
+        decimal lastBody = Math.Abs(last.Close - last.Open);
+        decimal prevBody = Math.Abs(prev.Close - prev.Open);
+        bool prevBear = prev.Close < prev.Open;
+        bool prevBull = prev.Close > prev.Open;
+        bool lastBull = last.Close > last.Open;
+        bool lastBear = last.Close < last.Open;
+        decimal lw = Math.Min(last.Open, last.Close) - last.Low;
+        decimal uw = last.High - Math.Max(last.Open, last.Close);
+
+        // Context: preceding 5-bar move
+        decimal move5 = candles.Count >= 6 ? candles[^1].Close - candles[^6].Close : 0m;
+        bool hadDown = move5 < -atr * 0.5m;
+        bool hadUp = move5 > atr * 0.5m;
+
+        int bestScore = 0; string bestTag = ""; bool bestBullish = false;
+        void Check(int score, string tag, bool bullish)
+        { if (score > bestScore) { bestScore = score; bestTag = tag; bestBullish = bullish; } }
+
+        // ── 2-bar: Engulfing ──
+        decimal prevBL = Math.Min(prev.Open, prev.Close), prevBH = Math.Max(prev.Open, prev.Close);
+        decimal lastBL = Math.Min(last.Open, last.Close), lastBH = Math.Max(last.Open, last.Close);
+        if (prevBear && lastBull && lastBL <= prevBL && lastBH >= prevBH)
+            Check(62 + (hadDown ? 6 : 0), "BULL_ENGULFING", true);
+        if (prevBull && lastBear && lastBH >= prevBH && lastBL <= prevBL)
+            Check(62 + (hadUp ? 6 : 0), "BEAR_ENGULFING", false);
+
+        // ── 1-bar: Hammer / Shooting star ──
+        if (lastBody > 0 && lw >= lastBody * 2.0m && uw <= lastBody * 0.6m)
+            Check(55 + (hadDown ? 8 : 0), "HAMMER", true);
+        if (lastBody > 0 && uw >= lastBody * 2.0m && lw <= lastBody * 0.6m)
+            Check(55 + (hadUp ? 8 : 0), "SHOOTING_STAR", false);
+
+        // ── 1-bar: Inverted Hammer / Hanging Man ──
+        if (lastBody > 0 && uw >= lastBody * 2.0m && lw <= lastBody * 0.5m && hadDown)
+            Check(52 + (lastBull ? 3 : 0), "INV_HAMMER", true);
+        if (lastBody > 0 && lw >= lastBody * 2.0m && uw <= lastBody * 0.5m && hadUp)
+            Check(52 + (lastBear ? 3 : 0), "HANGING_MAN", false);
+
+        // ── 1-bar: Doji ──
+        if (lastBody > 0 && lastBody <= (last.High - last.Low) * 0.10m && (last.High - last.Low) >= atr * 0.3m)
+        {
+            if (hadDown && lw > uw) Check(50, "DRAGONFLY_DOJI", true);
+            if (hadUp && uw > lw) Check(50, "GRAVESTONE_DOJI", false);
+        }
+
+        // ── 2-bar: Piercing / Dark Cloud ──
+        if (prevBear && lastBull && last.Open <= prev.Low && last.Close > (prev.Open + prev.Close) / 2m)
+            Check(60 + (hadDown ? 5 : 0), "PIERCING_LINE", true);
+        if (prevBull && lastBear && last.Open >= prev.High && last.Close < (prev.Open + prev.Close) / 2m)
+            Check(60 + (hadUp ? 5 : 0), "DARK_CLOUD", false);
+
+        // ── 2-bar: Tweezer ──
+        if (Math.Abs(last.Low - prev.Low) <= tol && lastBull && prevBear)
+            Check(56 + (hadDown ? 5 : 0), "TWEEZER_BOTTOM", true);
+        if (Math.Abs(last.High - prev.High) <= tol && lastBear && prevBull)
+            Check(56 + (hadUp ? 5 : 0), "TWEEZER_TOP", false);
+
+        // ── 3-bar patterns ──
+        if (candles.Count >= 3)
+        {
+            var a = candles[^3]; var b = candles[^2]; var c = candles[^1];
+            decimal aB = Math.Abs(a.Close - a.Open);
+            decimal bB = Math.Abs(b.Close - b.Open);
+            decimal aMid = (a.Open + a.Close) / 2m;
+
+            // Morning / Evening Star
+            if (a.Close < a.Open && bB <= Math.Max(aB, lastBody) * 0.50m && c.Close > c.Open && c.Close >= aMid)
+                Check(68 + (hadDown ? 5 : 0), "MORNING_STAR", true);
+            if (a.Close > a.Open && bB <= Math.Max(aB, lastBody) * 0.50m && c.Close < c.Open && c.Close <= aMid)
+                Check(68 + (hadUp ? 5 : 0), "EVENING_STAR", false);
+
+            // Abandoned Baby
+            if (a.Close < a.Open && b.High < Math.Min(a.Close, a.Open)
+                && c.Close > c.Open && c.Low > Math.Max(b.Open, b.Close))
+                Check(75, "BULL_ABANDONED_BABY", true);
+            if (a.Close > a.Open && b.Low > Math.Max(a.Close, a.Open)
+                && c.Close < c.Open && c.High < Math.Min(b.Open, b.Close))
+                Check(75, "BEAR_ABANDONED_BABY", false);
+
+            // Three Inside Up/Down
+            if (a.Close < a.Open && bB < aB
+                && Math.Min(b.Open, b.Close) >= Math.Min(a.Open, a.Close)
+                && Math.Max(b.Open, b.Close) <= Math.Max(a.Open, a.Close)
+                && c.Close > c.Open && c.Close > a.Open)
+                Check(65 + (hadDown ? 5 : 0), "THREE_INSIDE_UP", true);
+            if (a.Close > a.Open && bB < aB
+                && Math.Min(b.Open, b.Close) >= Math.Min(a.Open, a.Close)
+                && Math.Max(b.Open, b.Close) <= Math.Max(a.Open, a.Close)
+                && c.Close < c.Open && c.Close < a.Open)
+                Check(65 + (hadUp ? 5 : 0), "THREE_INSIDE_DOWN", false);
+        }
+
+        // ── 3-bar: Soldiers / Crows ──
+        if (candles.Count >= 4)
+        {
+            var x = candles[^3]; var y = candles[^2]; var z = candles[^1];
+            if (x.Close > x.Open && y.Close > y.Open && z.Close > z.Open
+                && y.Close > x.Close && z.Close > y.Close)
+                Check(74, "THREE_WHITE_SOLDIERS", true);
+            if (x.Close < x.Open && y.Close < y.Open && z.Close < z.Open
+                && y.Close < x.Close && z.Close < y.Close)
+                Check(74, "THREE_BLACK_CROWS", false);
+        }
+
+        // ── Head & Shoulders (11-bar window) ──
+        if (candles.Count >= 11)
+        {
+            var w = new List<Candle>();
+            for (int i = candles.Count - 11; i < candles.Count; i++) w.Add(candles[i]);
+            var highs = new List<int>(); var lows = new List<int>();
+            for (int i = 1; i < w.Count - 1; i++)
+            {
+                if (w[i].High > w[i - 1].High && w[i].High > w[i + 1].High) highs.Add(i);
+                if (w[i].Low < w[i - 1].Low && w[i].Low < w[i + 1].Low) lows.Add(i);
+            }
+            if (highs.Count >= 3)
+            {
+                var h = highs.Skip(highs.Count - 3).ToList();
+                decimal ls = w[h[0]].High, head = w[h[1]].High, rs = w[h[2]].High;
+                decimal neckline = Math.Min(
+                    w.Skip(h[0]).Take(Math.Max(1, h[1] - h[0] + 1)).Min(cc => cc.Low),
+                    w.Skip(h[1]).Take(Math.Max(1, h[2] - h[1] + 1)).Min(cc => cc.Low));
+                if (head > ls + atr * 0.30m && head > rs + atr * 0.30m
+                    && Math.Abs(ls - rs) <= atr * 0.50m && w[^1].Close < neckline)
+                    Check(72, "HEAD_SHOULDERS", false);
+            }
+            if (lows.Count >= 3)
+            {
+                var l = lows.Skip(lows.Count - 3).ToList();
+                decimal ls = w[l[0]].Low, head = w[l[1]].Low, rs = w[l[2]].Low;
+                decimal neckline = Math.Max(
+                    w.Skip(l[0]).Take(Math.Max(1, l[1] - l[0] + 1)).Max(cc => cc.High),
+                    w.Skip(l[1]).Take(Math.Max(1, l[2] - l[1] + 1)).Max(cc => cc.High));
+                if (head < ls - atr * 0.30m && head < rs - atr * 0.30m
+                    && Math.Abs(ls - rs) <= atr * 0.50m && w[^1].Close > neckline)
+                    Check(72, "INV_HEAD_SHOULDERS", true);
+            }
+        }
+
+        // ── Double Top / Bottom (15-bar window) ──
+        if (candles.Count >= 15)
+        {
+            decimal low1 = decimal.MaxValue, low2 = decimal.MaxValue;
+            int lo1 = -1, lo2 = -1;
+            int wStart = candles.Count - 15;
+            for (int i = 1; i < 8; i++)
+                if (candles[wStart + i].Low < low1) { low1 = candles[wStart + i].Low; lo1 = i; }
+            for (int i = 8; i < 14; i++)
+                if (candles[wStart + i].Low < low2) { low2 = candles[wStart + i].Low; lo2 = i; }
+            if (lo1 > 0 && lo2 > 0 && Math.Abs(low1 - low2) <= atr * 0.40m)
+            {
+                decimal peakBtw = decimal.MinValue;
+                for (int i = lo1; i <= lo2; i++) peakBtw = Math.Max(peakBtw, candles[wStart + i].High);
+                if (peakBtw - Math.Max(low1, low2) >= atr * 0.5m && candles[^1].Close > peakBtw * 0.995m)
+                    Check(70, "DOUBLE_BOTTOM", true);
+            }
+            decimal hi1 = decimal.MinValue, hi2 = decimal.MinValue;
+            int h1 = -1, h2 = -1;
+            for (int i = 1; i < 8; i++)
+                if (candles[wStart + i].High > hi1) { hi1 = candles[wStart + i].High; h1 = i; }
+            for (int i = 8; i < 14; i++)
+                if (candles[wStart + i].High > hi2) { hi2 = candles[wStart + i].High; h2 = i; }
+            if (h1 > 0 && h2 > 0 && Math.Abs(hi1 - hi2) <= atr * 0.40m)
+            {
+                decimal troughBtw = decimal.MaxValue;
+                for (int i = h1; i <= h2; i++) troughBtw = Math.Min(troughBtw, candles[wStart + i].Low);
+                if (Math.Min(hi1, hi2) - troughBtw >= atr * 0.5m && candles[^1].Close < troughBtw * 1.005m)
+                    Check(70, "DOUBLE_TOP", false);
+            }
+        }
+
+        return (bestScore, bestTag, bestBullish);
     }
 
     private static int CalcQty(decimal price, decimal stopDistance)
