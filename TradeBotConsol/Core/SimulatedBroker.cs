@@ -175,6 +175,27 @@ public class SimulatedBroker
     private decimal VIX_REDUCE_THRESHOLD = 25m;
     private decimal VIX_NO_LONG_THRESHOLD = 35m;
 
+    // ── RISK MGMT: Unrealized Drawdown Circuit Breaker ──
+    // Halts NEW entries (not exits) when realized + unrealized PnL breaches threshold.
+    // Prevents the gap scenario where 3 positions go against you simultaneously
+    // and you keep opening more before stops fire.
+    private decimal UNREALIZED_DD_HALT_THRESHOLD = -75m;
+
+    // ── RISK MGMT: Dynamic Position Sizing ──
+    // Scales risk down when losing, keeps normal when winning.
+    // At MAX_DAILY_LOSS/2 drawdown, risk is halved. No increase above baseline.
+    private bool DYNAMIC_SIZING_ENABLED = true;
+
+    // ── RISK MGMT: Strategy Allocation Limits ──
+    // Max trades per strategy family per day. Prevents one misfiring strategy
+    // from consuming the entire daily trade budget.
+    private int MAX_TRADES_PER_STRATEGY = 3;
+
+    // ── RISK MGMT: Trend Reversal Gate ──
+    // Rejects entries when short-term trend structure is breaking down (for longs)
+    // or recovering (for shorts). Protects early-entry logic from catching falling knives.
+    private bool TREND_REVERSAL_GATE_ENABLED = true;
+
     private int MIN_SETUP_SCORE = 40;           // was 45
 
 
@@ -307,6 +328,10 @@ public class SimulatedBroker
     private ConcurrentDictionary<string, decimal> _pendingInitialRisk = new();
 
     private readonly HashSet<string> _earningsBlacklist = new(StringComparer.OrdinalIgnoreCase);
+
+    // ── RISK MGMT: Per-strategy daily trade counters ──
+    // Key = strategy family (e.g. "ORB", "PATTERN", "VWAP"), Value = count today
+    private readonly ConcurrentDictionary<string, int> _strategyTradeCount = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, (int stopId, int targetId)> _pendingBracketChildren = new();
     private readonly ConcurrentDictionary<string, bool> _pendingEntrySymbols = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTime> _lastIntrabarSignalUtc = new(StringComparer.OrdinalIgnoreCase);
@@ -659,6 +684,15 @@ public class SimulatedBroker
         if (_haltTrading) return false;
         if (!_watchlist.Contains(symbol, StringComparer.OrdinalIgnoreCase)) return false;
         if (!_reconciled) return false;
+
+        // ── RISK MGMT: Unrealized drawdown circuit breaker ──
+        // Block new entries when realized+unrealized equity is deeply negative.
+        // Existing positions keep their stops — this only prevents digging deeper.
+        if (IsUnrealizedDrawdownBreached())
+        {
+            LogMessage($"[DD BREAKER] {symbol} entry blocked — total equity PnL ${GetTotalEquityPnL():F2} ≤ threshold ${UNREALIZED_DD_HALT_THRESHOLD}");
+            return false;
+        }
 
         var nowEt = GetEasternTime();
         if (nowEt.DayOfWeek == DayOfWeek.Saturday || nowEt.DayOfWeek == DayOfWeek.Sunday) return false;
@@ -2167,6 +2201,31 @@ public class SimulatedBroker
         if (qty <= 0 || qty > MAX_QTY_SANITY) return;
         if (_pendingEntrySymbols.ContainsKey(symbol)) return;
 
+        // ── RISK MGMT: Strategy allocation limit ──
+        // Prevents one misfiring strategy from consuming the full daily budget.
+        if (IsStrategyAtDailyLimit(strategyTag))
+        {
+            LogMessage($"[STRAT LIMIT] {strategyTag} {symbol} blocked — {GetStrategyFamily(strategyTag)} hit {MAX_TRADES_PER_STRATEGY} trades today");
+            return;
+        }
+
+        // ── RISK MGMT: Trend reversal gate ──
+        // Only applied to trend-following strategies. Reversal strategies (PATTERN_*,
+        // MICRO_PB_*, MEAN_REV_*, BB_MR_*) are EXEMPT because they intentionally
+        // enter against exhausted moves — blocking them would destroy early-entry edge.
+        bool isTrendFollowing = !strategyTag.StartsWith("PATTERN_", StringComparison.OrdinalIgnoreCase)
+                             && !strategyTag.StartsWith("MICRO_PB_", StringComparison.OrdinalIgnoreCase)
+                             && !strategyTag.StartsWith("MEAN_REV_", StringComparison.OrdinalIgnoreCase)
+                             && !strategyTag.StartsWith("BB_MR_", StringComparison.OrdinalIgnoreCase);
+        if (isTrendFollowing && _marketData.TryGetValue(symbol, out var trendCandles))
+        {
+            if (IsTrendReversing(symbol, isShort, trendCandles))
+            {
+                LogMessage($"[TREND GATE] {strategyTag} {symbol} blocked — trend structure reversing against {(isShort ? "SHORT" : "LONG")} entry");
+                return;
+            }
+        }
+
         if (symbol != "SPY" && symbol != "QQQ" && symbol != "IWM")
         {
             if (!isShort && _spyBearish)
@@ -2567,6 +2626,7 @@ public class SimulatedBroker
 
                 _tradesToday++;
                 _totalRealizedPnL -= COMMISSION_PER_SIDE;
+                IncrementStrategyCount(resolvedTag);
 
                 string dir = isShortEntry ? "SHORT" : "BUY";
                 subject = $"🚀 {dir}: {order.Symbol} x{fillQty} @ {fillPrice:C2}";
@@ -2715,6 +2775,7 @@ public class SimulatedBroker
         _dailyEntryCount.Clear();
         _lastTradeWasLoss.Clear();
         _earningsBlacklist.Clear();
+        _strategyTradeCount.Clear();
         _pendingEntryCount = 0;
         _completedTrades.Clear();
         _lastVolumeResetEt = nowEt.Date;
@@ -3132,6 +3193,20 @@ public class SimulatedBroker
             await Task.Delay(1500);
         }
 
+        // ── FIX: Seed indicator cache from historical candles so the web dashboard
+        // shows SMA20/50/RSI immediately — not just after the first live tick.
+        // Without this, _indicatorCache is empty until FinalizeCandle() fires,
+        // and BuildStatusJson() emits sma20=0, sma50=0 → HTML shows "—".
+        foreach (var symbol in toSubscribe)
+        {
+            if (_marketData.TryGetValue(symbol, out var candles) && candles.Count >= 30)
+            {
+                RefreshIndicatorCache(symbol, candles);
+                Refresh15MinEma(symbol, candles);
+            }
+        }
+        LogMessage($"[HIST] Indicator cache seeded for {toSubscribe.Count} symbols.");
+
         _previousOrbMinutes = ORB_MINUTES;
     }
 
@@ -3480,6 +3555,10 @@ public class SimulatedBroker
             VIX_REDUCE_THRESHOLD = GetD("VIX_REDUCE_THRESHOLD", VIX_REDUCE_THRESHOLD);
             VIX_NO_LONG_THRESHOLD = GetD("VIX_NO_LONG_THRESHOLD", VIX_NO_LONG_THRESHOLD);
             MIN_SETUP_SCORE = GetI("MIN_SETUP_SCORE", MIN_SETUP_SCORE);
+            UNREALIZED_DD_HALT_THRESHOLD = GetD("UNREALIZED_DD_HALT", UNREALIZED_DD_HALT_THRESHOLD);
+            DYNAMIC_SIZING_ENABLED = GetB("DYNAMIC_SIZING", DYNAMIC_SIZING_ENABLED);
+            MAX_TRADES_PER_STRATEGY = GetI("MAX_TRADES_PER_STRATEGY", MAX_TRADES_PER_STRATEGY);
+            TREND_REVERSAL_GATE_ENABLED = GetB("TREND_REVERSAL_GATE", TREND_REVERSAL_GATE_ENABLED);
 
             if (root.TryGetProperty("earnings_blacklist", out var ebEl) && ebEl.ValueKind == System.Text.Json.JsonValueKind.Array)
             {
@@ -3589,6 +3668,10 @@ public class SimulatedBroker
             $"\"VIX_REDUCE_THRESHOLD\":{VIX_REDUCE_THRESHOLD:F1}",
             $"\"VIX_NO_LONG_THRESHOLD\":{VIX_NO_LONG_THRESHOLD:F1}",
             $"\"MIN_SETUP_SCORE\":{MIN_SETUP_SCORE}",
+            $"\"UNREALIZED_DD_HALT\":{UNREALIZED_DD_HALT_THRESHOLD:F2}",
+            $"\"DYNAMIC_SIZING\":{(DYNAMIC_SIZING_ENABLED ? "true" : "false")}",
+            $"\"MAX_TRADES_PER_STRATEGY\":{MAX_TRADES_PER_STRATEGY}",
+            $"\"TREND_REVERSAL_GATE\":{(TREND_REVERSAL_GATE_ENABLED ? "true" : "false")}",
             $"\"earnings_blacklist\":[{string.Join(",", _earningsBlacklist.Select(s => $"\"{s}\""))}]",
             $"\"watchlist\":{wlJson}"
         }) + $"{nl}}}";
@@ -3820,6 +3903,10 @@ public class SimulatedBroker
                         VIX_REDUCE_THRESHOLD = GetD("VIX_REDUCE_THRESHOLD", VIX_REDUCE_THRESHOLD);
                         VIX_NO_LONG_THRESHOLD = GetD("VIX_NO_LONG_THRESHOLD", VIX_NO_LONG_THRESHOLD);
                         MIN_SETUP_SCORE = GetI("MIN_SETUP_SCORE", MIN_SETUP_SCORE);
+                        UNREALIZED_DD_HALT_THRESHOLD = GetD("UNREALIZED_DD_HALT", UNREALIZED_DD_HALT_THRESHOLD);
+                        DYNAMIC_SIZING_ENABLED = GetB("DYNAMIC_SIZING", DYNAMIC_SIZING_ENABLED);
+                        MAX_TRADES_PER_STRATEGY = GetI("MAX_TRADES_PER_STRATEGY", MAX_TRADES_PER_STRATEGY);
+                        TREND_REVERSAL_GATE_ENABLED = GetB("TREND_REVERSAL_GATE", TREND_REVERSAL_GATE_ENABLED);
 
                         if (root.TryGetProperty("earnings_blacklist", out var ebLiveEl) && ebLiveEl.ValueKind == System.Text.Json.JsonValueKind.Array)
                         {
@@ -4061,7 +4148,8 @@ public class SimulatedBroker
                 decimal price = candles?.LastOrDefault()?.Close ?? 0m;
                 bool dataReady = price > 0m;
 
-                // Use cached indicators instead of recomputing on every poll
+                // Use cached indicators; fall back to direct computation if cache
+                // hasn't been seeded yet (e.g. between historical load and first live tick).
                 decimal sma20 = 0m, sma50 = 0m, atr = 0m;
                 double rsi = 0.0;
                 int macdDir = 0;
@@ -4072,6 +4160,15 @@ public class SimulatedBroker
                     rsi = indC.Rsi14;
                     atr = indC.Atr14;
                     macdDir = indC.MacdDir;
+                }
+                else if (dataReady && candles != null && candles.Count >= 20)
+                {
+                    // FIX: Mirror the console dashboard — compute directly from candles
+                    sma20 = SafeSMA(candles, 20);
+                    sma50 = SafeSMA(candles, 50);
+                    rsi = SafeRSI(candles, 14);
+                    atr = SafeATR(candles, 14);
+                    macdDir = SafeMACDDirection(candles);
                 }
                 decimal atrPct = price > 0 ? atr / price * 100 : 0;
                 _vwap.TryGetValue(sym, out decimal vwap);
@@ -4195,7 +4292,12 @@ public class SimulatedBroker
                 }
             }
 
-            return $@"{{""time"":""{now:yyyy-MM-dd HH:mm:ss} PT"",""et"":""{et:HH:mm:ss} ET"",""regime"":""{_marketRegime}"",""spyBullish"":{(_spyBullish ? "true" : "false")},""spyBearish"":{(_spyBearish ? "true" : "false")},""halted"":{(_haltTrading ? "true" : "false")},""reconciled"":{(_reconciled ? "true" : "false")},""pnl"":{_totalRealizedPnL:F2},""goal"":{DAILY_PROFIT_GOAL:F2},""maxLoss"":{MAX_DAILY_LOSS:F2},""trades"":{_tradesToday},""maxTrades"":{MAX_TRADES_PER_DAY},""wins"":{_winCount},""losses"":{_lossCount},""wr"":{wr:F1},""cash"":{cash:F2},""budget"":{TOTAL_BUDGET:F2},""initialBudget"":{TOTAL_BUDGET:F2},""positions"":{posArr},""curve"":{curveArr},""watchlist"":{wlArr},""feed"":{tradeArr},""hist"":{histArr},""lifetimeCurve"":{ltArr},""allTrades"":{_cachedAllTradesJson}}}";
+            decimal unrealizedPnl = 0m;
+            lock (_lock) { foreach (var p in _positions.Values) unrealizedPnl += p.UnrealizedPnL(p.CurrentPrice); }
+            decimal totalEquityPnl = _totalRealizedPnL + unrealizedPnl;
+            decimal sizeMultiplier = GetDynamicSizeMultiplier();
+
+            return $@"{{""time"":""{now:yyyy-MM-dd HH:mm:ss} PT"",""et"":""{et:HH:mm:ss} ET"",""regime"":""{_marketRegime}"",""spyBullish"":{(_spyBullish ? "true" : "false")},""spyBearish"":{(_spyBearish ? "true" : "false")},""halted"":{(_haltTrading ? "true" : "false")},""reconciled"":{(_reconciled ? "true" : "false")},""pnl"":{_totalRealizedPnL:F2},""unrealizedPnl"":{unrealizedPnl:F2},""totalEquityPnl"":{totalEquityPnl:F2},""sizeMult"":{sizeMultiplier:F2},""ddBreached"":{(IsUnrealizedDrawdownBreached() ? "true" : "false")},""goal"":{DAILY_PROFIT_GOAL:F2},""maxLoss"":{MAX_DAILY_LOSS:F2},""trades"":{_tradesToday},""maxTrades"":{MAX_TRADES_PER_DAY},""wins"":{_winCount},""losses"":{_lossCount},""wr"":{wr:F1},""cash"":{cash:F2},""budget"":{TOTAL_BUDGET:F2},""initialBudget"":{TOTAL_BUDGET:F2},""positions"":{posArr},""curve"":{curveArr},""watchlist"":{wlArr},""feed"":{tradeArr},""hist"":{histArr},""lifetimeCurve"":{ltArr},""allTrades"":{_cachedAllTradesJson}}}";
         }
     }
 
@@ -4266,6 +4368,19 @@ public class SimulatedBroker
                 $"Cash: {cash:C0}   " +
                 $"Trades: {_tradesToday}   " +
                 $"W/L: {_winCount}/{_lossCount}  ({winRate:F0}%)");
+
+            // ── Risk management status line ──
+            decimal unrealPnlConsole = 0m;
+            lock (_lock) { foreach (var p in _positions.Values) unrealPnlConsole += p.UnrealizedPnL(p.CurrentPrice); }
+            decimal totalEqConsole = _totalRealizedPnL + unrealPnlConsole;
+            decimal sizeMult = GetDynamicSizeMultiplier();
+            string ddFlag = IsUnrealizedDrawdownBreached() ? "⚠ BREACHED" : "OK";
+            sb.AppendLine(
+                $"  Unrealized: {(unrealPnlConsole >= 0 ? "+" : "")}{unrealPnlConsole:C2}   " +
+                $"Total Equity: {(totalEqConsole >= 0 ? "+" : "")}{totalEqConsole:C2}   " +
+                $"SizeMult: {sizeMult:P0}   " +
+                $"DD-Breaker: {ddFlag}   " +
+                $"ConsecLoss: {_consecutiveLosses}");
             sb.AppendLine(new string('─', W));
 
             sb.AppendLine(
@@ -4674,12 +4789,175 @@ public class SimulatedBroker
         return symDayReturn >= 0.005m && spyDayReturn < 0m;
     }
 
+    // ══════════════════════════════════════════════════════════
+    //  RISK MGMT: Unrealized Drawdown Circuit Breaker
+    //  Computes aggregate PnL (realized + all open unrealized).
+    //  Returns true if total drawdown exceeds threshold — blocks new entries.
+    //  Does NOT close existing positions (stops handle that).
+    // ══════════════════════════════════════════════════════════
+
+    private decimal GetTotalEquityPnL()
+    {
+        decimal unrealized = 0m;
+        lock (_lock)
+        {
+            foreach (var pos in _positions.Values)
+                unrealized += pos.UnrealizedPnL(pos.CurrentPrice);
+        }
+        return _totalRealizedPnL + unrealized;
+    }
+
+    private bool IsUnrealizedDrawdownBreached()
+    {
+        if (UNREALIZED_DD_HALT_THRESHOLD >= 0) return false; // disabled
+        return GetTotalEquityPnL() <= UNREALIZED_DD_HALT_THRESHOLD;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  RISK MGMT: Strategy Allocation Limit
+    //  Maps a strategy tag to its family for counting purposes.
+    //  "PATTERN_BULL_ENGULFING_LONG" → "PATTERN"
+    //  "ORB_LONG" → "ORB"
+    //  "MICRO_PB_LONG" → "MICRO_PB"
+    // ══════════════════════════════════════════════════════════
+
+    private string GetStrategyFamily(string tag)
+    {
+        if (string.IsNullOrEmpty(tag)) return "UNKNOWN";
+        // Known prefixes — order matters (longest match first)
+        foreach (var prefix in new[] { "PATTERN_", "MICRO_PB_", "EMA_POCKET_",
+                                        "OUTSIDE_CANDLE_", "MOMENTUM_", "VWAP_",
+                                        "GAP_GO_", "ORB_", "BB_MR_", "MEAN_REV_" })
+        {
+            if (tag.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                return prefix.TrimEnd('_');
+        }
+        // Fallback: take everything before the last _LONG / _SHORT
+        int lastUnderscore = tag.LastIndexOf('_');
+        if (lastUnderscore > 0)
+        {
+            string suffix = tag.Substring(lastUnderscore);
+            if (suffix.Equals("_LONG", StringComparison.OrdinalIgnoreCase) ||
+                suffix.Equals("_SHORT", StringComparison.OrdinalIgnoreCase))
+                return tag.Substring(0, lastUnderscore);
+        }
+        return tag;
+    }
+
+    private bool IsStrategyAtDailyLimit(string strategyTag)
+    {
+        if (MAX_TRADES_PER_STRATEGY <= 0) return false; // disabled
+        string family = GetStrategyFamily(strategyTag);
+        return _strategyTradeCount.GetValueOrDefault(family) >= MAX_TRADES_PER_STRATEGY;
+    }
+
+    private void IncrementStrategyCount(string strategyTag)
+    {
+        string family = GetStrategyFamily(strategyTag);
+        _strategyTradeCount.AddOrUpdate(family, 1, (_, old) => old + 1);
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  RISK MGMT: Trend Reversal Gate
+    //  Checks if the stock's short-term trend structure is breaking
+    //  AGAINST the proposed trade direction. Uses EMA9/EMA21 crossover
+    //  and higher-low / lower-high structure on recent bars.
+    //
+    //  For LONGS: rejects when EMA9 crosses below EMA21 AND price is
+    //             making lower highs (trend is turning down).
+    //  For SHORTS: rejects when EMA9 crosses above EMA21 AND price is
+    //              making higher lows (trend is turning up).
+    //
+    //  This does NOT interfere with early-entry or reversal-pattern
+    //  strategies (patterns, micro-pullback) — those rely on actual
+    //  reversal candle confirmation and get their own exemption.
+    //  Only the trend-following strategies (ORB, momentum, gap-go,
+    //  EMA pocket, VWAP) are filtered.
+    // ══════════════════════════════════════════════════════════
+
+    private bool IsTrendReversing(string symbol, bool isShort, List<Candle> candles)
+    {
+        if (!TREND_REVERSAL_GATE_ENABLED) return false;
+        if (!_indicatorCache.TryGetValue(symbol, out var ind)) return false;
+        if (candles == null || candles.Count < 12) return false;
+
+        // EMA crossover direction
+        bool ema9BelowEma21 = ind.Ema9 < ind.Ema21;
+        bool ema9AboveEma21 = ind.Ema9 > ind.Ema21;
+        bool emaCrossDown = ind.Ema9 < ind.Ema21 && ind.Ema9Prev >= ind.Ema21Prev;
+        bool emaCrossUp = ind.Ema9 > ind.Ema21 && ind.Ema9Prev <= ind.Ema21Prev;
+
+        // Structure: check last 8 bars for lower-highs or higher-lows
+        var recent8 = candles.TakeLast(8).ToList();
+        bool lowerHighs = false;
+        bool higherLows = false;
+        if (recent8.Count >= 8)
+        {
+            var first4 = recent8.Take(4).ToList();
+            var last4 = recent8.Skip(4).ToList();
+            decimal firstHalfHigh = first4.Max(c => c.High);
+            decimal secondHalfHigh = last4.Max(c => c.High);
+            decimal firstHalfLow = first4.Min(c => c.Low);
+            decimal secondHalfLow = last4.Min(c => c.Low);
+            decimal atr = ind.Atr14;
+            // Only flag if the structural shift is meaningful (> 0.3 ATR)
+            lowerHighs = secondHalfHigh < firstHalfHigh - atr * 0.3m;
+            higherLows = secondHalfLow > firstHalfLow + atr * 0.3m;
+        }
+
+        if (!isShort)
+        {
+            // LONG entry: trend reversing down?
+            // Need BOTH: EMA structure turning bearish AND price making lower highs
+            if ((emaCrossDown || ema9BelowEma21) && lowerHighs) return true;
+        }
+        else
+        {
+            // SHORT entry: trend reversing up?
+            if ((emaCrossUp || ema9AboveEma21) && higherLows) return true;
+        }
+
+        return false;
+    }
+
+    // Helper: extract trade direction from strategy tag
+    private bool IsShortTag(string tag)
+    {
+        return tag != null && tag.EndsWith("_SHORT", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  RISK MGMT: Dynamic Position Sizing Multiplier
+    //  Returns a scale factor (0.0 – 1.0) that reduces risk
+    //  proportionally as daily PnL approaches MAX_DAILY_LOSS.
+    //  At PnL=0: returns 1.0 (full size)
+    //  At PnL=MAX_DAILY_LOSS/2: returns 0.5 (half size)
+    //  Never increases above 1.0 even when profitable.
+    // ══════════════════════════════════════════════════════════
+
+    private decimal GetDynamicSizeMultiplier()
+    {
+        if (!DYNAMIC_SIZING_ENABLED) return 1.0m;
+        if (MAX_DAILY_LOSS >= 0) return 1.0m; // safety: MAX_DAILY_LOSS should be negative
+
+        decimal totalPnl = GetTotalEquityPnL();
+        if (totalPnl >= 0) return 1.0m; // winning — no reduction
+
+        // Linear scale from 1.0 at PnL=0 to 0.25 at PnL=MAX_DAILY_LOSS
+        // Clamp so it never goes below 0.25 (still trades, just tiny)
+        decimal drawdownRatio = Math.Abs(totalPnl) / Math.Abs(MAX_DAILY_LOSS);
+        decimal multiplier = 1.0m - drawdownRatio * 0.75m;
+        return Math.Clamp(multiplier, 0.25m, 1.0m);
+    }
+
     private int CalcQty(decimal price, decimal stopDistance)
     {
         decimal minStop = Math.Max(MIN_STOP_DISTANCE, price * 0.003m);
         if (stopDistance < minStop) stopDistance = minStop;
 
-        decimal riskAmount = TOTAL_BUDGET * RISK_PCT;
+        // ── RISK MGMT: Dynamic sizing — scale down risk when in drawdown ──
+        decimal sizeMultiplier = GetDynamicSizeMultiplier();
+        decimal riskAmount = TOTAL_BUDGET * RISK_PCT * sizeMultiplier;
         int qty = (int)(riskAmount / stopDistance);
 
         decimal deployedCapital = _positions.Values.Sum(p => p.AvgPrice * p.Quantity)
@@ -4690,6 +4968,10 @@ public class SimulatedBroker
 
         qty = Math.Min(qty, maxByBudget);
         if (qty <= 0 || qty > MAX_QTY_SANITY) return 0;
+
+        if (sizeMultiplier < 1.0m)
+            LogMessage($"[DYNAMIC SIZE] Risk scaled to {sizeMultiplier:P0} — qty={qty} (drawdown protection)");
+
         return qty;
     }
 
