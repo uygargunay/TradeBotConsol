@@ -3477,6 +3477,41 @@ public class SimulatedBroker
     //  HTTP DASHBOARD SERVER
     // ══════════════════════════════════════════════════════════
 
+    private BacktestConfig BuildBacktestConfig(bool includeProjectedPeriods = true)
+    {
+        lock (_lock)
+        {
+            return new BacktestConfig
+            {
+                InitialCapital = TOTAL_BUDGET,
+                PositionSize = POSITION_SIZE,
+                RiskPct = RISK_PCT,
+                HardStopAtrMult = HARD_STOP_ATR_MULT,
+                AtrTrailMult = ATR_TRAIL_MULT,
+                TargetAtrMult = 2.4m,
+                CommissionRoundTrip = COMMISSION_PER_SIDE * 2m,
+                EntrySlippagePct = 0.0003m,
+                ExitSlippagePct = 0.0003m,
+                MaxPositions = MAX_POSITIONS,
+                MaxTradesPerDay = MAX_TRADES_PER_DAY,
+                MinHoldSeconds = MIN_HOLD_SECONDS,
+                RsiLongMin = RSI_LONG_MIN,
+                RsiShortMax = RSI_SHORT_MAX,
+                OrbMinutes = ORB_MINUTES,
+                MinAtrPct = MIN_ATR_PCT,
+                MaxAtrPct = MAX_ATR_PCT,
+                GapGoMinPct = GAP_GO_MIN_PCT,
+                GapGoRelVol = GAP_GO_REL_VOL,
+                VolExpandMult = VOL_EXPAND_MULT,
+                MinSetupScore = MIN_SETUP_SCORE,
+                AllowShorts = _allowShorts,
+                MiddayFilterEnabled = MIDDAY_FILTER_ENABLED,
+                IncludeProjectedPeriods = includeProjectedPeriods,
+                IncludeProjectedEquity = false,
+            };
+        }
+    }
+
     private static readonly string CONFIG_FILE = StatePath("bot-config.json");
     private const string CONFIG_PASSWORD = "a";
 
@@ -3533,6 +3568,7 @@ public class SimulatedBroker
             VWAP_CONFIRM_BARS = GetI("VWAP_CONFIRM_BARS", VWAP_CONFIRM_BARS);
             MAX_TRADES_PER_DAY = GetI("MAX_TRADES_PER_DAY", MAX_TRADES_PER_DAY);
             MIN_ATR_PCT = GetD("MIN_ATR_PCT", MIN_ATR_PCT);
+            MAX_ATR_PCT = GetD("MAX_ATR_PCT", MAX_ATR_PCT);
             _allowShorts = GetB("ALLOW_SHORTS", _allowShorts);
             MIDDAY_FILTER_ENABLED = GetB("MIDDAY_FILTER_ENABLED", MIDDAY_FILTER_ENABLED);
             MAX_CONSECUTIVE_LOSSES = GetI("MAX_CONSECUTIVE_LOSSES", MAX_CONSECUTIVE_LOSSES);
@@ -3769,7 +3805,10 @@ public class SimulatedBroker
                         snapshot,
                         filteredCandles,
                         filteredEquity,
-                        TOTAL_BUDGET);
+                        TOTAL_BUDGET,
+                        BuildBacktestConfig(includeProjectedPeriods: false),
+                        isHistoricalMode: true,
+                        historicalPeriodLabel: $"{fromStr} → {toStr}");
                     json = JsonSerializer.Serialize(report);
                 }
                 catch (Exception ex)
@@ -3787,7 +3826,10 @@ public class SimulatedBroker
                         snapshot,
                         _marketData,
                         _lifetimeEquity,
-                        TOTAL_BUDGET);
+                        TOTAL_BUDGET,
+                        BuildBacktestConfig(includeProjectedPeriods: true),
+                        isHistoricalMode: false,
+                        historicalPeriodLabel: "");
                     json = JsonSerializer.Serialize(report);
                 }
                 catch (Exception ex)
@@ -3881,6 +3923,7 @@ public class SimulatedBroker
                         VWAP_CONFIRM_BARS = GetI("VWAP_CONFIRM_BARS", VWAP_CONFIRM_BARS);
                         MAX_TRADES_PER_DAY = GetI("MAX_TRADES_PER_DAY", MAX_TRADES_PER_DAY);
                         MIN_ATR_PCT = GetD("MIN_ATR_PCT", MIN_ATR_PCT);
+                        MAX_ATR_PCT = GetD("MAX_ATR_PCT", MAX_ATR_PCT);
                         _allowShorts = GetB("ALLOW_SHORTS", _allowShorts);
                         MIDDAY_FILTER_ENABLED = GetB("MIDDAY_FILTER_ENABLED", MIDDAY_FILTER_ENABLED);
                         MAX_CONSECUTIVE_LOSSES = GetI("MAX_CONSECUTIVE_LOSSES", MAX_CONSECUTIVE_LOSSES);
