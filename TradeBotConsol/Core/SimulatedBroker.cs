@@ -57,6 +57,7 @@ public class SimPosition
     public bool PartialExitDone2 { get; set; }
     public bool IsShort { get; set; }
     public string StrategyTag { get; set; } = "";
+    public string EntryRegime { get; set; } = "";
     public decimal EntryCommission { get; set; } = 0m;
     public decimal InitialRiskPerShare { get; set; } = 0m;
     public int BracketStopId { get; set; } = 0;
@@ -143,13 +144,13 @@ public class SimulatedBroker
     private decimal TOTAL_BUDGET = 4000m;
     private int MAX_POSITIONS = 3;
     private decimal POSITION_SIZE = 900m;
-    private int MIN_HOLD_SECONDS = 45;
+    private int MIN_HOLD_SECONDS = 60;
     private decimal DAILY_PROFIT_GOAL = 200m;
 
 
 
     private decimal MAX_DAILY_LOSS = -100m;
-    private int COOLDOWN_SECONDS = 180;          // scalper: recycle symbols faster
+    private int COOLDOWN_SECONDS = 420;          // slightly slower recycle to reduce same-symbol churn
     private decimal ATR_TRAIL_MULT = 1.10m;
     private decimal SHORT_ATR_TRAIL = 1.05m;
     private decimal HARD_STOP_ATR_MULT = 1.20m;
@@ -158,16 +159,16 @@ public class SimulatedBroker
     private decimal MIN_STOP_DISTANCE = 0.10m;
     private int MAX_QTY_SANITY = 500;
     private decimal RISK_PCT = 0.005m;
-    private int ORB_MINUTES = 7;                // scalper: use a much tighter opening range
+    private int ORB_MINUTES = 9;               // aligns with live config; earlier entries but still after open noise
     private decimal VOL_EXPAND_MULT = 1.25m;    // scalper: accept smaller but still meaningful surges
-    private double RSI_LONG_MIN = 57.0;         // scalper: allow earlier momentum confirmation
-    private double RSI_SHORT_MAX = 43.0;        // scalper: allow earlier short confirmation
+    private double RSI_LONG_MIN = 57.0;         // balanced long threshold — avoids overblocking strong leaders
+    private double RSI_SHORT_MAX = 40.0;        // slightly tighter shorts to reduce low-quality fades
     private double RSI_OVERSOLD = 32.0;
     private double RSI_OVERBOUGHT = 68.0;
     private decimal GAP_GO_MIN_PCT = 0.020m;    // keep gap-go stricter; disabled by default below
     private decimal GAP_GO_REL_VOL = 1.8m;
     private int VWAP_CONFIRM_BARS = 2;          // tightened from 1
-    private int MAX_TRADES_PER_DAY = 16;        // scalper: more bites, smaller edges
+    private int MAX_TRADES_PER_DAY = 6;         // cap daily churn while allowing diversification
     private decimal MIN_ATR_PCT = 0.0020m;
     private decimal MAX_ATR_PCT = 0.015m;
     private decimal MIN_RR_RATIO = 1.0m;        // scalp setups can work around 1:1
@@ -189,7 +190,8 @@ public class SimulatedBroker
     // ── RISK MGMT: Strategy Allocation Limits ──
     // Max trades per strategy family per day. Prevents one misfiring strategy
     // from consuming the entire daily trade budget.
-    private int MAX_TRADES_PER_STRATEGY = 5;
+    private int MAX_TRADES_PER_STRATEGY = 2;
+    private int MAX_TRADES_PER_SYMBOL_PER_DAY = 1;
 
     // ── RISK MGMT: Trend Reversal Gate ──
     // Rejects entries when short-term trend structure is breaking down (for longs)
@@ -199,7 +201,7 @@ public class SimulatedBroker
     // ── Backtest projections (off by default — misleading with limited data) ──
     private bool SHOW_PROJECTIONS = false;
 
-    private int MIN_SETUP_SCORE = 48;           // demand cleaner tape even while trading more
+    private int MIN_SETUP_SCORE = 60;           // quality floor, with extra boosts applied to cheap tickers and re-entries
 
 
 
@@ -239,6 +241,15 @@ public class SimulatedBroker
 
     private int MAX_CONSECUTIVE_LOSSES = 4;
 
+    // ── Entry quality hardening ─────────────────────────────
+    private const int MIN_ENTRY_MINUTES_AFTER_OPEN = 20;     // 09:45 ET
+    private const int MIN_ENTRY_QTY = 5;
+    private const decimal MIN_GROSS_TARGET_TO_COMMISSION_MULT = 4.0m;
+    private bool ALLOW_BULLISH_CANDLE_PATTERNS = false;
+    private bool ALLOW_SCALP_BREAKOUT_LONGS = false;
+    private bool ALLOW_SCALP_BREAKOUT_SHORTS = false;
+    private bool ALLOW_SCALP_ORB_LONGS = true;
+
     private bool STRATEGY_ORB_ENABLED = true;
     private bool STRATEGY_GAP_GO_ENABLED = false;
     private bool STRATEGY_VWAP_ENABLED = true;
@@ -247,8 +258,8 @@ public class SimulatedBroker
     private bool STRATEGY_MOMENTUM_ENABLED = false;
     private bool STRATEGY_EMA_POCKET_ENABLED = true;
     private bool STRATEGY_OUTSIDE_CANDLE_ENABLED = false;
-    private bool STRATEGY_CANDLE_PATTERNS_ENABLED = true;
-    private bool STRATEGY_MICRO_PULLBACK_ENABLED = true;
+    private bool STRATEGY_CANDLE_PATTERNS_ENABLED = false;
+    private bool STRATEGY_MICRO_PULLBACK_ENABLED = false;
     private bool EARLY_PATTERN_ENTRY_ENABLED = false;
     private int PATTERN_MIN_SCORE = 68;
     private int INTRABAR_SIGNAL_COOLDOWN_SECONDS = 30;
@@ -349,7 +360,7 @@ public class SimulatedBroker
     private decimal _totalRealizedPnL = 0m;
     private int _tradesToday = 0;
     private int _tradesThisHour = 0;
-    private int MAX_TRADES_PER_HOUR = 4;
+    private int MAX_TRADES_PER_HOUR = 2;
     private DateTime _currentTradeHour = DateTime.MinValue;
     private bool _haltTrading = false;
     private bool _manualResumeOverride = false;
@@ -382,9 +393,9 @@ public class SimulatedBroker
         new(StringComparer.OrdinalIgnoreCase)
     {
         ["Regime Anchors (always on)"] = new[] { "SPY", "QQQ", "IWM" },
-        ["Mega-cap Momentum"] = new[] { "NVDA", "MSFT", "META", "AMZN", "AMD", "NFLX", "TSLA" },
-        ["Tactical Trend / Semis"] = new[] { "AVGO", "PLTR", "PANW", "CRWD", "ANET", "SMCI", "MU" },
-        ["Event-Driven High Beta"] = new[] { "COIN", "MSTR", "HOOD", "APP", "SOFI" }
+        ["Mega-cap Leaders"] = new[] { "AAPL", "MSFT", "META", "AMZN", "NVDA", "GOOGL", "NFLX" },
+        ["Liquid Growth / Semis"] = new[] { "AVGO", "MU", "ANET", "CRWD", "PANW", "DDOG" },
+        ["Diversifiers"] = new[] { "JPM", "GS" }
     };
 
     private static readonly string[] DEFAULT_WATCHLIST = DEFAULT_WATCHLIST_GROUPS
@@ -695,6 +706,110 @@ public class SimulatedBroker
         }
     }
 
+    private int GetMinEntryQtyForPrice(decimal price)
+    {
+        if (price >= 250m) return 1;
+        if (price >= 100m) return 2;
+        if (price >= 30m) return 3;
+        return MIN_ENTRY_QTY;
+    }
+
+    private int GetEffectiveMinSetupScore(string symbol, decimal price)
+    {
+        int effective = MIN_SETUP_SCORE;
+        if (price > 0m && price < 25m) effective += 8;
+        if (_lastTradeWasLoss.GetValueOrDefault(symbol)) effective += 4;
+        return Math.Min(85, effective);
+    }
+
+    private string GetWatchlistReadiness(string symbol)
+    {
+        try
+        {
+            if (!_watchlist.Contains(symbol, StringComparer.OrdinalIgnoreCase)) return "Off WL";
+            if (_haltTrading) return "Halted";
+            if (!_reconciled) return "Recon";
+            if (!_manualResumeOverride && IsUnrealizedDrawdownBreached()) return "DD block";
+
+            var nowEt = GetEasternTime();
+            if (nowEt.DayOfWeek == DayOfWeek.Saturday || nowEt.DayOfWeek == DayOfWeek.Sunday) return "Closed";
+            if (nowEt.Hour < 9 || (nowEt.Hour == 9 && nowEt.Minute < (30 + MIN_ENTRY_MINUTES_AFTER_OPEN))) return "Too early";
+            if (nowEt.Hour > 15 || (nowEt.Hour == 15 && nowEt.Minute >= 30)) return "Late";
+            if (_earningsBlacklist.Contains(symbol)) return "Earnings";
+            if (MIDDAY_FILTER_ENABLED &&
+                _marketRegime != "TRENDING" &&
+                (nowEt.Hour == 11 && nowEt.Minute >= 45 ||
+                 nowEt.Hour == 12 ||
+                 nowEt.Hour == 13 && nowEt.Minute < 5))
+                return "Midday";
+
+            if (!_marketData.TryGetValue(symbol, out var candles) || candles.Count < 50) return "No data";
+            decimal price = candles.Last().Close;
+            if (price <= 0m) return "No px";
+
+            if (candles.TakeLast(300).Sum(c => c.Volume) < 500_000) return "Low vol";
+
+            if (_latestBid.TryGetValue(symbol, out decimal bid) &&
+                _latestAsk.TryGetValue(symbol, out decimal ask) &&
+                bid > 0m && ask > 0m)
+            {
+                decimal mid = (ask + bid) / 2m;
+                decimal spreadPct = mid > 0m ? (ask - bid) / mid : 0m;
+                if (spreadPct > 0.0015m) return "Wide spr";
+            }
+
+            if (candles.Count >= 11 && IsLiquiditySweep(candles)) return "Sweep";
+
+            var todayCandles = candles.Where(c => c.Time.Date == nowEt.Date).ToList();
+            if (todayCandles.Count >= 20)
+            {
+                decimal dayHigh = todayCandles.Max(c => c.High);
+                decimal dayLow = todayCandles.Min(c => c.Low);
+                decimal dayRngPct = price > 0m ? (dayHigh - dayLow) / price : 0m;
+                if (dayRngPct < 0.006m) return "Dormant";
+            }
+
+            lock (_lock)
+            {
+                if (_tradesToday >= MAX_TRADES_PER_DAY) return "Day cap";
+                var hourSlot = new DateTime(nowEt.Year, nowEt.Month, nowEt.Day, nowEt.Hour, 0, 0);
+                int tradesThisHour = hourSlot != _currentTradeHour ? 0 : _tradesThisHour;
+                if (tradesThisHour >= MAX_TRADES_PER_HOUR) return "Hour cap";
+                if (_positions.ContainsKey(symbol)) return "In pos";
+                if (_pendingEntrySymbols.ContainsKey(symbol)) return "Pending";
+                if (_positions.Count + _pendingEntryCount >= MAX_POSITIONS) return "Max pos";
+
+                decimal deployedCapital = _positions.Values.Sum(p => p.AvgPrice * p.Quantity) + _pendingEntryCount * POSITION_SIZE;
+                if (TOTAL_BUDGET - deployedCapital < POSITION_SIZE) return "No cash";
+
+                if (_lastTradeTime.TryGetValue(symbol, out var lastTime))
+                {
+                    int cooldown = _lastTradeWasLoss.GetValueOrDefault(symbol) ? COOLDOWN_SECONDS * 2 : COOLDOWN_SECONDS;
+                    if ((DateTime.UtcNow - lastTime).TotalSeconds < cooldown) return "Cooldown";
+                }
+
+                int symCount = _dailyEntryCount.GetValueOrDefault(symbol);
+                if (symCount >= MAX_TRADES_PER_SYMBOL_PER_DAY) return $"Sym cap {symCount}";
+            }
+
+            int setup = ScoreSetup(symbol, candles);
+            int needed = GetEffectiveMinSetupScore(symbol, price);
+            if (setup < needed) return $"Set {setup}/{needed}";
+
+            decimal atr = SafeATR(candles, 14);
+            decimal stopDist = GetStopDistanceForStrategy("SCALP_EMA_LONG", atr, price);
+            int qty = CalcQty(price, stopDist, false);
+            int minQty = GetMinEntryQtyForPrice(price);
+            if (qty < minQty) return $"Qty {qty}<{minQty}";
+
+            return "Ready";
+        }
+        catch
+        {
+            return "Check";
+        }
+    }
+
     // ══════════════════════════════════════════════════════════
     //  UNIVERSAL ENTRY GATES
     //  Shared by ExecuteStrategy (closed-bar) and TryEarlyPatternEntry (intrabar).
@@ -719,7 +834,7 @@ public class SimulatedBroker
 
         var nowEt = GetEasternTime();
         if (nowEt.DayOfWeek == DayOfWeek.Saturday || nowEt.DayOfWeek == DayOfWeek.Sunday) return false;
-        if (nowEt.Hour < 9 || (nowEt.Hour == 9 && nowEt.Minute < 32)) return false;
+        if (nowEt.Hour < 9 || (nowEt.Hour == 9 && nowEt.Minute < (30 + MIN_ENTRY_MINUTES_AFTER_OPEN))) return false;
         if (nowEt.Hour > 15 || (nowEt.Hour == 15 && nowEt.Minute >= 30)) return false;
 
         bool isOpExFriday = nowEt.DayOfWeek == DayOfWeek.Friday
@@ -727,6 +842,8 @@ public class SimulatedBroker
         if (isOpExFriday && _tradesToday >= 2) return false;
 
         if (_earningsBlacklist.Contains(symbol)) return false;
+
+        if (IsSymbolCold(symbol)) return false;
 
         if (MIDDAY_FILTER_ENABLED &&
             _marketRegime != "TRENDING" &&
@@ -790,14 +907,15 @@ public class SimulatedBroker
                     : COOLDOWN_SECONDS;
                 if ((DateTime.UtcNow - lastTime).TotalSeconds < cooldown) return false;
             }
-            if (_dailyEntryCount.GetValueOrDefault(symbol) >= 3) return false;
+            if (_dailyEntryCount.GetValueOrDefault(symbol) >= MAX_TRADES_PER_SYMBOL_PER_DAY) return false;
         }
 
         minutesSinceOpen = (nowEt.Hour - 9) * 60 + nowEt.Minute - 30;
 
         // Setup quality
         int setupScore = ScoreSetup(symbol, candles);
-        if (setupScore < MIN_SETUP_SCORE) return false;
+        int effectiveMinSetup = GetEffectiveMinSetupScore(symbol, lastPrice);
+        if (setupScore < effectiveMinSetup) return false;
 
         return true;
     }
@@ -977,8 +1095,8 @@ public class SimulatedBroker
         long avgVol6 = (long)candles.TakeLast(6).Average(c => c.Volume);
         bool fastVol = last.Volume >= avgVol6 * 12 / 10 || HasFastVolumeSurge(candles, 1.20m);
 
-        bool longBody = Body(last) >= atr * 0.18m && closePos >= 0.65m;
-        bool shortBody = Body(last) >= atr * 0.18m && closePos <= 0.35m;
+        bool longBody = Body(last) >= atr * 0.20m && closePos >= 0.75m;
+        bool shortBody = Body(last) >= atr * 0.20m && closePos <= 0.25m;
 
         bool longBias = ind.Ema9 > ind.Ema21
                      && close > ind.Sma20
@@ -990,12 +1108,13 @@ public class SimulatedBroker
                       && vwapVal > 0 && close < vwapVal
                       && ind.Rsi14 >= 22 && ind.Rsi14 <= 46;
 
-        if ((_marketRegime == "TRENDING" || _marketRegime == "NORMAL")
+        if (ALLOW_SCALP_BREAKOUT_LONGS
+            && (_marketRegime == "TRENDING" || _marketRegime == "NORMAL")
             && !_spyOpenBearish
             && longBias
             && fastVol
             && longBody
-            && close > recentHigh3 + close * 0.0003m)
+            && close > recentHigh3 + Math.Max(atr * 0.12m, close * 0.0006m))
         {
             decimal stopDistance = Math.Max(GetStopDistanceForStrategy("SCALP_BREAKOUT_LONG", atr, close), close - last.Low);
             int qty = CalcQty(close, stopDistance);
@@ -1005,12 +1124,13 @@ public class SimulatedBroker
             return true;
         }
 
-        if (_allowShorts
+        if (ALLOW_SCALP_BREAKOUT_SHORTS
+            && _allowShorts
             && (_marketRegime == "SELL-OFF" || _marketRegime == "NORMAL")
             && shortBias
             && fastVol
             && shortBody
-            && close < recentLow3 - close * 0.0003m)
+            && close < recentLow3 - Math.Max(atr * 0.12m, close * 0.0006m))
         {
             decimal stopDistance = Math.Max(GetStopDistanceForStrategy("SCALP_BREAKOUT_SHORT", atr, close), last.High - close);
             int qty = CalcQty(close, stopDistance);
@@ -1057,11 +1177,12 @@ public class SimulatedBroker
 
         // ORB was materially late because it waited for multiple fully closed bars beyond the range.
         // TRENDING / SELL-OFF now allow the first clean hold bar; NORMAL still needs 2 bars.
-        int requiredHoldBars = _marketRegime == "NORMAL" ? 2 : 1;
+        int requiredHoldBars = _marketRegime == "NORMAL" ? 3 : 2;
 
         bool orbLongHold = candles.Count >= requiredHoldBars
-                        && candles.TakeLast(requiredHoldBars).All(c => c.Close > orb.High);
-        if (orbLongHold && lastBarVolOk && rsi > RSI_LONG_MIN)
+                        && candles.TakeLast(requiredHoldBars).All(c => c.Close > orb.High)
+                        && (vwapVal <= 0 || close >= vwapVal);
+        if (ALLOW_SCALP_ORB_LONGS && orbLongHold && lastBarVolOk && rsi > RSI_LONG_MIN)
         {
             if (!_spyBullish)
             {
@@ -1106,7 +1227,8 @@ public class SimulatedBroker
 
         TryShortOrb:
         bool orbShortHold = candles.Count >= requiredHoldBars
-                         && candles.TakeLast(requiredHoldBars).All(c => c.Close < orb.Low);
+                         && candles.TakeLast(requiredHoldBars).All(c => c.Close < orb.Low)
+                         && (vwapVal > 0 && close <= vwapVal);
         if (orbShortHold && lastBarVolOk && rsi < RSI_SHORT_MAX && _allowShorts)
         {
             if (!_spyBearish && _marketRegime != "SELL-OFF") return false;
@@ -1678,6 +1800,7 @@ public class SimulatedBroker
 
         if (pattern.Bullish)
         {
+            if (!ALLOW_BULLISH_CANDLE_PATTERNS) return false;
             if (_marketRegime == "SELL-OFF" && !CheckStrongRelativeStrength(symbol, candles)) return false;
             if (_spyOpenBearish) return false;
 
@@ -2322,6 +2445,12 @@ public class SimulatedBroker
             return;
         }
 
+        if (IsStrategyCold(strategyTag))
+        {
+            LogMessage($"[STRAT COOLING] {strategyTag} {symbol} blocked — recent real-trade performance is negative");
+            return;
+        }
+
         // ── RISK MGMT: Trend reversal gate ──
         // Only applied to trend-following strategies. Reversal strategies (PATTERN_*,
         // MICRO_PB_*, MEAN_REV_*, BB_MR_*) are EXEMPT because they intentionally
@@ -2396,7 +2525,7 @@ public class SimulatedBroker
                 targetDist = Math.Min(toVwap, Math.Min(toPdLow, toAtrTgt));
             }
 
-            decimal requiredRr = IsScalpStrategy(strategyTag) ? 0.90m : MIN_RR_RATIO;
+            decimal requiredRr = IsScalpStrategy(strategyTag) ? 1.25m : MIN_RR_RATIO;
             if (targetDist < stopDist * requiredRr)
             {
                 LogMessage($"[RR SKIP] {strategyTag} {symbol} R:R={targetDist / stopDist:F2} < {requiredRr:F2} — target too close to stop, skipping");
@@ -2416,6 +2545,22 @@ public class SimulatedBroker
                 qty = Math.Max(1, qty / 2);
                 LogMessage($"[VIX REDUCE] {strategyTag} {symbol} qty halved to {qty} — VIX={vixLevel:F1} ≥ {VIX_REDUCE_THRESHOLD}");
             }
+        }
+
+        int minEntryQty = GetMinEntryQtyForPrice(price);
+        if (qty < minEntryQty)
+        {
+            LogMessage($"[ECON FILTER] {strategyTag} {symbol} blocked — qty {qty} < minimum {minEntryQty} for ${price:F2}");
+            return;
+        }
+
+        decimal targetMultiple = GetTargetMultipleForStrategy(strategyTag);
+        decimal grossTargetPnL = stopDist * targetMultiple * qty;
+        decimal minGrossTargetPnL = COMMISSION_PER_SIDE * 2m * MIN_GROSS_TARGET_TO_COMMISSION_MULT;
+        if (grossTargetPnL < minGrossTargetPnL)
+        {
+            LogMessage($"[ECON FILTER] {strategyTag} {symbol} blocked — gross target ${grossTargetPnL:F2} < required ${minGrossTargetPnL:F2}");
+            return;
         }
 
         // ── ALL GUARDS PASSED — now commit to the entry ──
@@ -2447,7 +2592,6 @@ public class SimulatedBroker
                 ? stopTrigger + atrBracket * 0.5m
                 : stopTrigger - atrBracket * 0.5m;
 
-            decimal targetMultiple = GetTargetMultipleForStrategy(strategyTag);
             decimal targetPrice = isShort
                 ? price - stopDist * targetMultiple
                 : price + stopDist * targetMultiple;
@@ -2599,7 +2743,7 @@ public class SimulatedBroker
                     return;
                 }
 
-                if (secondsHeld >= 180 && rMultiple < GetStaleRForStrategy(pos.StrategyTag ?? ""))
+                if (secondsHeld >= 150 && rMultiple < GetStaleRForStrategy(pos.StrategyTag ?? ""))
                 {
                     CancelBracketChildren(pos);
                     pos.ExitSubmitted = true;
@@ -2808,6 +2952,7 @@ public class SimulatedBroker
                     EntryTime = DateTime.UtcNow,
                     IsShort = isShortEntry,
                     StrategyTag = resolvedTag,
+                    EntryRegime = _marketRegime,
                     EntryCommission = COMMISSION_PER_SIDE,
                     InitialRiskPerShare = initialRisk
                 };
@@ -2877,7 +3022,7 @@ public class SimulatedBroker
                     ExitReason = exitReason,
                     Time = GetEasternTime().ToString("HH:mm"),
                     Date = GetEasternTime().Date.ToString("yyyy-MM-dd"),
-                    Regime = _marketRegime
+                    Regime = string.IsNullOrWhiteSpace(pos.EntryRegime) ? _marketRegime : pos.EntryRegime
                 });
                 if (_completedTrades.Count > 200) _completedTrades.RemoveAt(0);
 
@@ -2894,7 +3039,7 @@ public class SimulatedBroker
                     ExitReason = exitReason,
                     Time = GetEasternTime().ToString("HH:mm"),
                     Date = GetEasternTime().Date.ToString("yyyy-MM-dd"),
-                    Regime = _marketRegime
+                    Regime = string.IsNullOrWhiteSpace(pos.EntryRegime) ? _marketRegime : pos.EntryRegime
                 };
                 lock (_allTrades)
                 {
@@ -2931,7 +3076,7 @@ public class SimulatedBroker
 
                     _positions.Remove(order.Symbol);
                     _lastTradeTime[order.Symbol] = DateTime.UtcNow;
-                    _lastTradeWasLoss[order.Symbol] = netPnl <= 0;
+                    _lastTradeWasLoss[order.Symbol] = recordedNetPnl <= 0;
                 }
 
                 subject = $"💰 {(isFullClose ? "CLOSE" : "PARTIAL")}: {order.Symbol} x{fillQty} @ {fillPrice:C2} | Net: {recordedNetPnl:C2}";
@@ -2987,6 +3132,10 @@ public class SimulatedBroker
         _lastTradeWasLoss.Clear();
         _earningsBlacklist.Clear();
         _strategyTradeCount.Clear();
+        _pendingEntrySymbols.Clear();
+        _pendingStrategyTag?.Clear();
+        _pendingInitialRisk.Clear();
+        _pendingBracketChildren.Clear();
         _pendingEntryCount = 0;
         _completedTrades.Clear();
         _lastVolumeResetEt = nowEt.Date;
@@ -3368,6 +3517,29 @@ public class SimulatedBroker
         return Math.Min(MAX_MARKET_DATA_LINES / linesPerSym, MAX_MARKET_DATA_LINES);
     }
 
+    private static string[] NormalizeWatchlist(IEnumerable<string> symbols)
+    {
+        return (symbols ?? Array.Empty<string>())
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .Select(s => s.Trim().ToUpperInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private void SyncBrokerDataLineBudget()
+    {
+        if (RealBroker is IbClient ib)
+        {
+            int slots = GetSubscriptionSlots();
+            ib.MaxMarketDataLines = slots;
+            LogMessage($"[DATA] IBKR live-subscription cap synced to {slots} symbol slots (budget: {MAX_MARKET_DATA_LINES} lines ÷ {Math.Max(1, DATA_LINES_PER_SYMBOL)}/sym).");
+        }
+    }
+
+    public int ConfiguredMarketDataLines => MAX_MARKET_DATA_LINES;
+    public int ConfiguredDataLinesPerSymbol => Math.Max(1, DATA_LINES_PER_SYMBOL);
+    public int ConfiguredSubscriptionSlots => GetSubscriptionSlots();
+
     private IEnumerable<string> GetPrioritizedWatchlist()
     {
         var withPosition = new HashSet<string>(_positions.Keys, StringComparer.OrdinalIgnoreCase);
@@ -3423,51 +3595,57 @@ public class SimulatedBroker
         _previousOrbMinutes = ORB_MINUTES;
     }
 
-    public async Task ApplyWatchlistDiff(string[] oldList, string[] newList)
+    public async Task ReconcileWatchlistSubscriptions()
     {
         if (RealBroker == null || !RealBroker.IsReady) return;
 
-        var added = newList.Except(oldList, StringComparer.OrdinalIgnoreCase).ToArray();
-        var removed = oldList.Except(newList, StringComparer.OrdinalIgnoreCase).ToArray();
+        SyncBrokerDataLineBudget();
 
-        foreach (var sym in removed)
+        int slots = GetSubscriptionSlots();
+        var target = GetPrioritizedWatchlist().Take(slots).ToArray();
+        var targetSet = new HashSet<string>(target, StringComparer.OrdinalIgnoreCase);
+        var currentlySubscribed = _subscribedSymbols.ToArray();
+
+        foreach (var sym in currentlySubscribed)
         {
+            if (targetSet.Contains(sym)) continue;
+
             bool hasPosition;
             lock (_lock) { hasPosition = _positions.ContainsKey(sym); }
             if (hasPosition)
             {
-                LogMessage($"[WATCHLIST] {sym} removed from watchlist but has open position — keeping feed until flat.");
+                LogMessage($"[WATCHLIST] {sym} is outside the current line budget but has an open position — keeping feed until flat.");
                 continue;
             }
-            LogMessage($"[WATCHLIST] Unsubscribing removed symbol: {sym}");
+
+            LogMessage($"[WATCHLIST] Unsubscribing non-target symbol: {sym}");
             try { RealBroker.CancelMarketData(sym); } catch { }
             _subscribedSymbols.Remove(sym);
         }
 
-        int slots = GetSubscriptionSlots();
-        int available = slots - _subscribedSymbols.Count;
+        var currentlySubscribedSet = new HashSet<string>(_subscribedSymbols, StringComparer.OrdinalIgnoreCase);
+        int available = Math.Max(0, slots - currentlySubscribedSet.Count);
+        var missing = target.Where(sym => !currentlySubscribedSet.Contains(sym)).Take(available).ToArray();
+        int overflow = Math.Max(0, _watchlist.Length - target.Length);
 
-        if (available <= 0)
-        {
-            LogMessage($"[DATA] No free data slots for {added.Length} new symbol(s). " +
-                       $"Budget: {MAX_MARKET_DATA_LINES} lines ÷ {DATA_LINES_PER_SYMBOL}/sym = {slots} slots, all used. " +
-                       $"Raise MAX_MARKET_DATA_LINES in settings or remove other symbols first.");
-            return;
-        }
-
-        var toAdd = added.Take(available).ToArray();
-        int overflow = added.Length - toAdd.Length;
         if (overflow > 0)
-            LogMessage($"[DATA] Line budget only allows {toAdd.Length}/{added.Length} new symbols. {overflow} skipped.");
+            LogMessage($"[DATA] Active budget is {slots} symbol slots. {_watchlist.Length - target.Length} watchlist symbol(s) remain inactive until slots are freed or MAX_MARKET_DATA_LINES is raised.");
 
-        foreach (var sym in toAdd)
+        if (missing.Length < target.Count(sym => !currentlySubscribedSet.Contains(sym)))
+            LogMessage($"[DATA] Some target symbols could not be activated because existing open-position feeds are using the remaining slots.");
+
+        foreach (var sym in missing)
         {
-            if (_subscribedSymbols.Contains(sym)) continue;
-            LogMessage($"[WATCHLIST] Subscribing new symbol: {sym}");
+            LogMessage($"[WATCHLIST] Subscribing target symbol: {sym}");
             RealBroker.RequestHistoricalData(sym);
             _subscribedSymbols.Add(sym);
             await Task.Delay(1500);
         }
+    }
+
+    public Task ApplyWatchlistDiff(string[] oldList, string[] newList)
+    {
+        return ReconcileWatchlistSubscriptions();
     }
 
     public void ReevaluateHalt()
@@ -3789,8 +3967,13 @@ public class SimulatedBroker
             UNREALIZED_DD_HALT_THRESHOLD = GetD("UNREALIZED_DD_HALT", UNREALIZED_DD_HALT_THRESHOLD);
             DYNAMIC_SIZING_ENABLED = GetB("DYNAMIC_SIZING", DYNAMIC_SIZING_ENABLED);
             MAX_TRADES_PER_STRATEGY = GetI("MAX_TRADES_PER_STRATEGY", MAX_TRADES_PER_STRATEGY);
+            MAX_TRADES_PER_SYMBOL_PER_DAY = GetI("MAX_TRADES_PER_SYMBOL_PER_DAY", MAX_TRADES_PER_SYMBOL_PER_DAY);
             TREND_REVERSAL_GATE_ENABLED = GetB("TREND_REVERSAL_GATE", TREND_REVERSAL_GATE_ENABLED);
             SHOW_PROJECTIONS = GetB("SHOW_PROJECTIONS", SHOW_PROJECTIONS);
+            ALLOW_BULLISH_CANDLE_PATTERNS = GetB("ALLOW_BULLISH_CANDLE_PATTERNS", ALLOW_BULLISH_CANDLE_PATTERNS);
+            ALLOW_SCALP_BREAKOUT_LONGS = GetB("ALLOW_SCALP_BREAKOUT_LONGS", ALLOW_SCALP_BREAKOUT_LONGS);
+            ALLOW_SCALP_BREAKOUT_SHORTS = GetB("ALLOW_SCALP_BREAKOUT_SHORTS", ALLOW_SCALP_BREAKOUT_SHORTS);
+            ALLOW_SCALP_ORB_LONGS = GetB("ALLOW_SCALP_ORB_LONGS", ALLOW_SCALP_ORB_LONGS);
 
             if (root.TryGetProperty("earnings_blacklist", out var ebEl) && ebEl.ValueKind == System.Text.Json.JsonValueKind.Array)
             {
@@ -3810,19 +3993,13 @@ public class SimulatedBroker
                 foreach (var item in wlEl.EnumerateArray())
                 {
                     var s = item.GetString();
-                    if (!string.IsNullOrWhiteSpace(s)) list.Add(s.Trim().ToUpper());
+                    if (!string.IsNullOrWhiteSpace(s)) list.Add(s);
                 }
-                int slotCap = DATA_LINES_PER_SYMBOL > 0
-                    ? MAX_MARKET_DATA_LINES / DATA_LINES_PER_SYMBOL
-                    : MAX_MARKET_DATA_LINES;
-                if (list.Count > slotCap)
-                {
-                    Console.WriteLine($"[CONFIG] Watchlist in config has {list.Count} symbols — trimming to {slotCap} to stay within data line budget.");
-                    list = list.Take(slotCap).ToList();
-                }
-                if (list.Count > 0) _watchlist = list.ToArray();
+                var normalized = NormalizeWatchlist(list);
+                if (normalized.Length > 0) _watchlist = normalized;
             }
 
+            SyncBrokerDataLineBudget();
             Console.WriteLine($"[CONFIG] Loaded from {CONFIG_FILE}");
         }
         catch (Exception ex)
@@ -3933,8 +4110,13 @@ public class SimulatedBroker
             $"\"UNREALIZED_DD_HALT\":{UNREALIZED_DD_HALT_THRESHOLD:F2}",
             $"\"DYNAMIC_SIZING\":{(DYNAMIC_SIZING_ENABLED ? "true" : "false")}",
             $"\"MAX_TRADES_PER_STRATEGY\":{MAX_TRADES_PER_STRATEGY}",
+            $"\"MAX_TRADES_PER_SYMBOL_PER_DAY\":{MAX_TRADES_PER_SYMBOL_PER_DAY}",
             $"\"TREND_REVERSAL_GATE\":{(TREND_REVERSAL_GATE_ENABLED ? "true" : "false")}",
             $"\"SHOW_PROJECTIONS\":{(SHOW_PROJECTIONS ? "true" : "false")}",
+            $"\"ALLOW_BULLISH_CANDLE_PATTERNS\":{(ALLOW_BULLISH_CANDLE_PATTERNS ? "true" : "false")}",
+            $"\"ALLOW_SCALP_BREAKOUT_LONGS\":{(ALLOW_SCALP_BREAKOUT_LONGS ? "true" : "false")}",
+            $"\"ALLOW_SCALP_BREAKOUT_SHORTS\":{(ALLOW_SCALP_BREAKOUT_SHORTS ? "true" : "false")}",
+            $"\"ALLOW_SCALP_ORB_LONGS\":{(ALLOW_SCALP_ORB_LONGS ? "true" : "false")}",
             $"\"earnings_blacklist\":[{string.Join(",", _earningsBlacklist.Select(s => $"\"{s}\""))}]",
             $"\"watchlist\":{wlJson}"
         }) + $"{nl}}}";
@@ -4187,8 +4369,13 @@ public class SimulatedBroker
                         UNREALIZED_DD_HALT_THRESHOLD = GetD("UNREALIZED_DD_HALT", UNREALIZED_DD_HALT_THRESHOLD);
                         DYNAMIC_SIZING_ENABLED = GetB("DYNAMIC_SIZING", DYNAMIC_SIZING_ENABLED);
                         MAX_TRADES_PER_STRATEGY = GetI("MAX_TRADES_PER_STRATEGY", MAX_TRADES_PER_STRATEGY);
+                        MAX_TRADES_PER_SYMBOL_PER_DAY = GetI("MAX_TRADES_PER_SYMBOL_PER_DAY", MAX_TRADES_PER_SYMBOL_PER_DAY);
                         TREND_REVERSAL_GATE_ENABLED = GetB("TREND_REVERSAL_GATE", TREND_REVERSAL_GATE_ENABLED);
                         SHOW_PROJECTIONS = GetB("SHOW_PROJECTIONS", SHOW_PROJECTIONS);
+                        ALLOW_BULLISH_CANDLE_PATTERNS = GetB("ALLOW_BULLISH_CANDLE_PATTERNS", ALLOW_BULLISH_CANDLE_PATTERNS);
+                        ALLOW_SCALP_BREAKOUT_LONGS = GetB("ALLOW_SCALP_BREAKOUT_LONGS", ALLOW_SCALP_BREAKOUT_LONGS);
+                        ALLOW_SCALP_BREAKOUT_SHORTS = GetB("ALLOW_SCALP_BREAKOUT_SHORTS", ALLOW_SCALP_BREAKOUT_SHORTS);
+                        ALLOW_SCALP_ORB_LONGS = GetB("ALLOW_SCALP_ORB_LONGS", ALLOW_SCALP_ORB_LONGS);
 
                         if (root.TryGetProperty("earnings_blacklist", out var ebLiveEl) && ebLiveEl.ValueKind == System.Text.Json.JsonValueKind.Array)
                         {
@@ -4209,24 +4396,18 @@ public class SimulatedBroker
                             foreach (var item in wlEl.EnumerateArray())
                             {
                                 var s = item.GetString();
-                                if (!string.IsNullOrWhiteSpace(s)) list.Add(s.Trim().ToUpper());
+                                if (!string.IsNullOrWhiteSpace(s)) list.Add(s);
                             }
-                            int liveCap = Math.Max(1, DATA_LINES_PER_SYMBOL) > 0
-                                ? MAX_MARKET_DATA_LINES / Math.Max(1, DATA_LINES_PER_SYMBOL)
-                                : MAX_MARKET_DATA_LINES;
-                            if (list.Count > liveCap)
+                            var normalized = NormalizeWatchlist(list);
+                            if (normalized.Length > 0)
                             {
-                                LogMessage($"[CONFIG] Watchlist trimmed {list.Count}→{liveCap} (data line budget).");
-                                list = list.Take(liveCap).ToList();
-                            }
-                            if (list.Count > 0)
-                            {
-                                newWatchlist = list.ToArray();
+                                newWatchlist = normalized;
                                 _watchlist = newWatchlist;
                             }
                         }
                     }
 
+                    SyncBrokerDataLineBudget();
                     ReevaluateHalt();
 
                     if (orbChanged)
@@ -4235,8 +4416,7 @@ public class SimulatedBroker
                         LogMessage($"[CONFIG] ORB_MINUTES changed — cleared all opening ranges, will recompute.");
                     }
 
-                    if (newWatchlist != null)
-                        _ = Task.Run(() => ApplyWatchlistDiff(oldWatchlist, newWatchlist));
+                    _ = Task.Run(() => ReconcileWatchlistSubscriptions());
 
                     SaveConfig();
                     json = "{\"ok\":true,\"message\":\"Configuration saved and applied live.\"}";
@@ -4532,10 +4712,11 @@ public class SimulatedBroker
                 bool hot = dataReady && vwap > 0 && price > vwap && rsi > 55;
 
                 if (!wfirst) wlArr.Append(",");
-                wfirst = false;
-                string pxSrc = quote.source;
+                wfirst = false;                string pxSrc = quote.source;
                 string ageJson = double.IsFinite(quote.ageSec) ? quote.ageSec.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) : "9999";
-                wlArr.Append($@"{{""s"":""{sym}"",""price"":{price:F2},""last"":{quote.last:F2},""bid"":{quote.bid:F2},""ask"":{quote.ask:F2},""pxSrc"":""{pxSrc}"",""ageSec"":{ageJson},""vwap"":{vwap:F2},""sma20"":{sma20:F2},""sma50"":{sma50:F2},""sma200"":{sma200:F2},""rsi"":{rsi:F1},""gap"":{gapPct:F2},""chg"":{chgPct:F2},""vol"":{volK},""atr"":{atrPct:F2},""orbHi"":{orbHi:F2},""orbLo"":{orbLo:F2},""pdHi"":{pdHi:F2},""pdLo"":{pdLo:F2},""macd"":{macdDir},""trend"":""{trend}"",""sig"":""{sig}"",""hot"":{(hot ? "true" : "false")},""abvVwap"":{(abvVwap ? "true" : "false")}}}");
+                string why = GetWatchlistReadiness(sym);
+                string whyEsc = why.Replace("\\", "\\\\").Replace("\"", "\\\"");
+                wlArr.Append($@"{{""s"":""{sym}"",""price"":{price:F2},""last"":{quote.last:F2},""bid"":{quote.bid:F2},""ask"":{quote.ask:F2},""pxSrc"":""{pxSrc}"",""ageSec"":{ageJson},""vwap"":{vwap:F2},""sma20"":{sma20:F2},""sma50"":{sma50:F2},""sma200"":{sma200:F2},""rsi"":{rsi:F1},""gap"":{gapPct:F2},""chg"":{chgPct:F2},""vol"":{volK},""atr"":{atrPct:F2},""orbHi"":{orbHi:F2},""orbLo"":{orbLo:F2},""pdHi"":{pdHi:F2},""pdLo"":{pdLo:F2},""macd"":{macdDir},""trend"":""{trend}"",""sig"":""{sig}"",""why"":""{whyEsc}"",""hot"":{(hot ? "true" : "false")},""abvVwap"":{(abvVwap ? "true" : "false")}}}");
             }
             wlArr.Append("]");
 
@@ -5174,7 +5355,7 @@ public class SimulatedBroker
 
     private decimal GetStopDistanceForStrategy(string strategyTag, decimal atr, decimal price)
     {
-        decimal minStop = Math.Max(MIN_STOP_DISTANCE, price * 0.0018m);
+        decimal minStop = Math.Max(MIN_STOP_DISTANCE, price * 0.0022m);
         decimal scalpAtrMult = strategyTag.StartsWith("SCALP_PATTERN_", StringComparison.OrdinalIgnoreCase)
             ? 0.70m
             : strategyTag.StartsWith("SCALP_BREAKOUT_", StringComparison.OrdinalIgnoreCase)
@@ -5192,9 +5373,9 @@ public class SimulatedBroker
     private decimal GetTargetMultipleForStrategy(string strategyTag)
     {
         if (!IsScalpStrategy(strategyTag)) return 2.40m;
-        if (strategyTag.StartsWith("SCALP_PATTERN_", StringComparison.OrdinalIgnoreCase)) return 1.00m;
-        if (strategyTag.StartsWith("SCALP_ORB_", StringComparison.OrdinalIgnoreCase)) return 1.15m;
-        return 1.10m;
+        if (strategyTag.StartsWith("SCALP_PATTERN_", StringComparison.OrdinalIgnoreCase)) return 1.45m;
+        if (strategyTag.StartsWith("SCALP_ORB_", StringComparison.OrdinalIgnoreCase)) return 1.65m;
+        return 1.55m;
     }
 
     private int GetMaxHoldSecondsForStrategy(string strategyTag)
@@ -5211,12 +5392,12 @@ public class SimulatedBroker
 
     private decimal GetScratchRForStrategy(string strategyTag)
     {
-        return IsScalpStrategy(strategyTag) ? -0.35m : decimal.MinValue;
+        return IsScalpStrategy(strategyTag) ? -0.10m : decimal.MinValue;
     }
 
     private decimal GetStaleRForStrategy(string strategyTag)
     {
-        return IsScalpStrategy(strategyTag) ? 0.15m : decimal.MinValue;
+        return IsScalpStrategy(strategyTag) ? 0.35m : decimal.MinValue;
     }
 
     private bool IsStrategyAtDailyLimit(string strategyTag)
@@ -5230,6 +5411,61 @@ public class SimulatedBroker
     {
         string family = GetStrategyFamily(strategyTag);
         _strategyTradeCount.AddOrUpdate(family, 1, (_, old) => old + 1);
+    }
+
+    private DateTime ParseTradeRecordTime(TradeRecord t)
+    {
+        if (t == null || string.IsNullOrWhiteSpace(t.Date)) return DateTime.MinValue;
+        if (!DateTime.TryParse(t.Date, out var d)) return DateTime.MinValue;
+        if (!string.IsNullOrWhiteSpace(t.Time) && TimeSpan.TryParse(t.Time, out var tod))
+            return d.Date.Add(tod);
+        return d.Date;
+    }
+
+    private bool IsSymbolCold(string symbol)
+    {
+        if (string.IsNullOrWhiteSpace(symbol)) return false;
+        if (symbol.Equals("SPY", StringComparison.OrdinalIgnoreCase) ||
+            symbol.Equals("QQQ", StringComparison.OrdinalIgnoreCase) ||
+            symbol.Equals("IWM", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        List<TradeRecord> recent;
+        lock (_allTrades)
+        {
+            recent = _allTrades
+                .Where(t => string.Equals(t.Symbol, symbol, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(ParseTradeRecordTime)
+                .Take(8)
+                .ToList();
+        }
+
+        if (recent.Count < 4) return false;
+        decimal pnl = recent.Sum(t => t.NetPnL);
+        double winRate = recent.Count > 0 ? recent.Count(t => t.NetPnL > 0) / (double)recent.Count : 0.0;
+        return pnl <= -10m && winRate < 0.40;
+    }
+
+    private bool IsStrategyCold(string strategyTag)
+    {
+        string family = GetStrategyFamily(strategyTag);
+        if (string.IsNullOrWhiteSpace(family) || family.Equals("UNKNOWN", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        List<TradeRecord> recent;
+        lock (_allTrades)
+        {
+            recent = _allTrades
+                .Where(t => GetStrategyFamily(t.Strategy ?? "") == family)
+                .OrderByDescending(ParseTradeRecordTime)
+                .Take(10)
+                .ToList();
+        }
+
+        if (recent.Count < 5) return false;
+        decimal pnl = recent.Sum(t => t.NetPnL);
+        double winRate = recent.Count > 0 ? recent.Count(t => t.NetPnL > 0) / (double)recent.Count : 0.0;
+        return pnl <= -12m && winRate < 0.35;
     }
 
     // ══════════════════════════════════════════════════════════
@@ -5325,7 +5561,7 @@ public class SimulatedBroker
         return Math.Clamp(multiplier, 0.25m, 1.0m);
     }
 
-    private int CalcQty(decimal price, decimal stopDistance)
+    private int CalcQty(decimal price, decimal stopDistance, bool logIfScaled = true)
     {
         decimal minStop = Math.Max(MIN_STOP_DISTANCE, price * 0.0018m);
         if (stopDistance < minStop) stopDistance = minStop;
@@ -5344,7 +5580,7 @@ public class SimulatedBroker
         qty = Math.Min(qty, maxByBudget);
         if (qty <= 0 || qty > MAX_QTY_SANITY) return 0;
 
-        if (sizeMultiplier < 1.0m)
+        if (logIfScaled && sizeMultiplier < 1.0m)
             LogMessage($"[DYNAMIC SIZE] Risk scaled to {sizeMultiplier:P0} — qty={qty} (drawdown protection)");
 
         return qty;

@@ -146,18 +146,25 @@ public class BacktestConfig
     public decimal PositionSize { get; set; } = 900m;
     public decimal HardStopAtrMult { get; set; } = 1.2m;
     public decimal AtrTrailMult { get; set; } = 1.1m;
-    public decimal TargetAtrMult { get; set; } = 1.1m;
+    public decimal TargetAtrMult { get; set; } = 1.3m;
     public decimal Commission { get; set; } = 2.0m;
     public decimal EntrySlippagePct { get; set; } = 0.0003m;
     public decimal ExitSlippagePct { get; set; } = 0.0003m;
     public int MaxPositions { get; set; } = 3;
-    public int MaxTradesPerDay { get; set; } = 16;
-    public int MinHoldSeconds { get; set; } = 45;
-    public double RsiLongMin { get; set; } = 57.0;
-    public double RsiShortMax { get; set; } = 43.0;
-    public int OrbMinutes { get; set; } = 7;
+    public int MaxTradesPerDay { get; set; } = 8;
+    public int MinHoldSeconds { get; set; } = 60;
+    public double RsiLongMin { get; set; } = 59.0;
+    public double RsiShortMax { get; set; } = 38.0;
+    public int OrbMinutes { get; set; } = 9;
     public decimal BreakEvenTriggerR { get; set; } = 1.0m;
     public decimal MinBreakoutBodyRatio { get; set; } = 0.45m;
+    public int MinSetupScore { get; set; } = 60;
+    public int MinEntryMinutesAfterOpen { get; set; } = 15;
+    public int MinEntryQty { get; set; } = 5;
+    public decimal MinGrossTargetToCommissionMult { get; set; } = 3.0m;
+    public bool AllowBullishPatternEntries { get; set; } = false;
+    public bool AllowScalpBreakoutLongs { get; set; } = false;
+    public bool AllowScalpOrbLongs { get; set; } = false;
     // Historical mode metadata
     public bool IsHistoricalMode { get; set; }
     public string HistoricalPeriodLabel { get; set; } = "";
@@ -1023,7 +1030,7 @@ public static class BacktestEngine
             if (tradesPerDay.GetValueOrDefault(etTime.Date) >= cfg.MaxTradesPerDay) continue;
             string tradeKey = symbol + "|" + etTime.Date.ToString("yyyy-MM-dd");
             if (symbolTradesToday.GetValueOrDefault(tradeKey) >= 3) continue;
-            if (etTime.Hour < 9 || (etTime.Hour == 9 && etTime.Minute < 35)) continue;
+            if (etTime.Hour < 9 || (etTime.Hour == 9 && etTime.Minute < (30 + cfg.MinEntryMinutesAfterOpen))) continue;
             if (etTime.Hour > 15 || (etTime.Hour == 15 && etTime.Minute >= 30)) continue;
             if (win.Count < 50) continue;
 
@@ -1066,7 +1073,7 @@ public static class BacktestEngine
             decimal atrPct = close > 0 ? atr / close : 0m;
             if (atrPct >= 0.003m && atrPct <= 0.02m) setupScore += 20;
             setupScore += regime == "TRENDING" ? 15 : regime == "NORMAL" ? 10 : regime == "SELL-OFF" ? 5 : 0;
-            if (setupScore < 35) continue;
+            if (setupScore < cfg.MinSetupScore) continue;
 
             BtPosition newPos = null;
 
@@ -1076,7 +1083,7 @@ public static class BacktestEngine
                 var patternResult = DetectBtPattern(win, atr);
                 if (patternResult.score >= 55)
                 {
-                    if (patternResult.bullish && !blockLongs && rsi >= 44 && (vwap <= 0 || close >= vwap - atr * 0.5m) && volOk)
+                    if (patternResult.bullish && cfg.AllowBullishPatternEntries && !blockLongs && rsi >= 44 && (vwap <= 0 || close >= vwap - atr * 0.5m) && volOk)
                     {
                         int qty = CalcQty(close, atr * cfg.HardStopAtrMult, cfg);
                         if (qty > 0)
@@ -1145,7 +1152,7 @@ public static class BacktestEngine
                     bool longBias = sma20 > 0 && close > sma20 && close > vwap && rsi >= 54 && rsi <= 78;
                     bool shortBias = sma20 > 0 && close < sma20 && close < vwap && rsi >= 22 && rsi <= 46;
 
-                    if (!blockLongs && longBias && fastVol && closePos >= 0.65m && close > recentHigh3)
+                    if (cfg.AllowScalpBreakoutLongs && !blockLongs && longBias && fastVol && closePos >= 0.65m && close > recentHigh3)
                     {
                         int qty = CalcQty(close, Math.Max(atr * 0.75m, close - candle.Low), cfg);
                         if (qty > 0)
@@ -1168,7 +1175,7 @@ public static class BacktestEngine
 
                 // ORB_LONG: blocked in SELL-OFF or bearish SPY open
                 // Also requires stock to be UP or flat on the day (daily direction filter)
-                if (!blockLongs && orbLongHold && rsi > cfg.RsiLongMin && volOk && HasStrongBodyClose(candle, true, cfg))
+                if (cfg.AllowScalpOrbLongs && !blockLongs && orbLongHold && rsi > cfg.RsiLongMin && volOk && HasStrongBodyClose(candle, true, cfg))
                 {
                     // Stock daily direction check: must be >= -0.2% vs prev candle day's last close
                     bool stockDayOk = true;
@@ -1523,7 +1530,14 @@ public static class BacktestEngine
         int qty = (int)(risk / stopDistance);
         int maxBySlot = price > 0 ? (int)(cfg.PositionSize / price) : 0;
         qty = Math.Min(qty, maxBySlot);
-        return qty > 0 && qty <= 500 ? qty : 0;
+        if (qty <= 0 || qty > 500 || qty < cfg.MinEntryQty) return 0;
+
+        decimal roundTripCommission = cfg.Commission * 2m;
+        decimal grossTargetPnL = stopDistance * cfg.TargetAtrMult * qty;
+        decimal minGrossTargetPnL = roundTripCommission * cfg.MinGrossTargetToCommissionMult;
+        if (grossTargetPnL < minGrossTargetPnL) return 0;
+
+        return qty;
     }
 
     private static decimal StdDev(IList<decimal> vals)
