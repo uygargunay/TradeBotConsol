@@ -420,7 +420,7 @@ private bool TryBollingerMeanReversionStrategy(string symbol, List<Candle> candl
     if (touchLower && (_marketRegime != "SELL-OFF" || CheckStrongRelativeStrength(symbol, candles)))
     {
         decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
-        int qty = CalcQty(close, stopDistance);
+        int qty = CalcQtyV2(close, stopDistance);
         if (qty <= 0) return false;
         OpenPosition(symbol, qty, close, TradeSide.Buy, false, "BB_MEAN_REV_LONG");
         return true;
@@ -432,7 +432,7 @@ private bool TryBollingerMeanReversionStrategy(string symbol, List<Candle> candl
     if (touchUpper && _allowShorts)
     {
         decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
-        int qty = CalcQty(close, stopDistance);
+        int qty = CalcQtyV2(close, stopDistance);
         if (qty <= 0) return false;
         OpenPosition(symbol, qty, close, TradeSide.Sell, true, "BB_MEAN_REV_SHORT");
         return true;

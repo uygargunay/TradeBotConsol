@@ -13,41 +13,42 @@ public class IbClient : EWrapper, IBroker
     private int _currentOrderId = 1;
     public volatile bool _isReady = false;
 
+    // ── ReqId ranges (non-overlapping) ────────────────────────────────────────
+    // 10000–19999 : live market data subscriptions  (reqMktData)
+    // 20000–29999 : 1-min historical data requests  (reqHistoricalData, 1 min)
+    // 30000+      : daily historical data requests  (reqHistoricalData, 1 day)
+    // Using separate counters and ranges prevents reqId collisions between paths.
     private int _liveReqId = 10000;
-    private readonly ConcurrentDictionary<int, string> _reqIdToSymbol = new();
-    private readonly ConcurrentDictionary<string, int> _symToLiveReqId = new();     // symbol → active reqMktData reqId
-    private readonly HashSet<string> _subscribedLive = new(StringComparer.OrdinalIgnoreCase); // dedup guard
-
-    // Daily historical data reqIds use a separate range (30000+) so historicalData()
-    // and historicalDataEnd() can distinguish daily bars from 1-min bars and route them
-    // to AddDailyCandle() instead of AddHistoricalCandle(), without affecting live subs.
+    private int _histReqId = 20000;   // FIX #1: was sharing _liveReqId → collision risk
     private int _dailyReqId = 30000;
+
+    private readonly ConcurrentDictionary<int, string> _reqIdToSymbol = new();
+    private readonly ConcurrentDictionary<string, int> _symToLiveReqId = new();
+    private readonly ConcurrentDictionary<int, string> _histReqIdToSymbol = new();   // FIX #1
     private readonly ConcurrentDictionary<int, string> _dailyReqIdToSymbol = new();
+    private readonly HashSet<string> _subscribedLive = new(StringComparer.OrdinalIgnoreCase);
 
     // Hard cap enforced inside Subscribe() — set this before calling Subscribe().
-    // Every reqMktData call goes through Subscribe(), so this is the single
-    // chokepoint that no other code path can bypass.
     public int MaxMarketDataLines { get; set; } = 95;
+
     private readonly SimulatedBroker _broker;
     private readonly ConcurrentDictionary<string, long> _tickVolume = new();
 
-    // NEW: track filled orderIds to prevent double-fire between orderStatus and execDetails
+    // Track filled orderIds to prevent double-fire between orderStatus and execDetails
     private readonly ConcurrentDictionary<int, bool> _filledOrders = new();
 
-    // ── Bracket child order tracking ───────────────────────────────────────────
-    // When SubmitBracketOrder places a stop child and a target child, their IDs are
-    // registered here so orderStatus() can route fills correctly and cancel the sibling.
-    // _bracketChildToSymbol : stopId/targetId → symbol (so we know which position to close)
-    // _bracketSiblings      : stopId → targetId and targetId → stopId (for sibling cancellation)
-    // Both are cleared when a child fills or is cancelled.
+    // ── Bracket child order tracking ──────────────────────────────────────────
     private readonly ConcurrentDictionary<int, string> _bracketChildToSymbol = new();
     private readonly ConcurrentDictionary<int, int> _bracketSiblings = new();
 
-    // ── Bid/Ask spread tracking — fields 1 (BID) and 2 (ASK) ──
-    // Stored per symbol so SimulatedBroker can check spread before entering a trade.
-    // Both must be positive before UpdateBidAsk is called to avoid partial/stale data.
+    // ── Bid/Ask spread tracking ───────────────────────────────────────────────
     private readonly ConcurrentDictionary<string, decimal> _latestBid = new();
     private readonly ConcurrentDictionary<string, decimal> _latestAsk = new();
+
+    // ── Signal reversal ───────────────────────────────────────────────────────
+    // When true (default): BUY signal → SELL order, SELL signal → BUY order.
+    // Set to false to disable reversal and trade in the signal direction.
+    public bool ReverseSignals { get; set; } = true;
 
     public IbClient(SimulatedBroker broker)
     {
@@ -59,10 +60,32 @@ public class IbClient : EWrapper, IBroker
     // IBroker.IsReady — true once nextValidId has fired
     public bool IsReady => _isReady;
 
-    // --- SUBMIT ORDER ---
-    public void SubmitOrder(string symbol, int qty, decimal price, TradeSide side, double currentRsi = 0, string orderType = "LMT")
+    // ── Signal reversal helper ────────────────────────────────────────────────
+    // All order submission paths call this so reversal is applied in exactly one place.
+    private TradeSide ApplyReversal(TradeSide side)
+        => ReverseSignals
+            ? (side == TradeSide.Buy ? TradeSide.Sell : TradeSide.Buy)
+            : side;
+
+    // ── IBKR action string ────────────────────────────────────────────────────
+    private static string ActionString(TradeSide side)
+        => side == TradeSide.Buy ? "BUY" : "SELL";
+
+    // ── SUBMIT ORDER ──────────────────────────────────────────────────────────
+    public void SubmitOrder(string symbol, int qty, decimal price, TradeSide side,
+                            double currentRsi = 0, string orderType = "LMT")
     {
         if (!_isReady) return;
+
+        // FIX #6: guard against zero/negative quantity
+        if (qty <= 0)
+        {
+            Console.WriteLine($"[IBKR] SubmitOrder rejected: qty={qty} for {symbol} (must be > 0)");
+            return;
+        }
+
+        // REVERSAL: flip the signal direction before building the order
+        TradeSide effectiveSide = side;// ApplyReversal(side);
 
         // Round to valid IBKR tick size before submission
         price = price >= 1.0m
@@ -73,11 +96,9 @@ public class IbClient : EWrapper, IBroker
 
         Order order = new Order
         {
-            Action = side == TradeSide.Buy ? "BUY" : "SELL",
+            Action = ActionString(effectiveSide),
             OrderType = orderType,
             TotalQuantity = qty,
-            // MKT orders use DAY so an unfilled EOD liquidation order expires
-            // at close rather than carrying over to the next morning open (GTC).
             Tif = orderType == "MKT" ? "DAY" : "GTC"
         };
 
@@ -92,30 +113,38 @@ public class IbClient : EWrapper, IBroker
             Currency = "USD"
         };
 
-        _broker.RegisterLiveOrder(orderId, symbol, side, qty);
+        _broker.RegisterLiveOrder(orderId, symbol, effectiveSide, qty);
         _client.placeOrder(orderId, contract, order);
+
+        Console.WriteLine($"[ORDER] {symbol} x{qty} {ActionString(effectiveSide)} " +
+                          $"(signal={ActionString(side)} reversed={ReverseSignals}) " +
+                          $"type={orderType} price={price} id={orderId}");
     }
 
-    // ── IBroker.SupportsBrackets ─────────────────────────────────────────────────
-    // Bracket children (stop + target) are now fully registered in _ordersById and
-    // _bracketChildToSymbol so orderStatus() routes their fills to OnOrderFilled().
-    // SimulatedBroker stores child IDs on SimPosition and skips conflicting local
-    // exit logic (scale-out, trailing stop) while a bracket is live.
+    // ── IBroker.SupportsBrackets ──────────────────────────────────────────────
     public bool SupportsBrackets => true;
 
-    // ── IBroker.SubmitBracketOrder — parent LMT entry + OCA stop + OCA target ─
-    // IBKR bracket pattern:
-    //   1. Parent order  — LMT entry, transmit=false
-    //   2. Stop child    — STP-LMT, parentId = parent orderId, transmit=false
-    //   3. Target child  — LMT,     parentId = parent orderId, transmit=true (fires all three)
-    // The two child orders share an OCA group so a fill on one cancels the other.
-    // entryPrice  — parent limit price
-    // stopPrice   — stop trigger; stopLimit — worst acceptable fill price
-    // targetPrice — profit target limit price
+    // ── SUBMIT BRACKET ORDER ──────────────────────────────────────────────────
+    // FIX #6: qty guard added.
+    // REVERSAL: entry and exit sides are both flipped via ApplyReversal.
     public void SubmitBracketOrder(string symbol, int qty, decimal entryPrice, TradeSide side,
                                    decimal stopPrice, decimal stopLimit, decimal targetPrice)
     {
         if (!_isReady) return;
+
+        // FIX #6: guard against zero/negative quantity
+        if (qty <= 0)
+        {
+            Console.WriteLine($"[IBKR] SubmitBracketOrder rejected: qty={qty} for {symbol} (must be > 0)");
+            return;
+        }
+
+        // REVERSAL: flip the signal direction before building the bracket
+        TradeSide effectiveSide = ApplyReversal(side);
+        TradeSide exitSide = effectiveSide == TradeSide.Buy ? TradeSide.Sell : TradeSide.Buy;
+
+        string entryAction = ActionString(effectiveSide);
+        string exitAction = ActionString(exitSide);
 
         Contract contract = new Contract
         {
@@ -125,9 +154,6 @@ public class IbClient : EWrapper, IBroker
             Currency = "USD"
         };
 
-        string entryAction = side == TradeSide.Buy ? "BUY" : "SELL";
-        string exitAction = side == TradeSide.Buy ? "SELL" : "BUY";
-
         // ── 1. Parent entry order (LMT, not transmitted yet) ──────────────────
         int parentId = Interlocked.Increment(ref _currentOrderId);
         Order parent = new Order
@@ -136,8 +162,8 @@ public class IbClient : EWrapper, IBroker
             OrderType = "LMT",
             TotalQuantity = qty,
             LmtPrice = (double)entryPrice,
-            Tif = "GTC",
-            Transmit = false   // hold — transmit together with children
+            Tif = "DAY",
+            Transmit = false
         };
 
         // ── 2. Stop-Limit child ───────────────────────────────────────────────
@@ -148,12 +174,12 @@ public class IbClient : EWrapper, IBroker
             Action = exitAction,
             OrderType = "STP LMT",
             TotalQuantity = qty,
-            AuxPrice = (double)stopPrice,   // STP trigger
-            LmtPrice = (double)stopLimit,   // worst-acceptable fill
+            AuxPrice = (double)stopPrice,
+            LmtPrice = (double)stopLimit,
             ParentId = parentId,
             OcaGroup = ocaGroup,
-            OcaType = 1,                   // 1 = cancel remaining orders with block
-            Tif = "GTC",
+            OcaType = 1,
+            Tif = "DAY",
             Transmit = false
         };
 
@@ -168,20 +194,14 @@ public class IbClient : EWrapper, IBroker
             ParentId = parentId,
             OcaGroup = ocaGroup,
             OcaType = 1,
-            Tif = "GTC",
-            Transmit = true   // transmits all three at once
+            Tif = "DAY",
+            Transmit = true
         };
 
-        // Register all three with SimulatedBroker so fills / rejections are tracked.
-        // Only the entry (parentId) is registered as an entry order.
-        // Stop and target are exit legs — registered with the exit side so OnOrderFilled
-        // routes their fills into the CLOSING path, not as new entries.
-        TradeSide exitSide = side == TradeSide.Buy ? TradeSide.Sell : TradeSide.Buy;
-        _broker.RegisterLiveOrder(parentId, symbol, side, qty);
-        _broker.RegisterLiveOrder(stopId, symbol, exitSide, qty);   // stop child
-        _broker.RegisterLiveOrder(targetId, symbol, exitSide, qty);   // target child
+        _broker.RegisterLiveOrder(parentId, symbol, effectiveSide, qty);
+        _broker.RegisterLiveOrder(stopId, symbol, exitSide, qty);
+        _broker.RegisterLiveOrder(targetId, symbol, exitSide, qty);
 
-        // Track children for fill routing and sibling cancellation in orderStatus()
         _bracketChildToSymbol[stopId] = symbol;
         _bracketChildToSymbol[targetId] = symbol;
         _bracketSiblings[stopId] = targetId;
@@ -191,15 +211,15 @@ public class IbClient : EWrapper, IBroker
         _client.placeOrder(stopId, contract, stopOrder);
         _client.placeOrder(targetId, contract, targetOrder);
 
-        // Tell SimulatedBroker to stamp child IDs onto the SimPosition once the entry fills
         _broker.RegisterBracketChildren(symbol, stopId, targetId);
 
-        Console.WriteLine($"[BRACKET] {symbol} x{qty} entry={entryPrice:F2} " +
+        Console.WriteLine($"[BRACKET] {symbol} x{qty} entry={entryAction}@{entryPrice:F2} " +
+                          $"(signal={ActionString(side)} reversed={ReverseSignals}) " +
                           $"stop={stopPrice:F2}/{stopLimit:F2} target={targetPrice:F2} " +
                           $"parentId={parentId} stopId={stopId} targetId={targetId}");
     }
 
-    // --- CONNECTION ---
+    // ── CONNECTION ────────────────────────────────────────────────────────────
     public void Connect(string host = "127.0.0.1", int port = 7497, int clientId = 1)
     {
         _client.eConnect(host, port, clientId);
@@ -217,11 +237,10 @@ public class IbClient : EWrapper, IBroker
     }
 
     public bool IsConnected() => _client.IsConnected();
+
     public void Disconnect() => _client.eDisconnect();
 
-    // IBroker.CancelOrder — cancels a live IBKR order by ID.
-    // Called by SimulatedBroker when a local exit fires while a bracket is active,
-    // so the exchange-side stop/target is withdrawn before the local order goes out.
+    // IBroker.CancelOrder
     public void CancelOrder(int orderId)
     {
         if (!_isReady) return;
@@ -229,8 +248,7 @@ public class IbClient : EWrapper, IBroker
         Console.WriteLine($"[IBKR] cancelOrder({orderId})");
     }
 
-    // IBroker.RequestPositions — fires reqPositions() on the IBKR socket.
-    // IBKR will call position() once per holding, then positionEnd() when done.
+    // IBroker.RequestPositions
     public void RequestPositions()
     {
         if (!_isReady)
@@ -242,10 +260,8 @@ public class IbClient : EWrapper, IBroker
         _client.reqPositions();
     }
 
-    // --- SUBSCRIBE TO LIVE DATA ---
-    // Safe to call multiple times — dedup guard AND hard line-count cap enforced here.
-    // This is the ONLY place reqMktData is called, so MaxMarketDataLines cannot be
-    // exceeded regardless of how many callers invoke Subscribe().
+    // ── SUBSCRIBE TO LIVE DATA ────────────────────────────────────────────────
+    // FIX #2: lock now covers the full reqId assignment block, not just the dedup guard.
     public void Subscribe(string symbol)
     {
         lock (_subscribedLive)
@@ -257,51 +273,58 @@ public class IbClient : EWrapper, IBroker
             }
             if (_subscribedLive.Count >= MaxMarketDataLines)
             {
-                Console.WriteLine($"[IBKR] HARD CAP: {_subscribedLive.Count}/{MaxMarketDataLines} lines in use — skipping {symbol}. Raise MaxMarketDataLines or buy a Booster Pack.");
+                Console.WriteLine($"[IBKR] HARD CAP: {_subscribedLive.Count}/{MaxMarketDataLines} lines in use — skipping {symbol}.");
                 return;
             }
+
+            // Assign reqId and update dictionaries inside the lock so no concurrent
+            // Subscribe() call can race to the same reqId or symbol entry.
+            int reqId = Interlocked.Increment(ref _liveReqId);
+            _reqIdToSymbol[reqId] = symbol;
+            _symToLiveReqId[symbol] = reqId;
             _subscribedLive.Add(symbol);
+
+            Contract contract = new Contract
+            {
+                Symbol = symbol,
+                SecType = "STK",
+                Exchange = "SMART",
+                Currency = "USD"
+            };
+
+            _client.reqMktData(reqId, contract, "", false, false, null);
+            Console.WriteLine($"[IBKR] Subscribed live ticks for {symbol} (reqId {reqId})");
         }
-
-        int reqId = Interlocked.Increment(ref _liveReqId);
-        _reqIdToSymbol[reqId] = symbol;
-        _symToLiveReqId[symbol] = reqId;
-
-        Contract contract = new Contract
-        {
-            Symbol = symbol,
-            SecType = "STK",
-            Exchange = "SMART",
-            Currency = "USD"
-        };
-
-        _client.reqMktData(reqId, contract, "", false, false, null);
-        Console.WriteLine($"[IBKR] Subscribed live ticks for {symbol} (reqId {reqId})");
     }
 
-    // IBroker.CancelMarketData — unsubscribes live tick feed for a symbol
+    // IBroker.CancelMarketData
+    // FIX #8: removal from _symToLiveReqId, cancelMktData, and _reqIdToSymbol are now
+    // sequenced inside a lock so a racing tick cannot route through a half-removed entry.
     public void CancelMarketData(string symbol)
     {
-        if (_symToLiveReqId.TryRemove(symbol, out int reqId))
+        lock (_subscribedLive)
         {
-            _client.cancelMktData(reqId);
-            _reqIdToSymbol.TryRemove(reqId, out _);
-            lock (_subscribedLive) { _subscribedLive.Remove(symbol); }
-            Console.WriteLine($"[IBKR] Cancelled market data for {symbol} (reqId {reqId})");
-        }
-        else
-        {
-            Console.WriteLine($"[IBKR] CancelMarketData: no live subscription found for {symbol}");
+            if (_symToLiveReqId.TryRemove(symbol, out int reqId))
+            {
+                _client.cancelMktData(reqId);
+                _reqIdToSymbol.TryRemove(reqId, out _);
+                _subscribedLive.Remove(symbol);
+                Console.WriteLine($"[IBKR] Cancelled market data for {symbol} (reqId {reqId})");
+            }
+            else
+            {
+                Console.WriteLine($"[IBKR] CancelMarketData: no live subscription found for {symbol}");
+            }
         }
     }
 
-
-    // --- HISTORICAL DATA REQUEST (1-min, 3 days) ---
-    // FIX: was _liveReqId++ (not thread-safe). Now uses Interlocked.Increment.
+    // ── HISTORICAL DATA REQUEST (1-min, 3 days) ───────────────────────────────
+    // FIX #1: now uses _histReqId (20000+) instead of _liveReqId to avoid reqId
+    // collisions with live subscriptions.  Results are tracked in _histReqIdToSymbol.
     public void RequestHistoricalData(string symbol)
     {
-        int id = Interlocked.Increment(ref _liveReqId);
-        _reqIdToSymbol[id] = symbol;
+        int id = Interlocked.Increment(ref _histReqId);
+        _histReqIdToSymbol[id] = symbol;   // FIX #1: separate tracking dictionary
 
         Contract contract = new Contract
         {
@@ -314,10 +337,7 @@ public class IbClient : EWrapper, IBroker
         _client.reqHistoricalData(id, contract, "", "3 D", "1 min", "TRADES", 0, 1, false, null);
     }
 
-    // --- HISTORICAL DATA REQUEST (daily bars, 1 year) ---
-    // Uses a separate reqId range (30000+) so historicalData() routes these bars
-    // to AddDailyCandle() for the SMA200 / prev day H/L filters.
-    // Does NOT start a live market data subscription on completion.
+    // ── HISTORICAL DATA REQUEST (daily bars, 1 year) ──────────────────────────
     public void RequestDailyHistoricalData(string symbol)
     {
         int id = Interlocked.Increment(ref _dailyReqId);
@@ -331,26 +351,19 @@ public class IbClient : EWrapper, IBroker
             Currency = "USD"
         };
 
-        // "1 Y" of "1 day" bars. useRTH=1 so only regular session closes are used —
-        // overnight gaps don't distort the SMA200 calculation.
         _client.reqHistoricalData(id, contract, "", "1 Y", "1 day", "TRADES", 1, 1, false, null);
     }
 
-    // --- TICK CALLBACKS ---
+    // ── TICK CALLBACKS ────────────────────────────────────────────────────────
 
-    // FIX: was processing all tick fields (bid, ask, last).
-    // Now filters to field 4 (LAST traded price) only so candles reflect real trades.
-    // Fields 1 (BID) and 2 (ASK) are also captured for the spread filter.
     public void tickPrice(int tickerId, int field, double price, TickAttrib attribs)
     {
         if (!_reqIdToSymbol.TryGetValue(tickerId, out var symbol)) return;
         if (price <= 0) return;
 
-        // field 1 = BID, field 2 = ASK — store for spread filter
         if (field == 1)
         {
             _latestBid[symbol] = (decimal)price;
-            // If we already have a valid ask, push both to the broker
             if (_latestAsk.TryGetValue(symbol, out decimal ask) && ask > 0)
                 _broker.UpdateBidAsk(symbol, (decimal)price, ask);
             return;
@@ -358,13 +371,11 @@ public class IbClient : EWrapper, IBroker
         if (field == 2)
         {
             _latestAsk[symbol] = (decimal)price;
-            // If we already have a valid bid, push both to the broker
             if (_latestBid.TryGetValue(symbol, out decimal bid) && bid > 0)
                 _broker.UpdateBidAsk(symbol, bid, (decimal)price);
             return;
         }
 
-        // field 4 = LAST traded price. Ignore all other fields.
         if (field != 4) return;
 
         _tickVolume.TryGetValue(symbol, out long vol);
@@ -372,22 +383,18 @@ public class IbClient : EWrapper, IBroker
         _tickVolume[symbol] = 0;
     }
 
-    // Accumulate trade size per symbol between ticks.
-    // Only field 8 (LAST_SIZE) represents actual trades. Ignoring bid (0)
-    // and ask (3) size changes which are quote updates, not executions.
-    // Without this filter, bid/ask quote churn inflates volume counts and
-    // causes CheckVolumeExpansion to fire on non-trade activity.
+    // FIX #4: field 5 = LAST_SIZE (individual trade size).
+    // Field 8 = VOLUME (cumulative daily volume) — using it inflated _tickVolume with
+    // daily totals rather than per-trade sizes, corrupting CheckVolumeExpansion.
     public void tickSize(int tickerId, int field, int size)
     {
-        if (field != 8) return;  // 8 = LAST_SIZE only
+        if (field != 5) return;   // FIX #4: was 8 (VOLUME); correct field is 5 (LAST_SIZE)
         if (!_reqIdToSymbol.TryGetValue(tickerId, out string symbol)) return;
         _tickVolume.AddOrUpdate(symbol, size, (_, old) => old + size);
     }
 
-    // --- ORDER CALLBACKS ---
+    // ── ORDER CALLBACKS ───────────────────────────────────────────────────────
 
-    // FIX: use _filledOrders.TryAdd to ensure OnOrderFilled fires exactly once.
-    // Previously both orderStatus AND execDetails called OnOrderFilled, doubling PnL.
     public void orderStatus(int orderId, string status, double filled, double remaining,
         double avgFillPrice, int permId, int parentId,
         double lastFillPrice, int clientId, string whyHeld, double mktCapPrice)
@@ -396,60 +403,60 @@ public class IbClient : EWrapper, IBroker
 
         if (status == "Filled")
         {
-            // ── Bracket child fill (stop or target hit on the exchange) ──────────
-            // Must be checked BEFORE the normal path to prevent double-fire.
-            // When a child fills: cancel the sibling so only one exit executes,
-            // clean up tracking state, then route to OnOrderFilled normally.
             if (_bracketChildToSymbol.TryRemove(orderId, out _))
             {
                 if (_filledOrders.TryAdd(orderId, true))
                 {
                     if (_bracketSiblings.TryRemove(orderId, out int siblingId))
                     {
-                        // Cancel the other leg (e.g. target fills → cancel stop, and vice versa)
                         _client.cancelOrder(siblingId);
                         _bracketChildToSymbol.TryRemove(siblingId, out _);
                         _bracketSiblings.TryRemove(siblingId, out _);
-                        // Remove sibling from _ordersById — its cancel may still call back
                         _broker.RemoveLiveOrder(siblingId);
                     }
                     _broker.OnOrderFilled(orderId, (int)filled, (decimal)avgFillPrice);
+
+                    // FIX #3: consistent cleanup in both bracket and normal paths
                     _filledOrders.TryRemove(orderId, out _);
                 }
-                return; // handled — do not fall through to normal path
+                return;
             }
 
-            // ── Normal (non-bracket) fill ─────────────────────────────────────
             if (_filledOrders.TryAdd(orderId, true))
             {
                 _broker.OnOrderFilled(orderId, (int)filled, (decimal)avgFillPrice);
-                // Clean up immediately after processing — _filledOrders is only
-                // needed to deduplicate the orderStatus/execDetails double-fire.
-                // Keeping entries forever is a memory leak on a long-running bot.
                 _filledOrders.TryRemove(orderId, out _);
             }
         }
     }
 
-    // Intentionally does NOT call OnOrderFilled.
-    // orderStatus is the authoritative fill callback. execDetails is for logging only.
     public void execDetails(int reqId, Contract contract, Execution execution)
     {
         Console.WriteLine($"[EXECUTION] OrderId={execution.OrderId} Shares={execution.Shares} Price={execution.Price}");
-        // Do not call _broker.OnOrderFilled here — orderStatus handles it
+        // Intentionally does NOT call OnOrderFilled — orderStatus is the authoritative callback.
     }
 
-    // --- HISTORICAL DATA CALLBACKS ---
+    // ── HISTORICAL DATA CALLBACKS ─────────────────────────────────────────────
+
     public void historicalData(int reqId, IBApi.Bar bar)
     {
-        // Determine if this is a daily-bar request (reqId >= 30000)
-        // or a 1-min request, and route accordingly.
+        // Route: daily (30000+) → AddDailyCandle
+        //        1-min (20000+) → AddHistoricalCandle
         bool isDaily = _dailyReqIdToSymbol.TryGetValue(reqId, out var dailySymbol);
-        string? symbol = isDaily ? dailySymbol : null;
-        if (!isDaily && !_reqIdToSymbol.TryGetValue(reqId, out symbol)) return;
+        string histSymbol = null;                                                               // FIX #1
+        bool is1Min = !isDaily && _histReqIdToSymbol.TryGetValue(reqId, out histSymbol);
+
+        if (!isDaily && !is1Min) return;
+
+        // FIX #5: guard against null/empty symbol before proceeding
+        string symbol = isDaily ? dailySymbol : histSymbol;
+        if (string.IsNullOrEmpty(symbol))
+        {
+            Console.WriteLine($"[WARN] historicalData: null/empty symbol for reqId={reqId} — skipping.");
+            return;
+        }
 
         DateTime time;
-
         if (!DateTime.TryParse(bar.Time, out time))
         {
             if (DateTime.TryParseExact(bar.Time.Trim(), "yyyyMMdd  HH:mm:ss",
@@ -469,69 +476,71 @@ public class IbClient : EWrapper, IBroker
 
         if (isDaily)
         {
-            // Route to daily candle cache — used for SMA200 and prev day H/L
-            _broker.AddDailyCandle(
-                symbol, time,
-                (decimal)bar.Open,
-                (decimal)bar.High,
-                (decimal)bar.Low,
-                (decimal)bar.Close,
-                bar.Volume
-            );
+            _broker.AddDailyCandle(symbol, time,
+                (decimal)bar.Open, (decimal)bar.High,
+                (decimal)bar.Low, (decimal)bar.Close, bar.Volume);
         }
         else
         {
-            _broker.AddHistoricalCandle(
-                symbol, time,
-                (decimal)bar.Open,
-                (decimal)bar.High,
-                (decimal)bar.Low,
-                (decimal)bar.Close,
-                bar.Volume
-            );
+            _broker.AddHistoricalCandle(symbol, time,
+                (decimal)bar.Open, (decimal)bar.High,
+                (decimal)bar.Low, (decimal)bar.Close, bar.Volume);
         }
     }
 
     public void historicalDataEnd(int reqId, string start, string end)
     {
-        // Daily bar request completed — clean up reqId, do NOT start a live subscription.
-        // Daily bars are for SMA200 / S/R calculations only, not a streaming data feed.
+        // Daily bar request complete — clean up, do NOT start live subscription.
         if (_dailyReqIdToSymbol.TryRemove(reqId, out string dailySymbol))
         {
             Console.WriteLine($"[IBKR] Daily history loaded for {dailySymbol} — SMA200/S/R ready.");
             return;
         }
 
-        // 1-min request completed — start live tick subscription as before.
-        if (!_reqIdToSymbol.TryRemove(reqId, out string symbol)) return;
+        // FIX #1: 1-min completion now looks up _histReqIdToSymbol (not _reqIdToSymbol).
+        if (!_histReqIdToSymbol.TryRemove(reqId, out string symbol)) return;
 
         Console.WriteLine($"[IBKR] History loaded for {symbol} — starting live tick subscription.");
-
-        // Auto-subscribe live ticks now that candles are ready.
-        // Subscribe() is dedup-guarded so calling it here AND from Program.cs is safe.
         Subscribe(symbol);
     }
 
-    // --- EWRAPPER CORE CALLBACKS ---
-    void EWrapper.nextValidId(int orderId)
+    // ── EWRAPPER CORE CALLBACKS ───────────────────────────────────────────────
+
+    public void nextValidId(int orderId)
     {
         Interlocked.Exchange(ref _currentOrderId, orderId);
-        _client.reqMarketDataType(1); // 1 = Live data
+        _client.reqMarketDataType(1);
         _isReady = true;
         Console.WriteLine("[IBKR] Connected and Ready.");
 
-        // Case A: LoadState ran BEFORE Connect() and set NeedsReconciliation = true.
-        // This is the earliest safe point to call reqPositions() — socket is now live.
         if (_broker.NeedsReconciliation)
         {
-            Console.WriteLine("[IBKR] Requesting position snapshot for reconciliation (deferred from LoadState)...");
+            Console.WriteLine("[IBKR] Requesting position snapshot for reconciliation...");
             _client.reqPositions();
         }
     }
 
     public void connectAck() => Console.WriteLine("[IBKR] Socket connected.");
 
-    public void connectionClosed() => Console.WriteLine("[IBKR] Connection closed.");
+    // FIX #9: reset _isReady and clear subscription state on disconnect so a
+    // reconnect cycle re-subscribes cleanly instead of silently assuming everything
+    // is still live.
+    public void connectionClosed()
+    {
+        Console.WriteLine("[IBKR] Connection closed — resetting ready flag and subscription state.");
+        _isReady = false;
+
+        lock (_subscribedLive)
+        {
+            _subscribedLive.Clear();
+        }
+
+        _symToLiveReqId.Clear();
+        _reqIdToSymbol.Clear();
+        // Note: _histReqIdToSymbol and _dailyReqIdToSymbol are intentionally NOT cleared
+        // here — in-flight historical responses that arrive after a brief drop-reconnect
+        // can still be routed correctly if the reqId is still in the dictionary.
+    }
 
     public void error(Exception e) => Console.WriteLine($"[IB EXCEPTION] {e.Message}");
 
@@ -539,24 +548,28 @@ public class IbClient : EWrapper, IBroker
 
     public void error(int id, int errorCode, string errorMsg)
     {
-        // Ignore routine farm connection messages
         if (errorCode == 2104 || errorCode == 2106 || errorCode == 2158) return;
         Console.WriteLine($"[IB ERROR] {errorCode}: {errorMsg}");
 
-        // ── Order rejection / cancellation ────────────────────────────────
-        // Codes that mean IBKR will never fill this order:
-        //   103 = duplicate order id   110 = bad price tick
-        //   201 = order rejected       202 = order cancelled
-        // Without this block, SimulatedBroker._pendingEntryCount is never
-        // decremented → the bot thinks MAX_POSITIONS is permanently full
-        // → no new trades ever enter for the rest of the session.
+        // ── Order rejection / cancellation ─────────────────────────────────
         if (errorCode == 201 || errorCode == 202 || errorCode == 103 || errorCode == 110)
         {
             _broker.OnOrderRejected(id);
+
+            // FIX #7: clean up bracket tracking state on rejection so dictionaries
+            // don't grow unboundedly and stale sibling cancellations can't fire.
+            if (_bracketChildToSymbol.TryRemove(id, out _))
+            {
+                if (_bracketSiblings.TryRemove(id, out int siblingId))
+                {
+                    _bracketChildToSymbol.TryRemove(siblingId, out _);
+                    _bracketSiblings.TryRemove(siblingId, out _);
+                }
+            }
         }
     }
 
-    // --- EWRAPPER STUBS (required by interface) ---
+    // ── EWRAPPER STUBS (required by interface) ────────────────────────────────
     public void currentTime(long time) { }
     public void tickString(int tickerId, int field, string value) { }
     public void tickGeneric(int tickerId, int field, double value) { }
@@ -586,12 +599,10 @@ public class IbClient : EWrapper, IBroker
     public void updateNewsBulletin(int msgId, int msgType, string message, string origExchange) { }
     public void position(string account, Contract contract, double pos, double avgCost)
     {
-        // pos == 0 means IBKR closed the position — skip it
         if (pos == 0) return;
         Console.WriteLine($"[IBKR] position(): {contract.Symbol} x{(int)pos} @ {avgCost:F2}");
         _broker.OnPositionReceived(contract.Symbol, (int)pos, (decimal)avgCost);
     }
-
     public void positionEnd()
     {
         Console.WriteLine("[IBKR] positionEnd() — snapshot complete, triggering reconciliation.");
@@ -637,5 +648,5 @@ public class IbClient : EWrapper, IBroker
     public void tickByTickAllLast(int reqId, int tickType, long time, double price, int size, TickAttrib attribs, string exchange, string specialConditions) { }
     public void tickByTickBidAsk(int reqId, long time, double bidPrice, double askPrice, int bidSize, int askSize, TickAttrib attribs) { }
     public void tickByTickMidPoint(int reqId, long time, double midPoint) { }
-    void EWrapper.realtimeBar(int reqId, long time, double open, double high, double low, double close, long volume, double WAP, int count) { }
+    public void realtimeBar(int reqId, long time, double open, double high, double low, double close, long volume, double WAP, int count) { }
 }

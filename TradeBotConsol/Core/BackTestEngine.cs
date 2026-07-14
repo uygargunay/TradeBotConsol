@@ -142,29 +142,37 @@ public class HourStat
 public class BacktestConfig
 {
     public decimal Capital { get; set; } = 4000m;
-    public decimal RiskPct { get; set; } = 0.005m;
+    public decimal RiskPct { get; set; } = 0.004m;
     public decimal PositionSize { get; set; } = 900m;
-    public decimal HardStopAtrMult { get; set; } = 1.2m;
-    public decimal AtrTrailMult { get; set; } = 1.1m;
-    public decimal TargetAtrMult { get; set; } = 1.3m;
+    public decimal HardStopAtrMult { get; set; } = 1.35m;
+    public decimal AtrTrailMult { get; set; } = 1.25m;
+    public decimal TargetAtrMult { get; set; } = 1.55m;
     public decimal Commission { get; set; } = 2.0m;
     public decimal EntrySlippagePct { get; set; } = 0.0003m;
     public decimal ExitSlippagePct { get; set; } = 0.0003m;
     public int MaxPositions { get; set; } = 3;
-    public int MaxTradesPerDay { get; set; } = 8;
-    public int MinHoldSeconds { get; set; } = 60;
-    public double RsiLongMin { get; set; } = 59.0;
-    public double RsiShortMax { get; set; } = 38.0;
-    public int OrbMinutes { get; set; } = 9;
+    public int MaxTradesPerDay { get; set; } = 4;
+    public int MinHoldSeconds { get; set; } = 90;
+    public double RsiLongMin { get; set; } = 60.0;
+    public double RsiShortMax { get; set; } = 36.0;
+    public int OrbMinutes { get; set; } = 12;
     public decimal BreakEvenTriggerR { get; set; } = 1.0m;
     public decimal MinBreakoutBodyRatio { get; set; } = 0.45m;
     public int MinSetupScore { get; set; } = 60;
-    public int MinEntryMinutesAfterOpen { get; set; } = 15;
+    public int MinEntryMinutesAfterOpen { get; set; } = 18;
     public int MinEntryQty { get; set; } = 5;
-    public decimal MinGrossTargetToCommissionMult { get; set; } = 3.0m;
+    public decimal MinGrossTargetToCommissionMult { get; set; } = 4.0m;
     public bool AllowBullishPatternEntries { get; set; } = false;
+    public bool AllowMicroPullback { get; set; } = false;
     public bool AllowScalpBreakoutLongs { get; set; } = false;
+    public bool AllowScalpBreakoutShorts { get; set; } = false;
     public bool AllowScalpOrbLongs { get; set; } = false;
+    public bool AllowShorts { get; set; } = true;
+    public bool SwingMode { get; set; } = false;
+    public bool EodLiquidate { get; set; } = true;
+    public int SwingBaseLookbackDays { get; set; } = 20;
+    public int SwingMaxHoldDays { get; set; } = 10;
+    public decimal SwingTargetRMult { get; set; } = 3.2m;
     // Historical mode metadata
     public bool IsHistoricalMode { get; set; }
     public string HistoricalPeriodLabel { get; set; } = "";
@@ -1099,7 +1107,7 @@ public static class BacktestEngine
             }
 
             // ── Micro pullback (catches entry after impulse + shallow retrace) ──
-            if (newPos == null && win.Count >= 8 && !blockLongs)
+            if (newPos == null && cfg.AllowMicroPullback && win.Count >= 8 && !blockLongs)
             {
                 bool foundImpulse = false;
                 decimal pullbackLow = decimal.MaxValue;
@@ -1158,7 +1166,7 @@ public static class BacktestEngine
                         if (qty > 0)
                             newPos = new BtPosition { Symbol = symbol, IsShort = false, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "SCALP_BREAKOUT_LONG", Regime = regime, HardStop = close - Math.Max(atr * 0.75m, close - candle.Low), Target = close + atr * 1.10m, AtrAtEntry = atr, WorstPrice = close };
                     }
-                    else if (shortBias && fastVol && closePos <= 0.35m && close < recentLow3)
+                    else if (cfg.AllowShorts && cfg.AllowScalpBreakoutShorts && shortBias && fastVol && closePos <= 0.35m && close < recentLow3)
                     {
                         int qty = CalcQty(close, Math.Max(atr * 0.75m, candle.High - close), cfg);
                         if (qty > 0)
@@ -1197,7 +1205,7 @@ public static class BacktestEngine
                     }
                 }
                 // ORB_SHORT: preferred in SELL-OFF / bearish open days
-                else if (orbShortHold && rsi < cfg.RsiShortMax && volOk && HasStrongBodyClose(candle, false, cfg))
+                else if (cfg.AllowShorts && orbShortHold && rsi < cfg.RsiShortMax && volOk && HasStrongBodyClose(candle, false, cfg))
                 {
                     if (!(symbol.Equals("MSTR", StringComparison.OrdinalIgnoreCase) || symbol.Equals("COIN", StringComparison.OrdinalIgnoreCase) || symbol.Equals("TSLA", StringComparison.OrdinalIgnoreCase)) || regime == "SELL-OFF")
                     {
@@ -1219,7 +1227,7 @@ public static class BacktestEngine
                     if (qty > 0)
                         newPos = new BtPosition { Symbol = symbol, IsShort = false, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "GAP_GO_LONG", Regime = regime, HardStop = close - atr * cfg.HardStopAtrMult, Target = close + atr * cfg.TargetAtrMult, AtrAtEntry = atr, WorstPrice = close };
                 }
-                else if (gapPct <= -0.02m && relVol >= 1.8m && rsi < cfg.RsiShortMax && close < vwap)
+                else if (cfg.AllowShorts && gapPct <= -0.02m && relVol >= 1.8m && rsi < cfg.RsiShortMax && close < vwap)
                 {
                     int qty = CalcQty(close, atr * cfg.HardStopAtrMult, cfg);
                     if (qty > 0)
@@ -1240,7 +1248,7 @@ public static class BacktestEngine
             }
 
             // ── VWAP Reject Short ──────────────────────────────────────────
-            if (newPos == null && vwap > 0 && volExp && HasStrongBodyClose(candle, false, cfg))
+            if (newPos == null && cfg.AllowShorts && vwap > 0 && volExp && HasStrongBodyClose(candle, false, cfg))
             {
                 bool reject = win.Count >= 3 && win[^1].Close < vwap && win[^2].Close < vwap && win[^3].Close >= vwap;
                 if (reject && rsi < cfg.RsiShortMax)
@@ -1267,7 +1275,7 @@ public static class BacktestEngine
             }
 
             // ── Momentum short continuation ────────────────────────────────
-            if (newPos == null && volExp && sma50 > 0 && close < sma20 && close < sma50 && HasStrongBodyClose(candle, false, cfg))
+            if (newPos == null && cfg.AllowShorts && volExp && sma50 > 0 && close < sma20 && close < sma50 && HasStrongBodyClose(candle, false, cfg))
             {
                 decimal recentLow = win.TakeLast(8).Min(c => c.Low);
                 bool breakdown = close < recentLow && rsi < cfg.RsiShortMax && (regime == "SELL-OFF" || regime == "NORMAL");
