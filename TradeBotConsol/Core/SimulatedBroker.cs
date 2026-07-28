@@ -168,7 +168,7 @@ public partial class SimulatedBroker
     private decimal GAP_GO_MIN_PCT = 0.012m;    // looser gap threshold; still avoids tiny overnight noise
     private decimal GAP_GO_REL_VOL = 1.30m;
     private int VWAP_CONFIRM_BARS = 1;          // looser: one confirmed bar through VWAP
-    private int MAX_TRADES_PER_DAY = 6;         // modestly higher capacity after loosening entries
+    private int MAX_TRADES_PER_DAY = 8;         // modestly higher capacity after loosening entries
     private decimal MIN_ATR_PCT = 0.0018m;
     private decimal MAX_ATR_PCT = 0.020m;
     private decimal MIN_RR_RATIO = 1.10m;       // looser RR floor; scalp economics filter still applies
@@ -201,7 +201,7 @@ public partial class SimulatedBroker
     // ── Backtest projections (off by default — misleading with limited data) ──
     private bool SHOW_PROJECTIONS = false;
 
-    private int MIN_SETUP_SCORE = 55;           // looser floor; strategy-specific gates still apply
+    private int MIN_SETUP_SCORE = 50;           // slightly looser floor to allow more valid setups
 
 
 
@@ -242,11 +242,11 @@ public partial class SimulatedBroker
     private int MAX_CONSECUTIVE_LOSSES = 3;
 
     // ── Entry quality hardening ─────────────────────────────
-    private int MIN_ENTRY_MINUTES_AFTER_OPEN = 12;     // looser but still avoids the first opening-noise reversals
+    private int MIN_ENTRY_MINUTES_AFTER_OPEN = 6;     // reduced to allow earlier entries while avoiding first-minute noise
     private const int MIN_ENTRY_QTY = 5;
     // V2 FIX: Raised from 4.0 to 5.0 — with $2 round-trip commission, gross target must be
     // at least $10 to make the trade worthwhile after slippage and market impact.
-    private const decimal MIN_GROSS_TARGET_TO_COMMISSION_MULT = 4.0m;
+    private static readonly decimal MIN_GROSS_TARGET_TO_COMMISSION_MULT = 3.0m;
     private bool ALLOW_BULLISH_CANDLE_PATTERNS = true;
     private bool ALLOW_SCALP_BREAKOUT_LONGS = true;
     private bool ALLOW_SCALP_BREAKOUT_SHORTS = true;
@@ -287,7 +287,9 @@ public partial class SimulatedBroker
     // When true, the signal/gate logic remains unchanged, but the actual entry
     // sent to IBKR is reversed: LONG signal -> SHORT entry; SHORT signal -> LONG entry.
     // Exit orders are NOT inverted; they must follow the actual open position.
-    private bool INVERT_ENTRY_DIRECTION = true;
+    // NOTE: IbClient.ReverseSignals already handles inversion at the broker client level.
+    // Disable this SimulatedBroker-level inversion to avoid double-inversion bugs.
+    private bool INVERT_ENTRY_DIRECTION = false;
 
     // ── STATE ──────────────────────────────────────────────
     public readonly ConcurrentDictionary<string, List<Candle>> _marketData = new();
@@ -322,6 +324,7 @@ public partial class SimulatedBroker
         public decimal Atr14;
         public decimal Sma20;
         public decimal Sma50;
+        public decimal Sma100;
         public double Ema9;
         public double Ema21;
         public double Ema9Prev;
@@ -379,10 +382,30 @@ public partial class SimulatedBroker
     private readonly Dictionary<string, bool> _lastTradeWasLoss = new();
     private readonly Dictionary<string, int> _dailyEntryCount = new();
 
+    // Telemetry: why entries are blocked
+    private readonly ConcurrentDictionary<string, int> _blockedReasonCounts = new();
+    private readonly ConcurrentDictionary<string, string> _lastBlockedReasonBySymbol = new(StringComparer.OrdinalIgnoreCase);
+    private void RecordBlock(string symbol, string reason)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(reason)) return;
+            _blockedReasonCounts.AddOrUpdate(reason, 1, (k, v) => v + 1);
+            if (!string.IsNullOrWhiteSpace(symbol))
+                _lastBlockedReasonBySymbol[symbol] = reason;
+        }
+        catch { }
+    }
+
+    // New config flags
+    private bool REQUIRE_SMA_ALIGNMENT = false; // require 50>100>200 for trend-following entries
+    private int SHORT_TAPE_STRICTNESS = 1; // 0=loose,1=normal,2=strict
+    private bool ALLOW_PARTIAL_ON_WEAK_SIGNAL = true;
+
     private decimal _totalRealizedPnL = 0m;
     private int _tradesToday = 0;
     private int _tradesThisHour = 0;
-    private int MAX_TRADES_PER_HOUR = 2;
+    private int MAX_TRADES_PER_HOUR = 3;
     private DateTime _currentTradeHour = DateTime.MinValue;
     private bool _haltTrading = false;
     private bool _manualResumeOverride = false;
@@ -1083,6 +1106,7 @@ public partial class SimulatedBroker
 
         decimal sma20 = SafeSMA(dailyBars, 20);
         decimal sma50 = SafeSMA(dailyBars, 50);
+        decimal sma100 = SafeSMA(dailyBars, 100);
         decimal sma200 = dailyBars.Count >= 200 ? SafeSMA(dailyBars, 200) : 0m;
         double rsi = SafeRSI(dailyBars, 14);
         decimal high52 = dailyBars.Max(c => c.High);
@@ -1091,7 +1115,8 @@ public partial class SimulatedBroker
         int score = 0;
         if (close > sma20 && sma20 > 0) score += 15;
         if (sma20 > sma50 && sma50 > 0) score += 15;
-        if (sma200 <= 0 || sma50 > sma200) score += 15;
+        if (sma50 > sma100 && sma100 > 0) score += 10;
+        if (sma200 <= 0 || sma50 > sma200 || (sma50 > sma100 && sma100 > sma200)) score += 15;
         if (rsi >= 48 && rsi <= 72) score += 12;
         else if (rsi >= 44 && rsi <= 76) score += 6;
         if (baseDepth <= SWING_BASE_TIGHTNESS_MAX) score += 15;
@@ -1116,10 +1141,11 @@ public partial class SimulatedBroker
 
         decimal dailySma20 = SafeSMA(dailyBars, 20);
         decimal dailySma50 = SafeSMA(dailyBars, 50);
+        decimal dailySma100 = SafeSMA(dailyBars, 100);
         decimal dailySma200 = dailyBars.Count >= 200 ? SafeSMA(dailyBars, 200) : 0m;
         if (dailySma20 <= 0 || dailySma50 <= 0) return false;
 
-        if (!(close > dailySma20 && dailySma20 > dailySma50 && (dailySma200 <= 0 || dailySma50 > dailySma200)))
+        if (!(close > dailySma20 && dailySma20 > dailySma50 && (dailySma200 <= 0 || dailySma50 > dailySma200 || (dailySma50 > dailySma100 && dailySma100 > dailySma200))))
             return false;
 
         double dailyRsi = SafeRSI(dailyBars, 14);
@@ -2695,6 +2721,11 @@ public partial class SimulatedBroker
 
             if (!isReversalFamily)
             {
+                if (REQUIRE_SMA_ALIGNMENT)
+                {
+                    // Require intraday SMA50 > SMA100 as a loose trend confirmation
+                    if (ind.Sma50 <= ind.Sma100) return false;
+                }
                 if (vwapVal > 0 && price < vwapVal - atr * 0.15m) return false;
                 if (ind.Ema9 <= ind.Ema21 && !strategyTag.StartsWith("SCALP_ORB_", StringComparison.OrdinalIgnoreCase)) return false;
                 if (ind.Rsi14 < RSI_LONG_MIN - 4) return false;
@@ -2707,7 +2738,12 @@ public partial class SimulatedBroker
             // Shorts are enabled, but only when the index/tape agrees. The historical
             // log showed noisy short attempts in NORMAL/TRENDING tape were low quality.
             bool bearishTape = _marketRegime == "SELL-OFF" || _spyBearish || _spyOpenBearish;
-            if (!bearishTape) return false;
+            if (SHORT_TAPE_STRICTNESS >= 2)
+            {
+                // strict: require clear sell-off
+                if (!(_marketRegime == "SELL-OFF" && (_spyBearish || _spyOpenBearish))) return false;
+            }
+            else if (!bearishTape) return false;
             if (vwapVal <= 0 || price > vwapVal + atr * 0.15m) return false;
             if (ind.Ema9 >= ind.Ema21 && _marketRegime != "SELL-OFF") return false;
             if (ind.Rsi14 > RSI_SHORT_MAX + 5) return false;
@@ -2747,15 +2783,31 @@ public partial class SimulatedBroker
             }
         }
 
-        if (isShort && !_allowShorts) return;
-        if (qty <= 0 || qty > MAX_QTY_SANITY) return;
-        if (_pendingEntrySymbols.ContainsKey(symbol)) return;
+        if (isShort && !_allowShorts)
+        {
+            RecordBlock(symbol, "SHORTS_DISABLED");
+            LogMessage($"[SHORTS_DISABLED] {strategyTag} {symbol} blocked — shorts disabled");
+            return;
+        }
+        if (qty <= 0 || qty > MAX_QTY_SANITY)
+        {
+            RecordBlock(symbol, "QTY_SANITY");
+            LogMessage($"[QTY_SANITY] {strategyTag} {symbol} blocked — qty {qty} invalid");
+            return;
+        }
+        if (_pendingEntrySymbols.ContainsKey(symbol))
+        {
+            RecordBlock(symbol, "PENDING_ENTRY");
+            LogMessage($"[PENDING] {strategyTag} {symbol} blocked — entry already pending");
+            return;
+        }
 
         if (!IsSwingStrategy(strategyTag))
         {
             if (!_marketData.TryGetValue(symbol, out var directionCandles) ||
                 !PassesDirectionalQualityGate(symbol, directionCandles, isShort, strategyTag, price))
             {
+                RecordBlock(symbol, "DIRECTION_GATE");
                 LogMessage($"[DIRECTION GATE] {strategyTag} {symbol} blocked — tape/EMA/VWAP not aligned");
                 return;
             }
@@ -2764,13 +2816,15 @@ public partial class SimulatedBroker
         // ── RISK MGMT: Strategy allocation limit ──
         // Prevents one misfiring strategy from consuming the full daily budget.
         if (!IsSwingStrategy(strategyTag) && IsStrategyAtDailyLimit(strategyTag))
-        {
+            {
+            RecordBlock(symbol, "STRAT_LIMIT");
             LogMessage($"[STRAT LIMIT] {strategyTag} {symbol} blocked — {GetStrategyFamily(strategyTag)} hit {MAX_TRADES_PER_STRATEGY} trades today");
             return;
         }
 
         if (!IsSwingStrategy(strategyTag) && IsStrategyCold(strategyTag))
         {
+            RecordBlock(symbol, "STRAT_COOLING");
             LogMessage($"[STRAT COOLING] {strategyTag} {symbol} blocked — recent real-trade performance is negative");
             return;
         }
@@ -2803,6 +2857,7 @@ public partial class SimulatedBroker
                 _marketData.TryGetValue(symbol, out var gateCandles);
                 if (gateCandles == null || !CheckStrongRelativeStrength(symbol, gateCandles))
                 {
+                    RecordBlock(symbol, "SPY_GATE_LONG");
                     LogMessage($"[SPY GATE] {strategyTag} {symbol} LONG blocked — SPY EMA20 bearish");
                     return;
                 }
@@ -2810,6 +2865,7 @@ public partial class SimulatedBroker
             }
             if (isShort && _spyBullish)
             {
+                RecordBlock(symbol, "SPY_GATE_SHORT");
                 LogMessage($"[SPY GATE] {strategyTag} {symbol} SHORT blocked — SPY EMA20 bullish");
                 return;
             }
@@ -2821,7 +2877,8 @@ public partial class SimulatedBroker
             {
                 if (_symbolSectors.TryGetValue(openPos.Symbol, out string existingSector)
                     && existingSector == newSector)
-                {
+                    {
+                    RecordBlock(symbol, "SECTOR_GATE");
                     LogMessage($"[SECTOR GATE] {strategyTag} {symbol} blocked — already have {openPos.Symbol} in sector [{newSector}]");
                     return;
                 }
@@ -2858,6 +2915,7 @@ public partial class SimulatedBroker
                 decimal requiredRr = IsScalpStrategy(strategyTag) ? 1.25m : MIN_RR_RATIO;
                 if (targetDist < stopDist * requiredRr)
                 {
+                    RecordBlock(symbol, "RR_SKIP");
                     LogMessage($"[RR SKIP] {strategyTag} {symbol} R:R={targetDist / stopDist:F2} < {requiredRr:F2} — target too close to stop, skipping");
                     return;
                 }
@@ -2868,6 +2926,7 @@ public partial class SimulatedBroker
         {
             if (vixLevel >= VIX_NO_LONG_THRESHOLD)
             {
+                RecordBlock(symbol, "VIX_BLOCK");
                 LogMessage($"[VIX BLOCK] {strategyTag} {symbol} LONG blocked — VIX={vixLevel:F1} ≥ {VIX_NO_LONG_THRESHOLD}");
                 return;
             }
@@ -2881,6 +2940,7 @@ public partial class SimulatedBroker
         int minEntryQty = GetMinEntryQtyForPrice(price);
         if (qty < minEntryQty)
         {
+            RecordBlock(symbol, "ECON_MIN_QTY");
             LogMessage($"[ECON FILTER] {strategyTag} {symbol} blocked — qty {qty} < minimum {minEntryQty} for ${price:F2}");
             return;
         }
@@ -2890,6 +2950,7 @@ public partial class SimulatedBroker
         decimal minGrossTargetPnL = COMMISSION_PER_SIDE * 2m * MIN_GROSS_TARGET_TO_COMMISSION_MULT;
         if (grossTargetPnL < minGrossTargetPnL)
         {
+            RecordBlock(symbol, "ECON_GROSS_TARGET");
             LogMessage($"[ECON FILTER] {strategyTag} {symbol} blocked — gross target ${grossTargetPnL:F2} < required ${minGrossTargetPnL:F2}");
             return;
         }
@@ -2901,20 +2962,6 @@ public partial class SimulatedBroker
 
         TradeSide executionSide = side;
         bool executionIsShort = isShort;
-
-        if (INVERT_ENTRY_DIRECTION)
-        {
-            executionSide = side == TradeSide.Buy ? TradeSide.Sell : TradeSide.Buy;
-            executionIsShort = !isShort;
-
-            // If a LONG signal is inverted into a SHORT transaction, shorting must be available.
-            // A SHORT signal inverted into a LONG transaction does not need short permission.
-            if (executionIsShort && !_allowShorts)
-            {
-                LogMessage($"[INVERT ENTRY] {strategyTag} {symbol} blocked — signal LONG would execute as SHORT, but ALLOW_SHORTS=false");
-                return;
-            }
-        }
 
         // ── COMMIT TO THE ENTRY ──
         // Tag + risk are set AFTER all guards so they can't be polluted
@@ -4388,6 +4435,9 @@ public partial class SimulatedBroker
             _allowShorts = GetB("ALLOW_SHORTS", _allowShorts);
             INVERT_ENTRY_DIRECTION = GetB("INVERT_ENTRY_DIRECTION", INVERT_ENTRY_DIRECTION);
             MIDDAY_FILTER_ENABLED = GetB("MIDDAY_FILTER_ENABLED", MIDDAY_FILTER_ENABLED);
+            REQUIRE_SMA_ALIGNMENT = GetB("REQUIRE_SMA_ALIGNMENT", REQUIRE_SMA_ALIGNMENT);
+            SHORT_TAPE_STRICTNESS = GetI("SHORT_TAPE_STRICTNESS", SHORT_TAPE_STRICTNESS);
+            ALLOW_PARTIAL_ON_WEAK_SIGNAL = GetB("ALLOW_PARTIAL_ON_WEAK_SIGNAL", ALLOW_PARTIAL_ON_WEAK_SIGNAL);
             MAX_CONSECUTIVE_LOSSES = GetI("MAX_CONSECUTIVE_LOSSES", MAX_CONSECUTIVE_LOSSES);
             STRATEGY_ORB_ENABLED = GetB("STRATEGY_ORB", STRATEGY_ORB_ENABLED);
             STRATEGY_GAP_GO_ENABLED = GetB("STRATEGY_GAP_GO", STRATEGY_GAP_GO_ENABLED);
@@ -4426,6 +4476,13 @@ public partial class SimulatedBroker
             ALLOW_SCALP_BREAKOUT_LONGS = GetB("ALLOW_SCALP_BREAKOUT_LONGS", ALLOW_SCALP_BREAKOUT_LONGS);
             ALLOW_SCALP_BREAKOUT_SHORTS = GetB("ALLOW_SCALP_BREAKOUT_SHORTS", ALLOW_SCALP_BREAKOUT_SHORTS);
             ALLOW_SCALP_ORB_LONGS = GetB("ALLOW_SCALP_ORB_LONGS", ALLOW_SCALP_ORB_LONGS);
+
+            // Backwards-compatible: if USE_SMA100 present, set REQUIRE_SMA_ALIGNMENT loosely
+            if (root.TryGetProperty("USE_SMA100", out var useSma100El) && useSma100El.ValueKind == System.Text.Json.JsonValueKind.True)
+            {
+                // do not enforce strict alignment by default; it's a hint to use sma100 in scoring
+                REQUIRE_SMA_ALIGNMENT = GetB("REQUIRE_SMA_ALIGNMENT", REQUIRE_SMA_ALIGNMENT);
+            }
 
             if (root.TryGetProperty("earnings_blacklist", out var ebEl) && ebEl.ValueKind == System.Text.Json.JsonValueKind.Array)
             {
@@ -4556,6 +4613,9 @@ public partial class SimulatedBroker
             $"\"ALLOW_SHORTS\":{(_allowShorts ? "true" : "false")}",
             $"\"INVERT_ENTRY_DIRECTION\":{(INVERT_ENTRY_DIRECTION ? "true" : "false")}",
             $"\"MIDDAY_FILTER_ENABLED\":{(MIDDAY_FILTER_ENABLED ? "true" : "false")}",
+            $"\"REQUIRE_SMA_ALIGNMENT\":{(REQUIRE_SMA_ALIGNMENT ? "true" : "false")}",
+            $"\"SHORT_TAPE_STRICTNESS\":{SHORT_TAPE_STRICTNESS}",
+            $"\"ALLOW_PARTIAL_ON_WEAK_SIGNAL\":{(ALLOW_PARTIAL_ON_WEAK_SIGNAL ? "true" : "false")}",
             $"\"MAX_CONSECUTIVE_LOSSES\":{MAX_CONSECUTIVE_LOSSES}",
             $"\"STRATEGY_ORB\":{(STRATEGY_ORB_ENABLED ? "true" : "false")}",
             $"\"STRATEGY_GAP_GO\":{(STRATEGY_GAP_GO_ENABLED ? "true" : "false")}",
@@ -4566,6 +4626,7 @@ public partial class SimulatedBroker
             $"\"STRATEGY_EMA_POCKET\":{(STRATEGY_EMA_POCKET_ENABLED ? "true" : "false")}",
             $"\"STRATEGY_OUTSIDE_CANDLE\":{(STRATEGY_OUTSIDE_CANDLE_ENABLED ? "true" : "false")}",
             $"\"STRATEGY_CANDLE_PATTERNS\":{(STRATEGY_CANDLE_PATTERNS_ENABLED ? "true" : "false")}",
+            $"\"USE_SMA100\":{(/* USE_SMA100 present in config file; default true for backwards compat */ true ? "true" : "false")}",
             $"\"STRATEGY_MICRO_PULLBACK\":{(STRATEGY_MICRO_PULLBACK_ENABLED ? "true" : "false")}",
             $"\"EARLY_PATTERN_ENTRY\":{(EARLY_PATTERN_ENTRY_ENABLED ? "true" : "false")}",
             $"\"PATTERN_MIN_SCORE\":{PATTERN_MIN_SCORE}",
@@ -5137,13 +5198,14 @@ public partial class SimulatedBroker
 
                 // Use cached indicators; fall back to direct computation if cache
                 // hasn't been seeded yet (e.g. between historical load and first live tick).
-                decimal sma20 = 0m, sma50 = 0m, atr = 0m;
+                decimal sma20 = 0m, sma50 = 0m, sma100 = 0m, atr = 0m;
                 double rsi = 0.0;
                 int macdDir = 0;
                 if (dataReady && _indicatorCache.TryGetValue(sym, out var indC))
                 {
                     sma20 = indC.Sma20;
                     sma50 = indC.Sma50;
+                    sma100 = indC.Sma100;
                     rsi = indC.Rsi14;
                     atr = indC.Atr14;
                     macdDir = indC.MacdDir;
@@ -5153,6 +5215,7 @@ public partial class SimulatedBroker
                     // FIX: Mirror the console dashboard — compute directly from candles
                     sma20 = SafeSMA(candles, 20);
                     sma50 = SafeSMA(candles, 50);
+                    sma100 = SafeSMA(candles, 100);
                     rsi = SafeRSI(candles, 14);
                     atr = SafeATR(candles, 14);
                     macdDir = SafeMACDDirection(candles);
@@ -5204,9 +5267,27 @@ public partial class SimulatedBroker
                 string ageJson = double.IsFinite(quote.ageSec) ? quote.ageSec.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) : "9999";
                 string why = GetWatchlistReadiness(sym);
                 string whyEsc = why.Replace("\\", "\\\\").Replace("\"", "\\\"");
-                wlArr.Append($@"{{""s"":""{sym}"",""price"":{price:F2},""last"":{quote.last:F2},""bid"":{quote.bid:F2},""ask"":{quote.ask:F2},""pxSrc"":""{pxSrc}"",""ageSec"":{ageJson},""vwap"":{vwap:F2},""sma20"":{sma20:F2},""sma50"":{sma50:F2},""sma200"":{sma200:F2},""rsi"":{rsi:F1},""gap"":{gapPct:F2},""chg"":{chgPct:F2},""vol"":{volK},""atr"":{atrPct:F2},""orbHi"":{orbHi:F2},""orbLo"":{orbLo:F2},""pdHi"":{pdHi:F2},""pdLo"":{pdLo:F2},""macd"":{macdDir},""trend"":""{trend}"",""sig"":""{sig}"",""why"":""{whyEsc}"",""hot"":{(hot ? "true" : "false")},""abvVwap"":{(abvVwap ? "true" : "false")}}}");
+                wlArr.Append($@"{{""s"":""{sym}"",""price"":{price:F2},""last"":{quote.last:F2},""bid"":{quote.bid:F2},""ask"":{quote.ask:F2},""pxSrc"":""{pxSrc}"",""ageSec"":{ageJson},""vwap"":{vwap:F2},""sma20"":{sma20:F2},""sma50"":{sma50:F2},""sma100"":{sma100:F2},""sma200"":{sma200:F2},""rsi"":{rsi:F1},""gap"":{gapPct:F2},""chg"":{chgPct:F2},""vol"":{volK},""atr"":{atrPct:F2},""orbHi"":{orbHi:F2},""orbLo"":{orbLo:F2},""pdHi"":{pdHi:F2},""pdLo"":{pdLo:F2},""macd"":{macdDir},""trend"":""{trend}"",""sig"":""{sig}"",""why"":""{whyEsc}"",""hot"":{(hot ? "true" : "false")},""abvVwap"":{(abvVwap ? "true" : "false")}}}");
             }
             wlArr.Append("]");
+            // blocked reasons summary
+            var blockedArr = new StringBuilder("{");
+            bool bfirst = true;
+            foreach (var kv in _blockedReasonCounts.OrderByDescending(kv => kv.Value).Take(20))
+            {
+                if (!bfirst) blockedArr.Append(","); bfirst = false;
+                blockedArr.Append($"\"{kv.Key}\":{kv.Value}");
+            }
+            blockedArr.Append("}");
+
+            var lastBlockedArr = new StringBuilder("{");
+            bool lfirst = true;
+            foreach (var kv in _lastBlockedReasonBySymbol)
+            {
+                if (!lfirst) lastBlockedArr.Append(","); lfirst = false;
+                lastBlockedArr.Append($"\"{kv.Key}\":\"{kv.Value}\"");
+            }
+            lastBlockedArr.Append("}");
 
             var recentTrades = _tradeHistoryLog.TakeLast(20).Reverse().ToList();
             var tradeArr = new StringBuilder("[");
@@ -5285,7 +5366,7 @@ public partial class SimulatedBroker
             decimal totalEquityPnl = _totalRealizedPnL + unrealizedPnl;
             decimal sizeMultiplier = GetDynamicSizeMultiplier();
 
-            return $@"{{""time"":""{now:yyyy-MM-dd HH:mm:ss} PT"",""et"":""{et:HH:mm:ss} ET"",""regime"":""{_marketRegime}"",""spyBullish"":{(_spyBullish ? "true" : "false")},""spyBearish"":{(_spyBearish ? "true" : "false")},""halted"":{(_haltTrading ? "true" : "false")},""manualResume"":{(_manualResumeOverride ? "true" : "false")},""reconciled"":{(_reconciled ? "true" : "false")},""pnl"":{_totalRealizedPnL:F2},""unrealizedPnl"":{unrealizedPnl:F2},""totalEquityPnl"":{totalEquityPnl:F2},""sizeMult"":{sizeMultiplier:F2},""ddBreached"":{(IsUnrealizedDrawdownBreached() ? "true" : "false")},""goal"":{DAILY_PROFIT_GOAL:F2},""maxLoss"":{MAX_DAILY_LOSS:F2},""trades"":{_tradesToday},""maxTrades"":{MAX_TRADES_PER_DAY},""wins"":{_winCount},""losses"":{_lossCount},""wr"":{wr:F1},""cash"":{cash:F2},""budget"":{TOTAL_BUDGET:F2},""initialBudget"":{TOTAL_BUDGET:F2},""positions"":{posArr},""curve"":{curveArr},""watchlist"":{wlArr},""feed"":{tradeArr},""hist"":{histArr},""lifetimeCurve"":{ltArr},""allTrades"":{_cachedAllTradesJson}}}";
+            return $@"{{""time"":""{now:yyyy-MM-dd HH:mm:ss} PT"",""et"":""{et:HH:mm:ss} ET"",""regime"":""{_marketRegime}"",""spyBullish"":{(_spyBullish ? "true" : "false")},""spyBearish"":{(_spyBearish ? "true" : "false")},""halted"":{(_haltTrading ? "true" : "false")},""manualResume"":{(_manualResumeOverride ? "true" : "false")},""reconciled"":{(_reconciled ? "true" : "false")},""pnl"":{_totalRealizedPnL:F2},""unrealizedPnl"":{unrealizedPnl:F2},""totalEquityPnl"":{totalEquityPnl:F2},""sizeMult"":{sizeMultiplier:F2},""ddBreached"":{(IsUnrealizedDrawdownBreached() ? "true" : "false")},""goal"":{DAILY_PROFIT_GOAL:F2},""maxLoss"":{MAX_DAILY_LOSS:F2},""trades"":{_tradesToday},""maxTrades"":{MAX_TRADES_PER_DAY},""wins"":{_winCount},""losses"":{_lossCount},""wr"":{wr:F1},""cash"":{cash:F2},""budget"":{TOTAL_BUDGET:F2},""initialBudget"":{TOTAL_BUDGET:F2},""positions"":{posArr},""curve"":{curveArr},""watchlist"":{wlArr},""feed"":{tradeArr},""hist"":{histArr},""lifetimeCurve"":{ltArr},""allTrades"":{_cachedAllTradesJson},""blockedReasons"":{blockedArr},""lastBlocked"":{lastBlockedArr}}}";
         }
     }
 
@@ -5415,7 +5496,7 @@ public partial class SimulatedBroker
             sb.AppendLine(new string('─', W));
 
             sb.AppendLine(
-                $"  {"SYM",-5}  {"PRICE",8}  {"VWAP",8}  {"SMA20",8}  {"SMA50",8}" +
+                $"  {"SYM",-5}  {"PRICE",8}  {"VWAP",8}  {"SMA20",8}  {"SMA50",8}  {"SMA100",8}" +
                 $"  {"RSI",5}  {"GAP%",6}  {"VOL K",7}  {"ORB HI",8}  {"ORB LO",8}  TREND  SIGNAL");
             sb.AppendLine(new string('─', W));
 
@@ -5428,6 +5509,7 @@ public partial class SimulatedBroker
 
                 decimal sma20 = SafeSMA(candles, 20);
                 decimal sma50 = SafeSMA(candles, 50);
+                decimal sma100 = SafeSMA(candles, 100);
                 double rsi = SafeRSI(candles, 14);
                 _vwap.TryGetValue(sym, out decimal vwapVal);
                 _prevDayClose.TryGetValue(sym, out decimal prevClose);
@@ -5459,7 +5541,7 @@ public partial class SimulatedBroker
                 string gapStr = gapPct >= 0 ? $"+{gapPct:F1}%" : $"{gapPct:F1}%";
 
                 sb.AppendLine(
-                    $"  {prefix}{sym,-5}  {price,8:C}  {vwapVal,8:C}  {sma20,8:C}  {sma50,8:C}" +
+                    $"  {prefix}{sym,-5}  {price,8:C}  {vwapVal,8:C}  {sma20,8:C}  {sma50,8:C}  {sma100,8:C}" +
                     $"  {rsi,5:F1}  {gapStr,6}  {volK,6}K  {orbHi,8:C}  {orbLo,8:C}  {trend}  {sig}");
             }
 
@@ -5592,6 +5674,7 @@ public partial class SimulatedBroker
             Atr14 = SafeATR(candles, 14),
             Sma20 = SafeSMA(candles, 20),
             Sma50 = SafeSMA(candles, 50),
+            Sma100 = SafeSMA(candles, 100),
             Ema9 = CalcEMA(closes, 9),
             Ema21 = CalcEMA(closes, 21),
             Ema9Prev = closesPrev.Length >= 9 ? CalcEMA(closesPrev, 9) : 0,
@@ -5632,6 +5715,16 @@ public partial class SimulatedBroker
         {
             if (daily.Count < 200) return 0m;
             return daily.TakeLast(200).Average(c => c.Close);
+        }
+    }
+
+    private decimal GetDailySma100(string symbol)
+    {
+        if (!_dailyCandles.TryGetValue(symbol, out var daily)) return 0m;
+        lock (daily)
+        {
+            if (daily.Count < 100) return 0m;
+            return daily.TakeLast(100).Average(c => c.Close);
         }
     }
 
