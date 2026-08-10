@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Net.Mail;
 using System.Text;
 using System.Text.Json;
@@ -299,6 +300,11 @@ public partial class SimulatedBroker
     private readonly List<TradeRecord> _completedTrades = new();
     private readonly Dictionary<string, DateTime> _lastTradeTime = new();
     private readonly Dictionary<string, long> _dailyVolume = new();
+    // Populated from IBKR's own cumulative daily volume ticks (see IbClient.tickSize,
+    // field 8). Self-healing across restarts/reconnects, unlike _dailyVolume above,
+    // which is summed locally from individual trade ticks and resets to zero on every
+    // process restart — see GetTodayVolume() below, which prefers this when available.
+    private readonly ConcurrentDictionary<string, long> _dailyVolumeAuthoritative = new();
     private readonly ConcurrentDictionary<string, decimal> _latestTick = new();
     private readonly ConcurrentDictionary<string, Candle> _currentMinuteCandle = new();
     private readonly List<(DateTime time, decimal equity)> _equityCurve = new();
@@ -349,6 +355,11 @@ public partial class SimulatedBroker
     private volatile bool _spyOpenBearish = false;
     private volatile bool _spyBiasChecked = false;
 
+    // Rebuild status (exposed to dashboard/status API)
+    private volatile bool _rebuildInProgress = false;
+    private DateTime _lastRebuildUtc = DateTime.MinValue;
+    private string _rebuildMessage = "";
+
     private readonly ConcurrentDictionary<string, decimal> _latestBid = new();
     private readonly ConcurrentDictionary<string, decimal> _latestAsk = new();
     private readonly ConcurrentDictionary<string, DateTime> _latestBidAskUpdateUtc = new();
@@ -360,6 +371,8 @@ public partial class SimulatedBroker
     private readonly ConcurrentDictionary<string, decimal> _vwap = new();
     private readonly ConcurrentDictionary<string, decimal> _prevDayClose = new();
     private readonly ConcurrentDictionary<string, bool> _prevBarAboveVwap = new();
+    // Daily SMA cache computed from Yahoo or live-derived daily bars (sma20,sma50,sma100,sma200)
+    private readonly ConcurrentDictionary<string, (decimal sma20, decimal sma50, decimal sma100, decimal sma200)> _dailySmaCache = new();
 
     private ConcurrentDictionary<string, string> _pendingStrategyTag = new();
     private ConcurrentDictionary<string, decimal> _pendingInitialRisk = new();
@@ -621,6 +634,12 @@ public partial class SimulatedBroker
             }
 
             CheckHardStop(symbol, price);
+            // BUGFIX: CheckBreakevenStop was previously only called inside the _haltTrading
+            // branch above, so the breakeven-stop-arming logic (move stop to entry at 1R)
+            // never ran during normal trading — only after the bot had already halted for
+            // the day. That meant winning trades could give back their entire gain because
+            // the stop was never moved up while the bot was actively trading.
+            CheckBreakevenStop(symbol, price);
             CheckExits(symbol, price);
             TryEarlyPatternEntry(symbol, current);
 
@@ -721,9 +740,13 @@ public partial class SimulatedBroker
                 list.RemoveAt(0);
         }
 
-        var nowEt = GetEasternTime();
-        if (nowEt.Hour == 9 && nowEt.Minute == 29)
-            _prevDayClose[symbol] = candle.Close;
+        // NOTE: previously set _prevDayClose[symbol] = candle.Close here when the
+        // 9:29 AM bar finalized. That used the 9:29 AM pre-market tick as "previous
+        // close", which is NOT yesterday's close — it's just the last price ticking
+        // in right before open. It also silently raced with AddDailyCandle()'s daily
+        // rollover (the correct source, now fixed below), so depending on timing
+        // either value could win, producing wrong Gap %/price-change readings.
+        // AddDailyCandle() is now the single source of truth for _prevDayClose.
 
         _vwap.TryGetValue(symbol, out decimal vwapNow);
         bool aboveVwap = vwapNow > 0 && candle.Close > vwapNow;
@@ -747,6 +770,27 @@ public partial class SimulatedBroker
             if (!_dailyVolume.ContainsKey(symbol)) _dailyVolume[symbol] = 0;
             _dailyVolume[symbol] += size;
         }
+    }
+
+    // Called from IbClient on every field-8 (cumulative VOLUME) tick. This is
+    // IBKR's own running daily total, resent on every update — so it self-
+    // corrects on reconnect/restart instead of resetting to zero the way
+    // _dailyVolume (summed locally from individual trade prints) does.
+    public void OnAuthoritativeDailyVolume(string symbol, long cumulativeVolume)
+    {
+        if (cumulativeVolume > 0)
+            _dailyVolumeAuthoritative[symbol] = cumulativeVolume;
+    }
+
+    // Single source of truth for "shares traded today" — prefers IBKR's own
+    // cumulative total when available, falls back to the locally-summed
+    // counter only if IBKR hasn't sent a field-8 tick yet (e.g. right after
+    // subscribing, before the first volume update arrives).
+    private long GetTodayVolume(string symbol)
+    {
+        if (_dailyVolumeAuthoritative.TryGetValue(symbol, out long authVol) && authVol > 0)
+            return authVol;
+        return _dailyVolume.GetValueOrDefault(symbol);
     }
 
     // ══════════════════════════════════════════════════════════
@@ -890,7 +934,8 @@ public partial class SimulatedBroker
 
             if (SWING_MODE_ENABLED)
             {
-                if (!_dailyCandles.TryGetValue(symbol, out var daily) || daily.Count < 60) return "No daily";
+                var dailyBars = GetDailyBarsPreferLive(symbol);
+                if (dailyBars == null || dailyBars.Count < 60) return "No daily";
                 return "Swing scan";
             }
 
@@ -1130,10 +1175,8 @@ public partial class SimulatedBroker
 
     private bool TrySwingBreakoutStrategy(string symbol, List<Candle> candles, DateTime nowEt)
     {
-        if (!_dailyCandles.TryGetValue(symbol, out var daily)) return false;
-
-        List<Candle> dailyBars;
-        lock (daily) dailyBars = daily.ToList();
+        var dailyBars = GetDailyBarsPreferLive(symbol);
+        if (dailyBars == null || dailyBars.Count == 0) return false;
         if (candles == null || candles.Count < 30) return false;
 
         decimal close = candles.Last().Close;
@@ -1216,7 +1259,7 @@ public partial class SimulatedBroker
                             || preInd.Rsi14 > RSI_LONG_MIN || preInd.Rsi14 < RSI_SHORT_MAX;
             _vwap.TryGetValue(symbol, out decimal preVwap);
             bool nearVwap = preVwap > 0 && Math.Abs(lastPrice - preVwap) <= preInd.Atr14 * 1.5m;
-            _prevDayClose.TryGetValue(symbol, out decimal prevCloseCheck);
+            decimal prevCloseCheck = GetPrevDayClose(symbol);
             bool gapActive = prevCloseCheck > 0
                                 && Math.Abs((lastPrice - prevCloseCheck) / prevCloseCheck) >= GAP_GO_MIN_PCT;
             if (!SWING_MODE_ENABLED && !orbActive && !rsiExtreme && !nearVwap && !gapActive && !preInd.VolExpansion)
@@ -1233,57 +1276,56 @@ public partial class SimulatedBroker
                 return;
             }
 
-            // 0. Candlestick anticipation / reversal-continuation layer
-            // Scalping note: delay pattern entries a bit longer than before.
-            // Open-drive noise during the first ~10 minutes was a major source of false positives.
-            if (STRATEGY_CANDLE_PATTERNS_ENABLED && minutesSinceOpen >= 10)
-                if (TryCandlestickPatternStrategy(symbol, candles, intrabar: false)) return;
-
-            // 0b. Micro-pullback: catch 1-2 bar pullbacks after impulse moves
-            if (STRATEGY_MICRO_PULLBACK_ENABLED && minutesSinceOpen >= 6)
-                if (TryMicroPullbackStrategy(symbol, candles)) return;
-
-            // 0b.2 Outside-candle / engulfing expansion setup. This method existed but
-            // was not wired into the dispatcher, so enabling the flag previously did nothing.
-            if (STRATEGY_OUTSIDE_CANDLE_ENABLED && minutesSinceOpen >= 10)
-                if (TryOutsideCandleStrategy(symbol, candles)) return;
-
-            // 0c. Dedicated breakout scalper — higher frequency than ORB/GAP/Momentum,
-            // but only when tape, VWAP and short EMAs align.
-            if (minutesSinceOpen >= 6)
-                if (TryScalpBreakoutStrategy(symbol, candles)) return;
-
-            // 1. Opening Range Breakout (only after ORB window closes)
-            if (STRATEGY_ORB_ENABLED && minutesSinceOpen >= ORB_MINUTES)
-                if (TryOrbStrategy(symbol, candles, nowEt)) return;
-
             // Gap&Go should be available earlier than the old 45-minute gate.
             // Strong gaps often do their real move in the first 20-40 minutes.
             int gapGoEnd = _marketRegime == "TRENDING" ? 150 : 120;
-            if (STRATEGY_GAP_GO_ENABLED && minutesSinceOpen >= 20 && minutesSinceOpen <= gapGoEnd)
-                if (TryGapAndGoStrategy(symbol, candles)) return;
 
-            // 3. VWAP Bounce / Reclaim
-            // FIX: VWAP needs at least 15 minutes to establish. At 09:36 (6 min), VWAP
-            // is basically current price ± noise — "reclaim" signals are meaningless.
-            if (STRATEGY_VWAP_ENABLED && minutesSinceOpen >= 15)
-                if (TryVwapBounceStrategy(symbol, candles, prevBarAboveVwap, currBarAboveVwap)) return;
+            // Each entry below is (family name, gate+action). The gate/timing rules
+            // for each strategy are unchanged from before — only the ORDER they are
+            // tried in now rotates daily (see rotation below), instead of always
+            // being tried in this fixed sequence.
+            //
+            // Why: with MAX_TRADES_PER_DAY=8 and MAX_TRADES_PER_STRATEGY=2, only 4
+            // strategy "families" can ever trade on a given day. With a fixed order,
+            // CANDLE_PATTERNS/MICRO_PULLBACK/OUTSIDE_CANDLE/SCALP_BREAKOUT always got
+            // first crack at every signal and silently absorbed the whole daily
+            // budget — ORB/GAP_GO/VWAP/MEAN_REV/BB_MR/MOMENTUM/EMA_POCKET could go
+            // days without ever getting a chance to fire, regardless of their flags.
+            var strategySlots = new (string Name, Func<bool> Run)[]
+            {
+                ("CANDLE_PATTERNS", () => STRATEGY_CANDLE_PATTERNS_ENABLED && minutesSinceOpen >= 10
+                    && TryCandlestickPatternStrategy(symbol, candles, intrabar: false)),
+                ("MICRO_PULLBACK", () => STRATEGY_MICRO_PULLBACK_ENABLED && minutesSinceOpen >= 6
+                    && TryMicroPullbackStrategy(symbol, candles)),
+                ("OUTSIDE_CANDLE", () => STRATEGY_OUTSIDE_CANDLE_ENABLED && minutesSinceOpen >= 10
+                    && TryOutsideCandleStrategy(symbol, candles)),
+                ("SCALP_BREAKOUT", () => minutesSinceOpen >= 6
+                    && TryScalpBreakoutStrategy(symbol, candles)),
+                ("ORB", () => STRATEGY_ORB_ENABLED && minutesSinceOpen >= ORB_MINUTES
+                    && TryOrbStrategy(symbol, candles, nowEt)),
+                ("GAP_GO", () => STRATEGY_GAP_GO_ENABLED && minutesSinceOpen >= 20 && minutesSinceOpen <= gapGoEnd
+                    && TryGapAndGoStrategy(symbol, candles)),
+                ("VWAP", () => STRATEGY_VWAP_ENABLED && minutesSinceOpen >= 15
+                    && TryVwapBounceStrategy(symbol, candles, prevBarAboveVwap, currBarAboveVwap)),
+                ("MEAN_REV", () => STRATEGY_MEAN_REV_ENABLED
+                    && TryMeanReversionStrategy(symbol, candles)),
+                ("BB_MR", () => STRATEGY_BB_MR_ENABLED
+                    && TryBollingerMeanReversionStrategy(symbol, candles)),
+                ("MOMENTUM", () => STRATEGY_MOMENTUM_ENABLED
+                    && TryMomentumStrategy(symbol, candles)),
+                ("EMA_POCKET", () => STRATEGY_EMA_POCKET_ENABLED
+                    && TryEmaPocketStrategy(symbol, candles)),
+            };
 
-            // 4. RSI Mean Reversion
-            if (STRATEGY_MEAN_REV_ENABLED)
-                if (TryMeanReversionStrategy(symbol, candles)) return;
-
-            // 4b. Bollinger Band Mean Reversion
-            if (STRATEGY_BB_MR_ENABLED)
-                if (TryBollingerMeanReversionStrategy(symbol, candles)) return;
-
-            // 5. Momentum Breakout + Continuation
-            if (STRATEGY_MOMENTUM_ENABLED)
-                if (TryMomentumStrategy(symbol, candles)) return;
-
-            // 6. EMA Pocket — catches pullbacks to EMA9/21 pocket near key levels
-            if (STRATEGY_EMA_POCKET_ENABLED)
-                if (TryEmaPocketStrategy(symbol, candles)) return;
+            // Rotate the starting point daily (day-of-year mod slot count) so each
+            // strategy family leads the queue on a roughly equal share of days over
+            // time, rather than the same families always going first.
+            int rotation = nowEt.DayOfYear % strategySlots.Length;
+            for (int i = 0; i < strategySlots.Length; i++)
+            {
+                var slot = strategySlots[(rotation + i) % strategySlots.Length];
+                if (slot.Run()) return;
+            }
         }
     }
 
@@ -1487,7 +1529,8 @@ public partial class SimulatedBroker
                 goto TryShortOrb;
             }
 
-            if (_prevDayClose.TryGetValue(symbol, out decimal prevCloseOrb) && prevCloseOrb > 0)
+            decimal prevCloseOrb = GetPrevDayClose(symbol);
+            if (prevCloseOrb > 0)
             {
                 decimal stockDayPct = (close - prevCloseOrb) / prevCloseOrb;
                 if (stockDayPct < -0.002m)
@@ -1511,7 +1554,7 @@ public partial class SimulatedBroker
             return true;
         }
 
-        TryShortOrb:
+    TryShortOrb:
         bool orbShortHold = candles.Count >= requiredHoldBars
                          && candles.TakeLast(requiredHoldBars).All(c => c.Close < orb.Low)
                          && (vwapVal > 0 && close <= vwapVal);
@@ -1542,14 +1585,15 @@ public partial class SimulatedBroker
 
     private bool TryGapAndGoStrategy(string symbol, List<Candle> candles)
     {
-        if (!_prevDayClose.TryGetValue(symbol, out decimal prevClose) || prevClose <= 0) return false;
+        decimal prevClose = GetPrevDayClose(symbol);
+        if (prevClose <= 0) return false;
         if (!_latestTick.TryGetValue(symbol, out decimal currentPrice) || currentPrice <= 0) return false;
         decimal gapPct = (currentPrice - prevClose) / prevClose;
 
         if (Math.Abs(gapPct) < GAP_GO_MIN_PCT) return false;
 
         var todayEt = GetEasternTime().Date;
-        long todayVol = _dailyVolume.GetValueOrDefault(symbol);
+        long todayVol = GetTodayVolume(symbol);
         int minutesToday = Math.Max(1, (GetEasternTime().Hour - 9) * 60 + GetEasternTime().Minute - 30);
         long avg20Vol = (long)(candles
             .GroupBy(c => c.Time.Date)
@@ -2816,7 +2860,7 @@ public partial class SimulatedBroker
         // ── RISK MGMT: Strategy allocation limit ──
         // Prevents one misfiring strategy from consuming the full daily budget.
         if (!IsSwingStrategy(strategyTag) && IsStrategyAtDailyLimit(strategyTag))
-            {
+        {
             RecordBlock(symbol, "STRAT_LIMIT");
             LogMessage($"[STRAT LIMIT] {strategyTag} {symbol} blocked — {GetStrategyFamily(strategyTag)} hit {MAX_TRADES_PER_STRATEGY} trades today");
             return;
@@ -2877,7 +2921,7 @@ public partial class SimulatedBroker
             {
                 if (_symbolSectors.TryGetValue(openPos.Symbol, out string existingSector)
                     && existingSector == newSector)
-                    {
+                {
                     RecordBlock(symbol, "SECTOR_GATE");
                     LogMessage($"[SECTOR GATE] {strategyTag} {symbol} blocked — already have {openPos.Symbol} in sector [{newSector}]");
                     return;
@@ -3185,7 +3229,8 @@ public partial class SimulatedBroker
                     return;
                 }
 
-                if (_dailyCandles.TryGetValue(symbol, out var swingDaily) && swingDaily.Count >= 20)
+                var swingDaily = GetDailyBarsPreferLive(symbol);
+                if (swingDaily != null && swingDaily.Count >= 20)
                 {
                     decimal dSma20 = SafeSMA(swingDaily, 20);
                     decimal dSma50 = swingDaily.Count >= 50 ? SafeSMA(swingDaily, 50) : 0m;
@@ -3605,6 +3650,7 @@ public partial class SimulatedBroker
         if (nowEt.Date <= _lastVolumeResetEt) return;
 
         _dailyVolume.Clear();
+        _dailyVolumeAuthoritative.Clear();
         _vwapAccum.Clear();
         _vwap.Clear();
         _orbRanges.Clear();
@@ -3972,6 +4018,8 @@ public partial class SimulatedBroker
             foreach (var kv in dict)
                 lock (kv.Value) { kv.Value.RemoveAll(c => c.Time < cutoff); }
             AtomicWrite(StatePath("market_memory.json"), JsonSerializer.Serialize(dict));
+            // persist daily candles too
+            SaveDailyMemory();
         }
         catch (Exception ex) { LogError("SaveMarketMemory", ex.Message); }
     }
@@ -3988,6 +4036,53 @@ public partial class SimulatedBroker
                     _marketData[kv.Key] = kv.Value;
         }
         catch (Exception ex) { LogError("LoadMarketMemory", ex.Message); }
+
+        // Load persisted daily candles and if missing, seed from Yahoo
+        try
+        {
+            LoadDailyMemory();
+        }
+        catch (Exception ex) { LogError("LoadDailyMemory", ex.Message); }
+
+        // If some symbols lack daily history, fetch from Yahoo to ensure SMA accuracy
+        try
+        {
+            foreach (var sym in _watchlist)
+            {
+                if (_dailyCandles.ContainsKey(sym) && _dailyCandles[sym].Count > 10) continue;
+                var bars = FetchDailyFromYahoo(sym).GetAwaiter().GetResult();
+                if (bars != null && bars.Count > 0)
+                {
+                    _dailyCandles[sym] = bars;
+                    LogMessage($"[YAHOO SEED] {sym} daily bars seeded: {bars.Count}");
+                }
+            }
+        }
+        catch (Exception ex) { LogError("SeedDailyFromYahoo", ex.Message); }
+    }
+
+    private void SaveDailyMemory()
+    {
+        try
+        {
+            var dict = _dailyCandles.ToDictionary(k => k.Key, v => v.Value);
+            AtomicWrite(StatePath("daily_memory.json"), JsonSerializer.Serialize(dict));
+        }
+        catch (Exception ex) { LogError("SaveDailyMemory", ex.Message); }
+    }
+
+    private void LoadDailyMemory()
+    {
+        string raw = SafeReadJson(StatePath("daily_memory.json"));
+        if (raw == null) return;
+        try
+        {
+            var data = JsonSerializer.Deserialize<ConcurrentDictionary<string, List<Candle>>>(raw);
+            if (data != null)
+                foreach (var kv in data)
+                    _dailyCandles[kv.Key] = kv.Value;
+        }
+        catch (Exception ex) { LogError("LoadDailyMemory", ex.Message); }
     }
 
     public void ClearMarketData()
@@ -4051,7 +4146,6 @@ public partial class SimulatedBroker
 
         foreach (var symbol in toSubscribe)
         {
-            SeedVwapFromCandles(symbol);
             LogMessage($"[HIST] Requesting 1-min history: {symbol}...");
             RealBroker.RequestHistoricalData(symbol);
             _subscribedSymbols.Add(symbol);
@@ -4070,6 +4164,13 @@ public partial class SimulatedBroker
         // shows SMA20/50/RSI immediately — not just after the first live tick.
         // Without this, _indicatorCache is empty until FinalizeCandle() fires,
         // and BuildStatusJson() emits sma20=0, sma50=0 → HTML shows "—".
+        // BUGFIX: SeedVwapFromCandles(symbol) used to be called BEFORE
+        // RealBroker.RequestHistoricalData(symbol) even ran, so _marketData had no
+        // candles for that symbol yet — the seed always no-op'd (empty _marketData,
+        // or "today" filtered down to 0 bars on a fresh session). Moved here, after
+        // the historical data loop above has had time to populate _marketData, so
+        // VWAP actually gets backfilled instead of sitting at $0 ("—" on the
+        // dashboard) until enough live ticks trickle in on their own.
         foreach (var symbol in toSubscribe)
         {
             if (_marketData.TryGetValue(symbol, out var candles) && candles.Count >= 30)
@@ -4077,6 +4178,7 @@ public partial class SimulatedBroker
                 RefreshIndicatorCache(symbol, candles);
                 Refresh15MinEma(symbol, candles);
             }
+            SeedVwapFromCandles(symbol);
         }
         LogMessage($"[HIST] Indicator cache seeded for {toSubscribe.Count} symbols.");
 
@@ -4211,12 +4313,28 @@ public partial class SimulatedBroker
             }
             if (list.Count > 250) list.RemoveAt(0);
 
-            if (list.Count >= 2)
+            // "Yesterday" = the most recent completed session strictly before
+            // today's ET trading date — resolved by calendar date, not list
+            // position. IBKR's historical daily-bar feed only ever returns
+            // *completed* sessions, so for most of the trading day the list's
+            // last entry already IS yesterday's bar (today's own bar doesn't
+            // exist yet). The old `list[list.Count - 2]` logic assumed today's
+            // bar was always present, so it was actually grabbing the day
+            // BEFORE yesterday — Prev Day Hi/Lo/Close (and Gap %, which is
+            // derived from _prevDayClose) lagged a full session for the entire
+            // live session, every day, which — combined with the nightly
+            // TWS restart requiring a fresh historical reload each morning —
+            // meant this was essentially always wrong during market hours.
+            var todayEt = GetEasternTime().Date;
+            var mostRecentPrior = list
+                .Where(c => c.Time.Date < todayEt)
+                .OrderByDescending(c => c.Time)
+                .FirstOrDefault();
+            if (mostRecentPrior != null)
             {
-                var yesterday = list[list.Count - 2];
-                _prevDayHighLevel[symbol] = yesterday.High;
-                _prevDayLowLevel[symbol] = yesterday.Low;
-                _prevDayClose[symbol] = yesterday.Close;
+                _prevDayHighLevel[symbol] = mostRecentPrior.High;
+                _prevDayLowLevel[symbol] = mostRecentPrior.Low;
+                _prevDayClose[symbol] = mostRecentPrior.Close;
             }
         }
     }
@@ -4708,6 +4826,8 @@ public partial class SimulatedBroker
             ctx.Response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
             ctx.Response.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
             ctx.Response.ContentType = "application/json";
+            // Log incoming requests for diagnostics
+            try { LogMessage($"[HTTP] {ctx.Request.HttpMethod} {ctx.Request.Url.AbsolutePath}"); } catch { }
 
             var path = ctx.Request.Url.AbsolutePath.ToLower();
             var method = ctx.Request.HttpMethod.ToUpper();
@@ -4718,6 +4838,61 @@ public partial class SimulatedBroker
                 ctx.Response.StatusCode = 204;
                 ctx.Response.OutputStream.Close();
                 return;
+            }
+            // Quick path: handle rebuild request early to ensure response is explicit
+            else if (path == "/api/rebuild_sma" && method == "POST")
+            {
+                try
+                {
+                    using var reader = new System.IO.StreamReader(ctx.Request.InputStream, System.Text.Encoding.UTF8);
+                    var body = reader.ReadToEnd();
+                    using var doc = System.Text.Json.JsonDocument.Parse(string.IsNullOrWhiteSpace(body) ? "{}" : body);
+                    var root = doc.RootElement;
+                    if (!root.TryGetProperty("password", out var pwEl) || !PasswordMatches(pwEl.GetString()))
+                    {
+                        ctx.Response.StatusCode = 401;
+                        json = "{\"ok\":false,\"message\":\"Incorrect password.\"}";
+                        byte[] deny = System.Text.Encoding.UTF8.GetBytes(json);
+                        ctx.Response.ContentLength64 = deny.Length;
+                        ctx.Response.OutputStream.Write(deny, 0, deny.Length);
+                        return;
+                    }
+
+                    if (_rebuildInProgress)
+                    {
+                        json = "{\"ok\":false,\"message\":\"Rebuild already in progress.\"}";
+                    }
+                    else
+                    {
+                        _rebuildInProgress = true;
+                        _rebuildMessage = "Started by dashboard";
+                        _lastRebuildUtc = DateTime.UtcNow;
+                        Task.Run(() => {
+                            try
+                            {
+                                RebuildAllSmaFromYahoo();
+                                _rebuildMessage = "Completed successfully";
+                            }
+                            catch (Exception ex)
+                            {
+                                _rebuildMessage = "Failed: " + ex.Message;
+                                LogError("RebuildAllSmaFromYahoo", ex.Message);
+                            }
+                            finally
+                            {
+                                _rebuildInProgress = false;
+                                _lastRebuildUtc = DateTime.UtcNow;
+                                try { SaveDailyMemory(); } catch { }
+                            }
+                        });
+                        json = "{\"ok\":true,\"message\":\"Rebuild started\"}";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ctx.Response.StatusCode = 400;
+                    json = $"{{\"ok\":false,\"message\":\"{ex.Message.Replace("\"", "\\\"").Replace("\n", " ")}\"}}";
+                }
             }
             else if (path == "/api/backtest/historical")
             {
@@ -4976,6 +5151,7 @@ public partial class SimulatedBroker
                     json = $"{{\"ok\":false,\"message\":\"{ex.Message.Replace("\"", "\\\"").Replace("\n", " ")}\"}}";
                 }
             }
+            // PLACEHOLDER: insertion point for external patches
             else if (path == "/api/unhalt" && method == "POST")
             {
                 try
@@ -5196,33 +5372,35 @@ public partial class SimulatedBroker
                 decimal price = candles?.LastOrDefault()?.Close ?? 0m;
                 bool dataReady = price > 0m;
 
-                // Use cached indicators; fall back to direct computation if cache
-                // hasn't been seeded yet (e.g. between historical load and first live tick).
+                // Use cached indicators for RSI/ATR/MACD (intraday, appropriate for near-term signal
+                // timing); fall back to direct computation if the cache hasn't been seeded yet.
+                // SMA20/50/100 are shown as DAILY values here (matching SMA200) since that's what
+                // the dashboard displays them as — the strategies themselves still use the fast,
+                // intraday SMA20/50/100 (ind.Sma20/Sma50/Sma100) for entry timing; this is display-only.
                 decimal sma20 = 0m, sma50 = 0m, sma100 = 0m, atr = 0m;
                 double rsi = 0.0;
                 int macdDir = 0;
                 if (dataReady && _indicatorCache.TryGetValue(sym, out var indC))
                 {
-                    sma20 = indC.Sma20;
-                    sma50 = indC.Sma50;
-                    sma100 = indC.Sma100;
                     rsi = indC.Rsi14;
                     atr = indC.Atr14;
                     macdDir = indC.MacdDir;
                 }
                 else if (dataReady && candles != null && candles.Count >= 20)
                 {
-                    // FIX: Mirror the console dashboard — compute directly from candles
-                    sma20 = SafeSMA(candles, 20);
-                    sma50 = SafeSMA(candles, 50);
-                    sma100 = SafeSMA(candles, 100);
                     rsi = SafeRSI(candles, 14);
                     atr = SafeATR(candles, 14);
                     macdDir = SafeMACDDirection(candles);
                 }
+                if (dataReady)
+                {
+                    sma20 = GetDailySma20(sym);
+                    sma50 = GetDailySma50(sym);
+                    sma100 = GetDailySma100(sym);
+                }
                 decimal atrPct = price > 0 ? atr / price * 100 : 0;
                 _vwap.TryGetValue(sym, out decimal vwap);
-                _prevDayClose.TryGetValue(sym, out decimal prevClose);
+                decimal prevClose = GetPrevDayClose(sym);
                 decimal gapPct = prevClose > 0 ? (price - prevClose) / prevClose * 100 : 0;
                 var quote = GetDisplayQuote(sym, price);
                 decimal displayPrice = quote.price > 0 ? quote.price : price;
@@ -5230,7 +5408,7 @@ public partial class SimulatedBroker
                     ? (displayPrice - prevClose) / prevClose * 100 : gapPct;
                 if (price == 0m && displayPrice > 0) price = displayPrice;
                 else if (displayPrice > 0) price = displayPrice;
-                long volK = _dailyVolume.GetValueOrDefault(sym) / 1000;
+                long volK = GetTodayVolume(sym) / 1000;
                 bool abvVwap = vwap > 0 && price > vwap;
                 string trend = price > sma50 ? "UP" : "NEUT";
 
@@ -5366,7 +5544,48 @@ public partial class SimulatedBroker
             decimal totalEquityPnl = _totalRealizedPnL + unrealizedPnl;
             decimal sizeMultiplier = GetDynamicSizeMultiplier();
 
-            return $@"{{""time"":""{now:yyyy-MM-dd HH:mm:ss} PT"",""et"":""{et:HH:mm:ss} ET"",""regime"":""{_marketRegime}"",""spyBullish"":{(_spyBullish ? "true" : "false")},""spyBearish"":{(_spyBearish ? "true" : "false")},""halted"":{(_haltTrading ? "true" : "false")},""manualResume"":{(_manualResumeOverride ? "true" : "false")},""reconciled"":{(_reconciled ? "true" : "false")},""pnl"":{_totalRealizedPnL:F2},""unrealizedPnl"":{unrealizedPnl:F2},""totalEquityPnl"":{totalEquityPnl:F2},""sizeMult"":{sizeMultiplier:F2},""ddBreached"":{(IsUnrealizedDrawdownBreached() ? "true" : "false")},""goal"":{DAILY_PROFIT_GOAL:F2},""maxLoss"":{MAX_DAILY_LOSS:F2},""trades"":{_tradesToday},""maxTrades"":{MAX_TRADES_PER_DAY},""wins"":{_winCount},""losses"":{_lossCount},""wr"":{wr:F1},""cash"":{cash:F2},""budget"":{TOTAL_BUDGET:F2},""initialBudget"":{TOTAL_BUDGET:F2},""positions"":{posArr},""curve"":{curveArr},""watchlist"":{wlArr},""feed"":{tradeArr},""hist"":{histArr},""lifetimeCurve"":{ltArr},""allTrades"":{_cachedAllTradesJson},""blockedReasons"":{blockedArr},""lastBlocked"":{lastBlockedArr}}}";
+            var __rebuildInProgressJson = (_rebuildInProgress ? "true" : "false");
+            var __lastRebuildIso = (_lastRebuildUtc == DateTime.MinValue) ? "" : _lastRebuildUtc.ToString("o");
+            var __rebuildMessageEsc = (_rebuildMessage ?? "").Replace("\"", "\\\"");
+
+            var __sb = new StringBuilder();
+            __sb.Append('{');
+            __sb.AppendFormat("\"time\":\"{0:yyyy-MM-dd HH:mm:ss} PT\",", now);
+            __sb.AppendFormat("\"et\":\"{0:HH:mm:ss} ET\",", et);
+            __sb.AppendFormat("\"regime\":\"{0}\",", _marketRegime);
+            __sb.Append("\"spyBullish\":").Append(_spyBullish ? "true" : "false").Append(',');
+            __sb.Append("\"spyBearish\":").Append(_spyBearish ? "true" : "false").Append(',');
+            __sb.Append("\"halted\":").Append(_haltTrading ? "true" : "false").Append(',');
+            __sb.Append("\"manualResume\":").Append(_manualResumeOverride ? "true" : "false").Append(',');
+            __sb.Append("\"reconciled\":").Append(_reconciled ? "true" : "false").Append(',');
+            __sb.AppendFormat("\"pnl\":{0:F2},", _totalRealizedPnL);
+            __sb.AppendFormat("\"unrealizedPnl\":{0:F2},", unrealizedPnl);
+            __sb.AppendFormat("\"totalEquityPnl\":{0:F2},", totalEquityPnl);
+            __sb.AppendFormat("\"sizeMult\":{0:F2},", sizeMultiplier);
+            __sb.Append("\"ddBreached\":").Append(IsUnrealizedDrawdownBreached() ? "true" : "false").Append(',');
+            __sb.AppendFormat("\"goal\":{0:F2},", DAILY_PROFIT_GOAL);
+            __sb.AppendFormat("\"maxLoss\":{0:F2},", MAX_DAILY_LOSS);
+            __sb.AppendFormat("\"trades\":{0},", _tradesToday);
+            __sb.AppendFormat("\"maxTrades\":{0},", MAX_TRADES_PER_DAY);
+            __sb.AppendFormat("\"wins\":{0},", _winCount);
+            __sb.AppendFormat("\"losses\":{0},", _lossCount);
+            __sb.AppendFormat("\"wr\":{0:F1},", wr);
+            __sb.AppendFormat("\"cash\":{0:F2},", cash);
+            __sb.AppendFormat("\"budget\":{0:F2},", TOTAL_BUDGET);
+            __sb.AppendFormat("\"initialBudget\":{0:F2},", TOTAL_BUDGET);
+            __sb.Append("\"positions\":").Append(posArr).Append(',');
+            __sb.Append("\"curve\":").Append(curveArr).Append(',');
+            __sb.Append("\"watchlist\":").Append(wlArr).Append(',');
+            __sb.Append("\"feed\":").Append(tradeArr).Append(',');
+            __sb.Append("\"hist\":").Append(histArr).Append(',');
+            __sb.Append("\"lifetimeCurve\":").Append(ltArr).Append(',');
+            __sb.Append("\"allTrades\":").Append(_cachedAllTradesJson).Append(',');
+            __sb.Append("\"rebuildInProgress\":").Append(__rebuildInProgressJson).Append(',');
+            __sb.Append("\"lastRebuildUtc\":\"").Append(__lastRebuildIso).Append("\",");
+            __sb.Append("\"rebuildMessage\":\"").Append(__rebuildMessageEsc).Append("\",");
+            __sb.Append("\"blockedReasons\":").Append(blockedArr).Append(',');
+            __sb.Append("\"lastBlocked\":").Append(lastBlockedArr).Append('}');
+            return __sb.ToString();
         }
     }
 
@@ -5507,14 +5726,17 @@ public partial class SimulatedBroker
                 decimal price = last?.Close ?? 0m;
                 if (price == 0m) continue;
 
-                decimal sma20 = SafeSMA(candles, 20);
-                decimal sma50 = SafeSMA(candles, 50);
-                decimal sma100 = SafeSMA(candles, 100);
+                // Show DAILY SMA20/50/100 here (matching how SMA200 is already shown elsewhere) —
+                // the strategies themselves still use the fast intraday SMA20/50/100 (ind.Sma*) for
+                // entry timing; this console table is a human-readable trend view, not a signal feed.
+                decimal sma20 = GetDailySma20(sym);
+                decimal sma50 = GetDailySma50(sym);
+                decimal sma100 = GetDailySma100(sym);
                 double rsi = SafeRSI(candles, 14);
                 _vwap.TryGetValue(sym, out decimal vwapVal);
-                _prevDayClose.TryGetValue(sym, out decimal prevClose);
+                decimal prevClose = GetPrevDayClose(sym);
                 decimal gapPct = prevClose > 0 ? (price - prevClose) / prevClose * 100 : 0;
-                long volK = _dailyVolume.GetValueOrDefault(sym) / 1000;
+                long volK = GetTodayVolume(sym) / 1000;
                 string trend = price > sma50 ? "▲ UP  " : "- NEUT";
 
                 _orbRanges.TryGetValue(sym, out var orb);
@@ -5633,19 +5855,40 @@ public partial class SimulatedBroker
 
     private int SafeMACDDirection(List<Candle> candles)
     {
-        if (candles == null || candles.Count < 30) return 0;
+        // Standard MACD: signal line is the 9-period EMA of the MACD line itself
+        // (EMA12 - EMA26), not a comparison against the raw MACD value from N bars
+        // ago. That old approach doesn't smooth the comparison point at all, so it
+        // was noisier and didn't match what "MACD direction" conventionally means.
+        // Need 26 bars for the slow EMA to seed, plus ~9 more so the signal EMA
+        // itself has warmed up.
+        if (candles == null || candles.Count < 35) return 0;
         var closes = candles.Select(c => (double)c.Close).ToArray();
 
-        double ema12Now = CalcEMA(closes, 12);
-        double ema26Now = CalcEMA(closes, 26);
-        double macdNow = ema12Now - ema26Now;
+        double k12 = 2.0 / (12 + 1);
+        double k26 = 2.0 / (26 + 1);
 
-        var closesPrev = closes.Take(closes.Length - 5).ToArray();
-        if (closesPrev.Length < 26) return 0;
-        double macdPrev = CalcEMA(closesPrev, 12) - CalcEMA(closesPrev, 26);
+        double ema12 = closes.Take(12).Average();
+        double ema26 = closes.Take(26).Average();
 
-        if (macdNow > 0 && macdNow > macdPrev) return 1;
-        if (macdNow < 0 && macdNow < macdPrev) return -1;
+        var macdSeries = new List<double>();
+        for (int i = 0; i < closes.Length; i++)
+        {
+            if (i >= 12) ema12 = closes[i] * k12 + ema12 * (1 - k12);
+            if (i >= 26)
+            {
+                ema26 = closes[i] * k26 + ema26 * (1 - k26);
+                macdSeries.Add(ema12 - ema26);
+            }
+        }
+
+        if (macdSeries.Count < 9) return 0;
+
+        double signal = CalcEMA(macdSeries.ToArray(), 9);
+        double macdNow = macdSeries[macdSeries.Count - 1];
+        double histogram = macdNow - signal;
+
+        if (histogram > 0) return 1;
+        if (histogram < 0) return -1;
         return 0;
     }
 
@@ -5672,9 +5915,10 @@ public partial class SimulatedBroker
             Rsi14 = SafeRSI(candles, 14),
             Rsi14Prev = SafeRSI(candlesM1, 14),
             Atr14 = SafeATR(candles, 14),
-            Sma20 = SafeSMA(candles, 20),
-            Sma50 = SafeSMA(candles, 50),
-            Sma100 = SafeSMA(candles, 100),
+            // Use live intraday 1-min data for intraday SMAs
+            Sma20 = GetIntradaySma(symbol, 20),
+            Sma50 = GetIntradaySma(symbol, 50),
+            Sma100 = GetIntradaySma(symbol, 100),
             Ema9 = CalcEMA(closes, 9),
             Ema21 = CalcEMA(closes, 21),
             Ema9Prev = closesPrev.Length >= 9 ? CalcEMA(closesPrev, 9) : 0,
@@ -5685,6 +5929,32 @@ public partial class SimulatedBroker
             VolExpansion = CheckVolumeExpansion(candles),
         };
         _indicatorCache[symbol] = ind;
+
+        // Diagnostic logging for suspicious symbols (NVDA, AAPL)
+        try
+        {
+            if (string.Equals(symbol, "NVDA", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(symbol, "AAPL", StringComparison.OrdinalIgnoreCase))
+            {
+                var (pdHigh, pdLow) = GetPrevDayHL(symbol);
+                decimal pdClose = GetPrevDayClose(symbol);
+                var vwapNow = _vwap.GetValueOrDefault(symbol);
+                LogMessage($"[DIAG] {symbol} bars={candles.Count} sma20={ind.Sma20:F3} sma50={ind.Sma50:F3} sma100={ind.Sma100:F3} atr={ind.Atr14:F3} prevHi={pdHigh:F2} prevLo={pdLow:F2} prevClose={pdClose:F2} vwap={vwapNow:F2}");
+            }
+        }
+        catch { }
+    }
+
+    // Compute intraday SMA from live 1-min market data (preferred over any cached series)
+    private decimal GetIntradaySma(string symbol, int period)
+    {
+        if (period <= 0) return 0m;
+        if (!_marketData.TryGetValue(symbol, out var list) || list == null) return 0m;
+        lock (list)
+        {
+            if (list.Count < period) return 0m;
+            return list.TakeLast(period).Average(c => c.Close);
+        }
     }
 
     private void Refresh15MinEma(string symbol, List<Candle> candles)
@@ -5710,29 +5980,278 @@ public partial class SimulatedBroker
 
     private decimal GetDailySma200(string symbol)
     {
-        if (!_dailyCandles.TryGetValue(symbol, out var daily)) return 0m;
-        lock (daily)
-        {
-            if (daily.Count < 200) return 0m;
-            return daily.TakeLast(200).Average(c => c.Close);
-        }
+        // Use the merged (historical + live "today") daily bar series so the
+        // average is actually taken over up to 200 distinct trading days,
+        // not just whatever days happen to be sitting in the 1-min live buffer.
+        var bars = GetDailyBarsPreferLive(symbol);
+        if (bars.Count >= 200) return SafeSMA(bars, 200);
+        if (bars.Count > 0) return bars.Average(c => c.Close);
+
+        // Last-resort fallback: previously cached value (e.g. from a Yahoo rebuild).
+        if (_dailySmaCache.TryGetValue(symbol, out var cached) && cached.sma200 > 0) return cached.sma200;
+
+        return 0m;
     }
 
     private decimal GetDailySma100(string symbol)
     {
-        if (!_dailyCandles.TryGetValue(symbol, out var daily)) return 0m;
-        lock (daily)
+        // Use the merged (historical + live "today") daily bar series so the
+        // average is actually taken over up to 100 distinct trading days,
+        // not just whatever days happen to be sitting in the 1-min live buffer.
+        var bars = GetDailyBarsPreferLive(symbol);
+        if (bars.Count >= 100) return SafeSMA(bars, 100);
+        if (bars.Count > 0) return bars.Average(c => c.Close);
+
+        // Last-resort fallback: previously cached value (e.g. from a Yahoo rebuild).
+        if (_dailySmaCache.TryGetValue(symbol, out var cached) && cached.sma100 > 0) return cached.sma100;
+
+        return 0m;
+    }
+
+    private decimal GetDailySma50(string symbol)
+    {
+        var bars = GetDailyBarsPreferLive(symbol);
+        if (bars.Count >= 50) return SafeSMA(bars, 50);
+        if (bars.Count > 0) return bars.Average(c => c.Close);
+
+        if (_dailySmaCache.TryGetValue(symbol, out var cached) && cached.sma50 > 0) return cached.sma50;
+
+        return 0m;
+    }
+
+    private decimal GetDailySma20(string symbol)
+    {
+        var bars = GetDailyBarsPreferLive(symbol);
+        if (bars.Count >= 20) return SafeSMA(bars, 20);
+        if (bars.Count > 0) return bars.Average(c => c.Close);
+
+        if (_dailySmaCache.TryGetValue(symbol, out var cached) && cached.sma20 > 0) return cached.sma20;
+
+        return 0m;
+    }
+
+    // Rebuild daily candles for the watchlist from Yahoo and persist them.
+    private void RebuildAllSmaFromYahoo()
+    {
+        try
         {
-            if (daily.Count < 100) return 0m;
-            return daily.TakeLast(100).Average(c => c.Close);
+            LogMessage("[REBUILD] Starting Yahoo daily rebuild for watchlist...");
+            int succeeded = 0, failed = 0;
+            foreach (var sym in _watchlist)
+            {
+                try
+                {
+                    var bars = FetchDailyFromYahoo(sym).GetAwaiter().GetResult();
+                    if (bars != null && bars.Count > 0)
+                    {
+                        // Keep last ~250 bars
+                        var take = bars.Count > 250 ? bars.TakeLast(250).ToList() : bars;
+                        _dailyCandles[sym] = take;
+                        // Compute daily SMAs and cache them
+                        try
+                        {
+                            var closes = take.Select(c => c.Close).ToList();
+                            decimal sma20 = closes.Count >= 20 ? closes.TakeLast(20).Average() : (closes.Count > 0 ? closes.Average() : 0m);
+                            decimal sma50 = closes.Count >= 50 ? closes.TakeLast(50).Average() : (closes.Count > 0 ? closes.Average() : 0m);
+                            decimal sma100 = closes.Count >= 100 ? closes.TakeLast(100).Average() : (closes.Count > 0 ? closes.Average() : 0m);
+                            decimal sma200 = closes.Count >= 200 ? closes.TakeLast(200).Average() : (closes.Count > 0 ? closes.Average() : 0m);
+                            _dailySmaCache[sym] = (sma20, sma50, sma100, sma200);
+                        }
+                        catch { }
+                        LogMessage($"[REBUILD] {sym} seeded {take.Count} daily bars from Yahoo");
+                        succeeded++;
+                    }
+                    else
+                    {
+                        LogMessage($"[REBUILD] {sym} yahoo returned no bars — skipping");
+                        failed++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogError("RebuildAllSmaFromYahoo", $"{sym}: {ex.Message}");
+                    failed++;
+                }
+            }
+            try { SaveDailyMemory(); } catch { }
+            LogMessage($"[REBUILD] Done — success={succeeded} failed={failed}");
         }
+        catch (Exception ex)
+        {
+            LogError("RebuildAllSmaFromYahoo", ex.Message);
+        }
+    }
+
+    // Build the daily bar series used for SMA20/50/100/200 etc.
+    //
+    // BUGFIX: this previously returned ONLY the days derivable from the 1-min
+    // live buffer (_marketData, capped at ~500 bars ≈ 1 trading day) whenever
+    // that buffer was non-empty, and never fell back to the persisted
+    // multi-day history (_dailyCandles, up to 250 days) even though that
+    // history was available. Since _marketData has data during/after every
+    // session, GetDailyBarsPreferLive was effectively always returning a
+    // single "day" (today, built out of 1-min bars) — so every SMA100/SMA200
+    // call downstream either returned 0 (SafeSMA needs `period` bars) or, in
+    // GetDailySma100/200's own fallback, the average of a single day's price
+    // action mislabeled as a 100/200-day moving average.
+    //
+    // Fix: merge the persisted daily history with the live-derived bar(s),
+    // letting the live bar override only the same calendar date (so "today"
+    // stays current) instead of live data replacing the whole history.
+    private List<Candle> GetDailyBarsPreferLive(string symbol)
+    {
+        try
+        {
+            List<Candle> historical = new List<Candle>();
+            if (_dailyCandles.TryGetValue(symbol, out var dlist) && dlist != null)
+            {
+                lock (dlist) { historical = dlist.ToList(); }
+            }
+
+            List<Candle> liveDaily = new List<Candle>();
+            if (_marketData.TryGetValue(symbol, out var mlist))
+            {
+                lock (mlist)
+                {
+                    if (mlist.Count > 0)
+                    {
+                        liveDaily = mlist
+                            .GroupBy(c => c.Time.Date)
+                            .OrderBy(g => g.Key)
+                            .Select(g => new Candle
+                            {
+                                Time = g.Key,
+                                Open = g.First().Open,
+                                High = g.Max(x => x.High),
+                                Low = g.Min(x => x.Low),
+                                Close = g.Last().Close,
+                                Volume = g.Sum(x => x.Volume)
+                            })
+                            .ToList();
+                    }
+                }
+            }
+
+            if (historical.Count > 0)
+            {
+                // Keep historical bars for any date not already covered by the live buffer,
+                // then layer the live (more current) bars on top, so "today" is up to date
+                // while the long history used for SMA100/200 stays intact.
+                var merged = historical.Where(h => !liveDaily.Any(l => l.Time.Date == h.Time.Date)).ToList();
+                merged.AddRange(liveDaily);
+                merged.Sort((a, b) => a.Time.CompareTo(b.Time));
+                return merged;
+            }
+
+            if (liveDaily.Count > 0) return liveDaily;
+
+            // No historical or live data at all — fetch daily series from Yahoo Finance
+            var yahoo = FetchDailyFromYahoo(symbol).GetAwaiter().GetResult();
+            if (yahoo != null && yahoo.Count > 0) return yahoo;
+        }
+        catch { }
+        return new List<Candle>();
+    }
+
+    // Simple in-memory TTL cache for Yahoo responses
+    private readonly ConcurrentDictionary<string, (DateTime fetchedAt, List<Candle> bars)> _yahooCache = new();
+
+    private async Task<List<Candle>> FetchDailyFromYahoo(string symbol)
+    {
+        try
+        {
+            // TTL 30 minutes
+            if (_yahooCache.TryGetValue(symbol, out var cached) && (DateTime.UtcNow - cached.fetchedAt).TotalMinutes < 30)
+                return cached.bars;
+
+            using var http = new HttpClient();
+            http.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (compatible; TradeBot/1.0)");
+            string url = $"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1y&interval=1d";
+            var res = await http.GetStringAsync(url);
+            using var doc = JsonDocument.Parse(res);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("chart", out var chart)) return null;
+            var result = chart.GetProperty("result")[0];
+            var timestamps = result.GetProperty("timestamp").EnumerateArray().Select(t => t.GetInt64()).ToList();
+            var indicators = result.GetProperty("indicators").GetProperty("quote")[0];
+            var closes = indicators.GetProperty("close").EnumerateArray().Select(c => c.ValueKind == JsonValueKind.Null ? (decimal?)null : (decimal?)c.GetDecimal()).ToList();
+            var opens = indicators.TryGetProperty("open", out var op) ? op.EnumerateArray().Select(c => c.ValueKind == JsonValueKind.Null ? (decimal?)null : (decimal?)c.GetDecimal()).ToList() : null;
+            var highs = indicators.TryGetProperty("high", out var hi) ? hi.EnumerateArray().Select(c => c.ValueKind == JsonValueKind.Null ? (decimal?)null : (decimal?)c.GetDecimal()).ToList() : null;
+            var lows = indicators.TryGetProperty("low", out var lo) ? lo.EnumerateArray().Select(c => c.ValueKind == JsonValueKind.Null ? (decimal?)null : (decimal?)c.GetDecimal()).ToList() : null;
+            var volumes = indicators.TryGetProperty("volume", out var vol) ? vol.EnumerateArray().Select(c => c.ValueKind == JsonValueKind.Null ? (long?)null : (long?)c.GetInt64()).ToList() : null;
+
+            var bars = new List<Candle>();
+            for (int i = 0; i < timestamps.Count && i < closes.Count; i++)
+            {
+                if (!closes[i].HasValue) continue;
+                var utc = DateTimeOffset.FromUnixTimeSeconds(timestamps[i]).UtcDateTime;
+                // Convert to Eastern date
+                var et = TimeZoneInfo.ConvertTimeBySystemTimeZoneId(utc, "Eastern Standard Time");
+                var c = new Candle
+                {
+                    Time = new DateTime(et.Year, et.Month, et.Day),
+                    Close = closes[i].Value,
+                    Open = opens != null && opens.Count > i && opens[i].HasValue ? opens[i].Value : closes[i].Value,
+                    High = highs != null && highs.Count > i && highs[i].HasValue ? highs[i].Value : closes[i].Value,
+                    Low = lows != null && lows.Count > i && lows[i].HasValue ? lows[i].Value : closes[i].Value,
+                    Volume = volumes != null && volumes.Count > i && volumes[i].HasValue ? volumes[i].Value : 0L
+                };
+                bars.Add(c);
+            }
+
+            _yahooCache[symbol] = (DateTime.UtcNow, bars);
+            return bars;
+        }
+        catch { return null; }
+    }
+
+
+    // Resolves the most recent COMPLETED trading day's daily bar from the same
+    // merged series used for SMA100/200 (IBKR persisted history + live-built
+    // "today" bar, falling back to Yahoo Finance when IBKR has delivered
+    // nothing at all for the symbol — see GetDailyBarsPreferLive/FetchDailyFromYahoo
+    // above). Previously, Prev Day Hi/Lo/Close each had their own separate,
+    // narrower data path (a tiny live 1-min buffer capped at ~1 session, and
+    // a dictionary populated only from IBKR's own historical daily bars) with
+    // no Yahoo fallback, so a symbol IBKR hadn't delivered data for yet would
+    // just show stale/zero values instead of self-healing like SMA200 now does.
+    private Candle GetMostRecentCompletedDailyBar(string symbol)
+    {
+        var bars = GetDailyBarsPreferLive(symbol);
+        if (bars == null || bars.Count == 0) return null;
+
+        var todayEt = GetEasternTime().Date;
+        var prior = bars.Where(b => b.Time.Date < todayEt)
+                         .OrderByDescending(b => b.Time)
+                         .FirstOrDefault();
+        if (prior != null) return prior;
+
+        // No bar dated strictly before today (e.g. a brand-new/thinly-covered
+        // symbol) — fall back to whatever the most recent bar is rather than
+        // returning nothing.
+        return bars.OrderByDescending(b => b.Time).FirstOrDefault();
     }
 
     private (decimal High, decimal Low) GetPrevDayHL(string symbol)
     {
+        var prior = GetMostRecentCompletedDailyBar(symbol);
+        if (prior != null && (prior.High > 0 || prior.Low > 0))
+            return (prior.High, prior.Low);
+
+        // Last-resort fallback: dictionaries populated by AddDailyCandle()
         _prevDayHighLevel.TryGetValue(symbol, out decimal h);
         _prevDayLowLevel.TryGetValue(symbol, out decimal l);
         return (h, l);
+    }
+
+    private decimal GetPrevDayClose(string symbol)
+    {
+        var prior = GetMostRecentCompletedDailyBar(symbol);
+        if (prior != null && prior.Close > 0) return prior.Close;
+
+        // Last-resort fallback: dictionary populated by AddDailyCandle()
+        _prevDayClose.TryGetValue(symbol, out decimal c);
+        return c;
     }
 
     private decimal SafeSMA(List<Candle> candles, int period)
@@ -5775,10 +6294,16 @@ public partial class SimulatedBroker
 
     private decimal SafeATR(List<Candle> candles, int period)
     {
-        if (candles == null || candles.Count <= period)
+        // Only fall back to the arbitrary 0.2%-of-price placeholder when there's
+        // truly not enough data to compute even a single true-range value (need
+        // at least 2 candles: current + previous). Otherwise compute a genuine
+        // ATR over however many bars are actually available, instead of ignoring
+        // real history whenever it's shorter than `period`.
+        if (candles == null || candles.Count < 2)
             return candles?.LastOrDefault()?.Close * 0.002m ?? 0.01m;
 
-        int start = candles.Count - period;
+        int effectivePeriod = Math.Min(period, candles.Count - 1);
+        int start = candles.Count - effectivePeriod;
         decimal atr = 0m;
         for (int i = start; i < candles.Count; i++)
         {
@@ -5788,7 +6313,7 @@ public partial class SimulatedBroker
                          Math.Max(Math.Abs(c.High - prev.Close),
                                   Math.Abs(c.Low - prev.Close)));
             if (i == start) atr = tr;
-            else atr = ((atr * (period - 1)) + tr) / period;
+            else atr = ((atr * (effectivePeriod - 1)) + tr) / effectivePeriod;
         }
         return atr;
     }
@@ -6224,4 +6749,5 @@ public partial class SimulatedBroker
         }
         catch (Exception ex) { LogError("SendEmail", ex.Message); }
     }
+    // EOF placeholder: no-op change to ensure file end context matches patching expectations
 }

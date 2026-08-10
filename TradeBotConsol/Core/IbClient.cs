@@ -46,9 +46,9 @@ public class IbClient : EWrapper, IBroker
     private readonly ConcurrentDictionary<string, decimal> _latestAsk = new();
 
     // ── Signal reversal ───────────────────────────────────────────────────────
-    // When true (default): BUY signal → SELL order, SELL signal → BUY order.
-    // Set to false to disable reversal and trade in the signal direction.
-    public bool ReverseSignals { get; set; } = true;
+    // When true: BUY signal → SELL order, SELL signal → BUY order.
+    // Default false to avoid unexpected reversal; SimulatedBroker manages entry direction.
+    public bool ReverseSignals { get; set; } = false;
 
     public IbClient(SimulatedBroker broker)
     {
@@ -84,8 +84,8 @@ public class IbClient : EWrapper, IBroker
             return;
         }
 
-        // REVERSAL: flip the signal direction before building the order
-        TradeSide effectiveSide = side;// ApplyReversal(side);
+        // REVERSAL: flip the signal direction before building the order (controlled by ReverseSignals)
+        TradeSide effectiveSide = ApplyReversal(side);
 
         // Round to valid IBKR tick size before submission
         price = price >= 1.0m
@@ -388,6 +388,26 @@ public class IbClient : EWrapper, IBroker
     // daily totals rather than per-trade sizes, corrupting CheckVolumeExpansion.
     public void tickSize(int tickerId, int field, int size)
     {
+        if (field == 8)
+        {
+            // Field 8 = VOLUME: IBKR's own running cumulative volume for the
+            // symbol today, resent on every update. Unlike _tickVolume below
+            // (deliberately built from per-trade LAST_SIZE ticks for
+            // CheckVolumeExpansion's windowed comparison — see FIX #4 above),
+            // this is the right source for "how much has traded today,
+            // period" — the dashboard's Volume figure and GAP_GO's relative-
+            // volume gate. It self-syncs on every tick regardless of when
+            // this bot process connected, so a mid-session restart doesn't
+            // reset it to zero the way a locally tick-summed total does.
+            // NOTE: verify units against TWS's own displayed daily volume for
+            // a symbol after deploying — some IBKR API versions historically
+            // reported this field in round lots (100s) rather than raw
+            // shares; if the dashboard number reads ~100x low, multiply by
+            // 100 here.
+            if (_reqIdToSymbol.TryGetValue(tickerId, out string volSymbol))
+                _broker.OnAuthoritativeDailyVolume(volSymbol, size);
+            return;
+        }
         if (field != 5) return;   // FIX #4: was 8 (VOLUME); correct field is 5 (LAST_SIZE)
         if (!_reqIdToSymbol.TryGetValue(tickerId, out string symbol)) return;
         _tickVolume.AddOrUpdate(symbol, size, (_, old) => old + size);
