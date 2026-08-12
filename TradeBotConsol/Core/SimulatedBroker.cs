@@ -421,6 +421,8 @@ public partial class SimulatedBroker
     private int MAX_TRADES_PER_HOUR = 3;
     private DateTime _currentTradeHour = DateTime.MinValue;
     private bool _haltTrading = false;
+    private DateTime _lastHaltGateLogUtc = DateTime.MinValue;
+    private DateTime _lastReconGateLogUtc = DateTime.MinValue;
     private bool _manualResumeOverride = false;
     private bool _eodSent = false;
     private DateTime _lastVolumeResetEt = DateTime.MinValue;
@@ -887,7 +889,18 @@ public partial class SimulatedBroker
             decimal price = candles.Last().Close;
             if (price <= 0m) return "No px";
 
-            if (candles.TakeLast(300).Sum(c => c.Volume) < 300_000) return "Low vol";
+            // Was: candles.TakeLast(300).Sum(c => c.Volume) < 300_000
+            // That summed each individual 1-min candle's own Volume field,
+            // which is built from live trade-print ticks (see UpdateLiveTick)
+            // — a much sparser signal than IBKR's own cumulative daily volume
+            // (field 8, now captured via OnAuthoritativeDailyVolume/
+            // GetTodayVolume). It was returning "Low vol" for essentially
+            // every symbol regardless of actual volume, including SPY/QQQ/
+            // NVDA well into the session — silently blocking every real
+            // trade in the WHY explainer even though the dashboard's own
+            // Volume column (already fixed) showed normal numbers for the
+            // same symbols. Use the same reliable source here for consistency.
+            if (GetTodayVolume(symbol) < 300_000) return "Low vol";
 
             if (_latestBid.TryGetValue(symbol, out decimal bid) &&
                 _latestAsk.TryGetValue(symbol, out decimal ask) &&
@@ -1012,9 +1025,34 @@ public partial class SimulatedBroker
     {
         minutesSinceOpen = -1;
         ExpireStalePendingEntries();
-        if (_haltTrading) return false;
+        if (_haltTrading)
+        {
+            // Previously silent — a stuck _haltTrading blocked every entry
+            // with zero indication why. Throttled to once per 5 min per
+            // process (not per-symbol/per-tick) so it doesn't flood the
+            // console across a 50+ symbol watchlist.
+            if ((DateTime.UtcNow - _lastHaltGateLogUtc).TotalMinutes >= 5)
+            {
+                LogMessage("[GATE] _haltTrading=true — ALL entries blocked (daily loss/profit limit or consecutive-loss halt). " +
+                           "Clears automatically at next daily reset, or check DAILY_PROFIT_GOAL/MAX_DAILY_LOSS/MAX_CONSECUTIVE_LOSSES.");
+                _lastHaltGateLogUtc = DateTime.UtcNow;
+            }
+            return false;
+        }
         if (!_watchlist.Contains(symbol, StringComparer.OrdinalIgnoreCase)) return false;
-        if (!_reconciled) return false;
+        if (!_reconciled)
+        {
+            // Previously silent — a stuck _reconciled=false (e.g. IBKR's
+            // positionEnd() never firing after a watchdog reconnect) blocked
+            // every entry with zero indication why. Same 5-min throttle.
+            if ((DateTime.UtcNow - _lastReconGateLogUtc).TotalMinutes >= 5)
+            {
+                LogMessage("[GATE] _reconciled=false — ALL entries blocked pending IBKR position reconciliation. " +
+                           "If this repeats for more than ~1 min after startup/reconnect, reconciliation is stuck.");
+                _lastReconGateLogUtc = DateTime.UtcNow;
+            }
+            return false;
+        }
 
         // ── RISK MGMT: Unrealized drawdown circuit breaker ──
         // Block new entries when realized+unrealized equity is deeply negative.
@@ -3886,6 +3924,26 @@ public partial class SimulatedBroker
         LogMessage("[WATCHDOG] Re-reconciliation armed — requesting fresh position snapshot.");
         if (RealBroker?.IsReady == true)
             RealBroker.RequestPositions();
+
+        // Safety net: Program.cs only guarded the STARTUP reconciliation with
+        // a 30s ForceReconcile timeout. This path — triggered by the
+        // connection watchdog after every reconnect — had no equivalent.
+        // If IBKR's positionEnd() callback never fires after this
+        // RequestPositions() call (missed/stale reqId, TWS still catching
+        // up post-reconnect, etc.), _reconciled stays false for the rest of
+        // the session and PassesEntryGates() silently blocks every entry —
+        // no error, no log, the bot just never trades again until the
+        // process is fully restarted. Mirror the startup timeout here so a
+        // stuck reconnect-reconciliation can't strand trading indefinitely.
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(30_000);
+            if (!_reconciled)
+            {
+                LogMessage("[WATCHDOG] Re-reconciliation timed out after 30s — forcing reconcile so trading can resume.");
+                ForceReconcile();
+            }
+        });
     }
 
     public bool IsReconciled => _reconciled;
