@@ -19,6 +19,8 @@ class Program
         broker.LoadAllTrades();
         broker.LoadState();
         broker.LoadEquityCurve();   // restores intraday equity chart after restart
+        client.MaxMarketDataLines = broker.ConfiguredSubscriptionSlots;
+        Console.WriteLine($"[STARTUP] Live data cap synced to {client.MaxMarketDataLines} symbol slots.");
 
         try
         {
