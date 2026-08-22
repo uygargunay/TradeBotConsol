@@ -16,16 +16,19 @@ public class IbClient : EWrapper, IBroker
     // ── ReqId ranges (non-overlapping) ────────────────────────────────────────
     // 10000–19999 : live market data subscriptions  (reqMktData)
     // 20000–29999 : 1-min historical data requests  (reqHistoricalData, 1 min)
-    // 30000+      : daily historical data requests  (reqHistoricalData, 1 day)
+    // 30000–39999 : daily historical data requests  (reqHistoricalData, 1 day)
+    // 40000–49999 : 1-hour NW historical requests  (reqHistoricalData, 1 hour)
     // Using separate counters and ranges prevents reqId collisions between paths.
     private int _liveReqId = 10000;
     private int _histReqId = 20000;   // FIX #1: was sharing _liveReqId → collision risk
     private int _dailyReqId = 30000;
+    private int _hourlyReqId = 40000;  // dedicated 1-hour history for Nadaraya-Watson
 
     private readonly ConcurrentDictionary<int, string> _reqIdToSymbol = new();
     private readonly ConcurrentDictionary<string, int> _symToLiveReqId = new();
     private readonly ConcurrentDictionary<int, string> _histReqIdToSymbol = new();   // FIX #1
     private readonly ConcurrentDictionary<int, string> _dailyReqIdToSymbol = new();
+    private readonly ConcurrentDictionary<int, string> _hourlyReqIdToSymbol = new();
     private readonly HashSet<string> _subscribedLive = new(StringComparer.OrdinalIgnoreCase);
 
     // Hard cap enforced inside Subscribe() — set this before calling Subscribe().
@@ -132,19 +135,18 @@ public class IbClient : EWrapper, IBroker
     {
         if (!_isReady) return;
 
-        // FIX #6: guard against zero/negative quantity
         if (qty <= 0)
         {
             Console.WriteLine($"[IBKR] SubmitBracketOrder rejected: qty={qty} for {symbol} (must be > 0)");
             return;
         }
 
-        // REVERSAL: flip the signal direction before building the bracket
         TradeSide effectiveSide = ApplyReversal(side);
         TradeSide exitSide = effectiveSide == TradeSide.Buy ? TradeSide.Sell : TradeSide.Buy;
 
         string entryAction = ActionString(effectiveSide);
         string exitAction = ActionString(exitSide);
+        bool hasProfitTarget = targetPrice > 0m;
 
         Contract contract = new Contract
         {
@@ -154,7 +156,7 @@ public class IbClient : EWrapper, IBroker
             Currency = "USD"
         };
 
-        // ── 1. Parent entry order (LMT, not transmitted yet) ──────────────────
+        // Parent entry. It is transmitted by the final child order below.
         int parentId = Interlocked.Increment(ref _currentOrderId);
         Order parent = new Order
         {
@@ -166,7 +168,9 @@ public class IbClient : EWrapper, IBroker
             Transmit = false
         };
 
-        // ── 2. Stop-Limit child ───────────────────────────────────────────────
+        // Protective stop. For a normal bracket it waits for the target order
+        // to transmit the whole chain. For NW 1H trades targetPrice=0, so the
+        // stop itself is the final child and transmits the parent+stop atomically.
         int stopId = Interlocked.Increment(ref _currentOrderId);
         string ocaGroup = $"OCA_{symbol}_{parentId}";
         Order stopOrder = new Order
@@ -177,47 +181,52 @@ public class IbClient : EWrapper, IBroker
             AuxPrice = (double)stopPrice,
             LmtPrice = (double)stopLimit,
             ParentId = parentId,
-            OcaGroup = ocaGroup,
-            OcaType = 1,
+            OcaGroup = hasProfitTarget ? ocaGroup : "",
+            OcaType = hasProfitTarget ? 1 : 0,
             Tif = "DAY",
-            Transmit = false
-        };
-
-        // ── 3. Target LMT child (transmit=true fires all three atomically) ────
-        int targetId = Interlocked.Increment(ref _currentOrderId);
-        Order targetOrder = new Order
-        {
-            Action = exitAction,
-            OrderType = "LMT",
-            TotalQuantity = qty,
-            LmtPrice = (double)targetPrice,
-            ParentId = parentId,
-            OcaGroup = ocaGroup,
-            OcaType = 1,
-            Tif = "DAY",
-            Transmit = true
+            Transmit = !hasProfitTarget
         };
 
         _broker.RegisterLiveOrder(parentId, symbol, effectiveSide, qty);
         _broker.RegisterLiveOrder(stopId, symbol, exitSide, qty);
-        _broker.RegisterLiveOrder(targetId, symbol, exitSide, qty);
-
         _bracketChildToSymbol[stopId] = symbol;
-        _bracketChildToSymbol[targetId] = symbol;
-        _bracketSiblings[stopId] = targetId;
-        _bracketSiblings[targetId] = stopId;
 
         _client.placeOrder(parentId, contract, parent);
         _client.placeOrder(stopId, contract, stopOrder);
-        _client.placeOrder(targetId, contract, targetOrder);
+
+        int targetId = 0;
+        if (hasProfitTarget)
+        {
+            targetId = Interlocked.Increment(ref _currentOrderId);
+            Order targetOrder = new Order
+            {
+                Action = exitAction,
+                OrderType = "LMT",
+                TotalQuantity = qty,
+                LmtPrice = (double)targetPrice,
+                ParentId = parentId,
+                OcaGroup = ocaGroup,
+                OcaType = 1,
+                Tif = "DAY",
+                Transmit = true
+            };
+
+            _broker.RegisterLiveOrder(targetId, symbol, exitSide, qty);
+            _bracketChildToSymbol[targetId] = symbol;
+            _bracketSiblings[stopId] = targetId;
+            _bracketSiblings[targetId] = stopId;
+            _client.placeOrder(targetId, contract, targetOrder);
+        }
 
         _broker.RegisterBracketChildren(symbol, stopId, targetId);
 
+        string targetText = hasProfitTarget ? targetPrice.ToString("F2") : "DYNAMIC/NONE";
         Console.WriteLine($"[BRACKET] {symbol} x{qty} entry={entryAction}@{entryPrice:F2} " +
                           $"(signal={ActionString(side)} reversed={ReverseSignals}) " +
-                          $"stop={stopPrice:F2}/{stopLimit:F2} target={targetPrice:F2} " +
+                          $"stop={stopPrice:F2}/{stopLimit:F2} target={targetText} " +
                           $"parentId={parentId} stopId={stopId} targetId={targetId}");
     }
+
 
     // ── CONNECTION ────────────────────────────────────────────────────────────
     public void Connect(string host = "127.0.0.1", int port = 7497, int clientId = 1)
@@ -334,7 +343,10 @@ public class IbClient : EWrapper, IBroker
             Currency = "USD"
         };
 
-        _client.reqHistoricalData(id, contract, "", "3 D", "1 min", "TRADES", 0, 1, false, null);
+        // formatDate=2 returns epoch timestamps for intraday bars. We normalize them
+        // to America/New_York in historicalData(), matching the live candle clock.
+        // This also lets the bot rebuild today's ORB correctly after a midday/late restart.
+        _client.reqHistoricalData(id, contract, "", "3 D", "1 min", "TRADES", 0, 2, false, null);
     }
 
     // ── HISTORICAL DATA REQUEST (daily bars, 1 year) ──────────────────────────
@@ -352,6 +364,36 @@ public class IbClient : EWrapper, IBroker
         };
 
         _client.reqHistoricalData(id, contract, "", "1 Y", "1 day", "TRADES", 1, 1, false, null);
+    }
+
+    // ── HISTORICAL DATA REQUEST (1-hour bars, 1 year RTH) ──────────────────
+    // Dedicated feed for the Nadaraya-Watson 1-hour envelope. Keeping it
+    // separate from the 1-minute buffer prevents the NW calculation from
+    // silently collapsing to a 1-minute/15-minute indicator when the intraday
+    // buffer is trimmed.
+    public void RequestHourlyHistoricalData(string symbol)
+    {
+        int id = Interlocked.Increment(ref _hourlyReqId);
+        _hourlyReqIdToSymbol[id] = symbol;
+
+        Contract contract = new Contract
+        {
+            Symbol = symbol,
+            SecType = "STK",
+            Exchange = "SMART",
+            Currency = "USD"
+        };
+
+        // useRTH=1: the NW levels are based on regular-session 1-hour bars,
+        // not overnight/after-hours prints. formatDate=2 forces Unix timestamps
+        // for intraday bars so we can normalize them to US/Eastern explicitly;
+        // otherwise the API can return bars in the TWS/login timezone and the
+        // 09:30 ET hour buckets become wrong on machines outside Eastern time.
+        // Request a full year. The NW endpoint uses 500 completed 1-hour bars;
+        // 4 calendar months can fall below 500 RTH bars after holidays/half-days,
+        // which made every NW value display as blank. 1Y gives a safe margin;
+        // SimulatedBroker trims storage to the most recent bars it needs.
+        _client.reqHistoricalData(id, contract, "", "1 Y", "1 hour", "TRADES", 1, 2, false, null);
     }
 
     // ── TICK CALLBACKS ────────────────────────────────────────────────────────
@@ -460,16 +502,19 @@ public class IbClient : EWrapper, IBroker
 
     public void historicalData(int reqId, IBApi.Bar bar)
     {
-        // Route: daily (30000+) → AddDailyCandle
-        //        1-min (20000+) → AddHistoricalCandle
+        // Route: daily  (30000+) → AddDailyCandle
+        //        hourly (40000+) → AddHourlyCandle
+        //        1-min  (20000+) → AddHistoricalCandle
         bool isDaily = _dailyReqIdToSymbol.TryGetValue(reqId, out var dailySymbol);
+        string hourlySymbol = null;
+        bool isHourly = !isDaily && _hourlyReqIdToSymbol.TryGetValue(reqId, out hourlySymbol);
         string histSymbol = null;                                                               // FIX #1
-        bool is1Min = !isDaily && _histReqIdToSymbol.TryGetValue(reqId, out histSymbol);
+        bool is1Min = !isDaily && !isHourly && _histReqIdToSymbol.TryGetValue(reqId, out histSymbol);
 
-        if (!isDaily && !is1Min) return;
+        if (!isDaily && !isHourly && !is1Min) return;
 
         // FIX #5: guard against null/empty symbol before proceeding
-        string symbol = isDaily ? dailySymbol : histSymbol;
+        string symbol = isDaily ? dailySymbol : isHourly ? hourlySymbol : histSymbol;
         if (string.IsNullOrEmpty(symbol))
         {
             Console.WriteLine($"[WARN] historicalData: null/empty symbol for reqId={reqId} — skipping.");
@@ -477,7 +522,16 @@ public class IbClient : EWrapper, IBroker
         }
 
         DateTime time;
-        if (!DateTime.TryParse(bar.Time, out time))
+        if ((isHourly || is1Min) && long.TryParse(bar.Time.Trim(), out long unixSeconds))
+        {
+            // Intraday requests use formatDate=2. Convert epoch UTC -> Eastern
+            // before handing it to SimulatedBroker, whose RTH buckets are
+            // explicitly anchored to 09:30 America/New_York.
+            DateTime utc = DateTimeOffset.FromUnixTimeSeconds(unixSeconds).UtcDateTime;
+            var eastern = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+            time = TimeZoneInfo.ConvertTimeFromUtc(utc, eastern);
+        }
+        else if (!DateTime.TryParse(bar.Time, out time))
         {
             if (DateTime.TryParseExact(bar.Time.Trim(), "yyyyMMdd  HH:mm:ss",
                 System.Globalization.CultureInfo.InvariantCulture,
@@ -500,6 +554,12 @@ public class IbClient : EWrapper, IBroker
                 (decimal)bar.Open, (decimal)bar.High,
                 (decimal)bar.Low, (decimal)bar.Close, bar.Volume);
         }
+        else if (isHourly)
+        {
+            _broker.AddHourlyCandle(symbol, time,
+                (decimal)bar.Open, (decimal)bar.High,
+                (decimal)bar.Low, (decimal)bar.Close, bar.Volume);
+        }
         else
         {
             _broker.AddHistoricalCandle(symbol, time,
@@ -510,6 +570,15 @@ public class IbClient : EWrapper, IBroker
 
     public void historicalDataEnd(int reqId, string start, string end)
     {
+        // Hourly NW request complete — clean up, do NOT start live subscription.
+        if (_hourlyReqIdToSymbol.TryRemove(reqId, out string hourlySymbol))
+        {
+            int bars = _broker.GetNadarayaWatson1HourBarCount(hourlySymbol);
+            Console.WriteLine($"[IBKR] 1-hour history loaded for {hourlySymbol}: {bars} completed bars " +
+                              $"(need {_broker.NadarayaWatsonLookback} for NW).");
+            return;
+        }
+
         // Daily bar request complete — clean up, do NOT start live subscription.
         if (_dailyReqIdToSymbol.TryRemove(reqId, out string dailySymbol))
         {
@@ -520,7 +589,10 @@ public class IbClient : EWrapper, IBroker
         // FIX #1: 1-min completion now looks up _histReqIdToSymbol (not _reqIdToSymbol).
         if (!_histReqIdToSymbol.TryRemove(reqId, out string symbol)) return;
 
-        Console.WriteLine($"[IBKR] History loaded for {symbol} — starting live tick subscription.");
+        // Historical 1-minute bars are now complete. Seed intraday state that
+        // otherwise only exists if the process was running at 09:30 ET (especially ORB).
+        _broker.OnMinuteHistoryLoaded(symbol);
+        Console.WriteLine($"[IBKR] History loaded for {symbol} — intraday state seeded; starting live tick subscription.");
         Subscribe(symbol);
     }
 
@@ -557,7 +629,7 @@ public class IbClient : EWrapper, IBroker
 
         _symToLiveReqId.Clear();
         _reqIdToSymbol.Clear();
-        // Note: _histReqIdToSymbol and _dailyReqIdToSymbol are intentionally NOT cleared
+        // Note: _histReqIdToSymbol, _dailyReqIdToSymbol and _hourlyReqIdToSymbol are intentionally NOT cleared
         // here — in-flight historical responses that arrive after a brief drop-reconnect
         // can still be routed correctly if the reqId is still in the dictionary.
     }
