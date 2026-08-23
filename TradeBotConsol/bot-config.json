@@ -26,10 +26,11 @@
   "VWAP_CONFIRM_BARS": 1,
   "MAX_TRADES_PER_DAY": 8,
   "MAX_TRADES_PER_HOUR": 3,
-  "MIN_ATR_PCT": 0.0018,
+  "MIN_ATR_PCT": 0.0012,
+  "MIN_RR_RATIO": 1.1,
   "ALLOW_SHORTS": true,
   "INVERT_ENTRY_DIRECTION": false,
-  "MIDDAY_FILTER_ENABLED": true,
+  "MIDDAY_FILTER_ENABLED": false,
   "MAX_CONSECUTIVE_LOSSES": 3,
   "STRATEGY_ORB": true,
   "STRATEGY_GAP_GO": true,
@@ -42,7 +43,7 @@
   "STRATEGY_CANDLE_PATTERNS": true,
   "STRATEGY_MICRO_PULLBACK": true,
   "EARLY_PATTERN_ENTRY": true,
-  "PATTERN_MIN_SCORE": 68,
+  "PATTERN_MIN_SCORE": 65,
   "INTRABAR_SIGNAL_COOLDOWN_SECONDS": 20,
   "FAST_VOL_MULT": 1.2,
   "DATA_LINES_PER_SYMBOL": 1,
@@ -68,6 +69,10 @@
   "ALLOW_SCALP_BREAKOUT_LONGS": true,
   "ALLOW_SCALP_BREAKOUT_SHORTS": true,
   "ALLOW_SCALP_ORB_LONGS": true,
+  "STRATEGY_NADARAYA_WATSON": true,
+  "NW_LOOKBACK": 250,
+  "NW_BANDWIDTH": 6.0,
+  "NW_MULT": 2.5,
   "earnings_blacklist": [],
   "watchlist": [
     "SPY",
@@ -123,7 +128,9 @@
     "BLK",
     "V"
   ],
-  "notes": "Profile: looser-entry; SMA100 enabled; shorting allowed; INVERT_ENTRY_DIRECTION disabled.",
+  "notes": "Profile: OR strategy routing; moderately looser entry filters; SMA100 enabled; shorting allowed; INVERT_ENTRY_DIRECTION disabled.",
   "USE_SMA100": true,
-  "MinGrossTargetToCommissionMult": 3.0
+  "MinGrossTargetToCommissionMult": 3.0,
+  "NW_STOP_LOSS_PCT": 0.03,
+  "NW_TIMEFRAME_MINUTES": 30
 }
