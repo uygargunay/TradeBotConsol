@@ -12,6 +12,12 @@ class Program
         var client = new IbClient(broker);
         broker.RealBroker = client;
 
+        // Load bot-config.json explicitly before any history/watchlist work.
+        // Previously config was only loaded as a side-effect of LoadState() when
+        // bot_state.json existed; a fresh install/missing state could silently run
+        // class defaults instead of the user's NW/watchlist settings.
+        broker.LoadConfig();
+
         // Load state BEFORE connecting — sets _needsReconciliation = true so
         // nextValidId() fires reqPositions() the moment the socket is live.
         broker.LoadMarketMemory();
