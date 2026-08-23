@@ -37,7 +37,7 @@ public interface IBroker
     bool IsReady { get; }
     void RequestPositions();
     void RequestDailyHistoricalData(string symbol);
-    void RequestHourlyHistoricalData(string symbol);
+    void RequestHourlyHistoricalData(string symbol, int timeframeMinutes);
     bool SupportsBrackets { get; }
     void SubmitBracketOrder(string symbol, int qty, decimal entryPrice, TradeSide side,
                             decimal stopPrice, decimal stopLimit, decimal targetPrice);
@@ -277,7 +277,8 @@ public partial class SimulatedBroker
     private bool STRATEGY_CANDLE_PATTERNS_ENABLED = true;
     private bool STRATEGY_MICRO_PULLBACK_ENABLED = true;
     private bool STRATEGY_NADARAYA_WATSON_ENABLED = true;
-    private int NW_LOOKBACK = 500;         // standard NWE window: 500 completed regular-session 1-hour bars
+    private int NW_TIMEFRAME_MINUTES = 60;  // NW bar size: 15, 30, or 60 minutes
+    private int NW_LOOKBACK = 500;         // standard NWE window: 500 completed regular-session bars (at NW_TIMEFRAME_MINUTES size)
     private decimal NW_BANDWIDTH = 8m;     // Gaussian kernel bandwidth — larger = smoother centerline
     private decimal NW_MULT = 3.0m;        // band width = kernel MAE * this multiplier
     private decimal NW_STOP_LOSS_PCT = 0.03m;  // flat % stop-loss for NW_BAND_ trades (not ATR-based)
@@ -1543,14 +1544,31 @@ public partial class SimulatedBroker
     //  the current 1-minute price was also moving the band it was trying to touch.
     // ══════════════════════════════════════════════════════════
 
+    // NOTE: name says "Hour" but this now buckets by NW_TIMEFRAME_MINUTES
+    // (15, 30, or 60) — kept the original name to avoid touching every
+    // caller across two files; the 60-minute default keeps existing
+    // behavior unchanged unless NW_TIMEFRAME_MINUTES is set otherwise.
     private DateTime? GetRegularSessionHourBucket(DateTime time)
     {
         DateTime open = new DateTime(time.Year, time.Month, time.Day, 9, 30, 0);
         DateTime close = new DateTime(time.Year, time.Month, time.Day, 16, 0, 0);
         if (time < open || time >= close) return null;
 
+        int tf = (NW_TIMEFRAME_MINUTES == 15 || NW_TIMEFRAME_MINUTES == 30 || NW_TIMEFRAME_MINUTES == 60)
+            ? NW_TIMEFRAME_MINUTES : 60;
         int minutesFromOpen = (int)(time - open).TotalMinutes;
-        return open.AddMinutes((minutesFromOpen / 60) * 60);
+        return open.AddMinutes((minutesFromOpen / tf) * tf);
+    }
+
+    // Snaps any config value to the nearest of the three supported NW bar
+    // sizes. IBKR's historical-data duration limits are much shorter for
+    // sub-hour bars than for 1-hour bars (see IbClient.RequestHourlyHistoricalData),
+    // so only these three are supported rather than an arbitrary integer.
+    private int ValidateNwTimeframe(int minutes)
+    {
+        if (minutes <= 20) return 15;
+        if (minutes <= 45) return 30;
+        return 60;
     }
 
     private void UpdateHourlyFromMinute(string symbol, Candle minuteBar)
@@ -4571,6 +4589,7 @@ public partial class SimulatedBroker
     public int ConfiguredDataLinesPerSymbol => Math.Max(1, DATA_LINES_PER_SYMBOL);
     public int ConfiguredSubscriptionSlots => GetSubscriptionSlots();
     public int NadarayaWatsonLookback => NW_LOOKBACK;
+    public int NadarayaWatsonTimeframeMinutes => NW_TIMEFRAME_MINUTES;
 
     public int GetNadarayaWatson1HourBarCount(string symbol)
         => GetCompletedNwHourlyCandles(symbol).Count;
@@ -4607,11 +4626,11 @@ public partial class SimulatedBroker
 
         if (STRATEGY_NADARAYA_WATSON_ENABLED)
         {
-            LogMessage($"[HIST] Requesting dedicated 1-hour RTH bars for {toSubscribe.Count} symbols (NW 1H)...");
+            LogMessage($"[HIST] Requesting dedicated {NW_TIMEFRAME_MINUTES}-min RTH bars for {toSubscribe.Count} symbols (NW)...");
             foreach (var symbol in toSubscribe)
             {
-                LogMessage($"[HIST] Requesting 1-hour NW history: {symbol}...");
-                RealBroker.RequestHourlyHistoricalData(symbol);
+                LogMessage($"[HIST] Requesting {NW_TIMEFRAME_MINUTES}-min NW history: {symbol}...");
+                RealBroker.RequestHourlyHistoricalData(symbol, NW_TIMEFRAME_MINUTES);
                 await Task.Delay(750);
             }
         }
@@ -4694,7 +4713,7 @@ public partial class SimulatedBroker
             LogMessage($"[WATCHLIST] Subscribing target symbol: {sym}");
             RealBroker.RequestHistoricalData(sym);
             if (STRATEGY_NADARAYA_WATSON_ENABLED)
-                RealBroker.RequestHourlyHistoricalData(sym);
+                RealBroker.RequestHourlyHistoricalData(sym, NW_TIMEFRAME_MINUTES);
             _subscribedSymbols.Add(sym);
             await Task.Delay(1500);
         }
@@ -5098,6 +5117,7 @@ public partial class SimulatedBroker
             STRATEGY_CANDLE_PATTERNS_ENABLED = GetB("STRATEGY_CANDLE_PATTERNS", STRATEGY_CANDLE_PATTERNS_ENABLED);
             STRATEGY_MICRO_PULLBACK_ENABLED = GetB("STRATEGY_MICRO_PULLBACK", STRATEGY_MICRO_PULLBACK_ENABLED);
             STRATEGY_NADARAYA_WATSON_ENABLED = GetB("STRATEGY_NADARAYA_WATSON", STRATEGY_NADARAYA_WATSON_ENABLED);
+            NW_TIMEFRAME_MINUTES = ValidateNwTimeframe(GetI("NW_TIMEFRAME_MINUTES", NW_TIMEFRAME_MINUTES));
             NW_LOOKBACK = GetI("NW_LOOKBACK", NW_LOOKBACK);
             NW_BANDWIDTH = GetD("NW_BANDWIDTH", NW_BANDWIDTH);
             NW_MULT = GetD("NW_MULT", NW_MULT);
@@ -5281,6 +5301,7 @@ public partial class SimulatedBroker
             $"\"USE_SMA100\":{(/* USE_SMA100 present in config file; default true for backwards compat */ true ? "true" : "false")}",
             $"\"STRATEGY_MICRO_PULLBACK\":{(STRATEGY_MICRO_PULLBACK_ENABLED ? "true" : "false")}",
             $"\"STRATEGY_NADARAYA_WATSON\":{(STRATEGY_NADARAYA_WATSON_ENABLED ? "true" : "false")}",
+            $"\"NW_TIMEFRAME_MINUTES\":{NW_TIMEFRAME_MINUTES}",
             $"\"NW_LOOKBACK\":{NW_LOOKBACK}",
             $"\"NW_BANDWIDTH\":{NW_BANDWIDTH:F2}",
             $"\"NW_MULT\":{NW_MULT:F2}",
@@ -5613,6 +5634,7 @@ public partial class SimulatedBroker
                         STRATEGY_CANDLE_PATTERNS_ENABLED = GetB("STRATEGY_CANDLE_PATTERNS", STRATEGY_CANDLE_PATTERNS_ENABLED);
                         STRATEGY_MICRO_PULLBACK_ENABLED = GetB("STRATEGY_MICRO_PULLBACK", STRATEGY_MICRO_PULLBACK_ENABLED);
                         STRATEGY_NADARAYA_WATSON_ENABLED = GetB("STRATEGY_NADARAYA_WATSON", STRATEGY_NADARAYA_WATSON_ENABLED);
+                        NW_TIMEFRAME_MINUTES = ValidateNwTimeframe(GetI("NW_TIMEFRAME_MINUTES", NW_TIMEFRAME_MINUTES));
                         NW_LOOKBACK = GetI("NW_LOOKBACK", NW_LOOKBACK);
                         NW_BANDWIDTH = GetD("NW_BANDWIDTH", NW_BANDWIDTH);
                         NW_MULT = GetD("NW_MULT", NW_MULT);
@@ -7321,4 +7343,4 @@ public partial class SimulatedBroker
         catch (Exception ex) { LogError("SendEmail", ex.Message); }
     }
     // EOF placeholder: no-op change to ensure file end context matches patching expectations
-    }
+}

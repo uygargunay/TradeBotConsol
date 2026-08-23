@@ -371,7 +371,7 @@ public class IbClient : EWrapper, IBroker
     // separate from the 1-minute buffer prevents the NW calculation from
     // silently collapsing to a 1-minute/15-minute indicator when the intraday
     // buffer is trimmed.
-    public void RequestHourlyHistoricalData(string symbol)
+    public void RequestHourlyHistoricalData(string symbol, int timeframeMinutes)
     {
         int id = Interlocked.Increment(ref _hourlyReqId);
         _hourlyReqIdToSymbol[id] = symbol;
@@ -384,16 +384,42 @@ public class IbClient : EWrapper, IBroker
             Currency = "USD"
         };
 
-        // useRTH=1: the NW levels are based on regular-session 1-hour bars,
-        // not overnight/after-hours prints. formatDate=2 forces Unix timestamps
+        // Bar size AND duration both depend on the configured NW timeframe.
+        // We've reliably pulled "1 Y" of 1-hour bars in practice, but IBKR's
+        // historical-data API generally caps sub-hour bar sizes to a much
+        // shorter duration per request (commonly documented around "1 M"
+        // for 15/30-min bars) before rejecting the request or throwing a
+        // pacing violation. If you see a historical-data error in the
+        // console right after switching to 15/30-min, shortening this
+        // duration further is the first thing to try.
+        string barSizeSetting;
+        string durationStr;
+        switch (timeframeMinutes)
+        {
+            case 15:
+                barSizeSetting = "15 mins";
+                durationStr = "1 M";
+                break;
+            case 30:
+                barSizeSetting = "30 mins";
+                durationStr = "1 M";
+                break;
+            default:
+                barSizeSetting = "1 hour";
+                durationStr = "1 Y";
+                break;
+        }
+
+        // useRTH=1: the NW levels are based on regular-session bars, not
+        // overnight/after-hours prints. formatDate=2 forces Unix timestamps
         // for intraday bars so we can normalize them to US/Eastern explicitly;
         // otherwise the API can return bars in the TWS/login timezone and the
-        // 09:30 ET hour buckets become wrong on machines outside Eastern time.
-        // Request a full year. The NW endpoint uses 500 completed 1-hour bars;
-        // 4 calendar months can fall below 500 RTH bars after holidays/half-days,
-        // which made every NW value display as blank. 1Y gives a safe margin;
-        // SimulatedBroker trims storage to the most recent bars it needs.
-        _client.reqHistoricalData(id, contract, "", "1 Y", "1 hour", "TRADES", 1, 2, false, null);
+        // 09:30 ET bucket boundaries become wrong on machines outside Eastern time.
+        // NOTE: with 15/30-min bars and a 1-month duration, NW_LOOKBACK values
+        // much above ~500 (15m) or ~270 (30m) may not have enough bars available
+        // — SimulatedBroker's GetNadarayaWatson1HourEnvelope() simply returns
+        // blank/zero until enough bars accumulate rather than erroring.
+        _client.reqHistoricalData(id, contract, "", durationStr, barSizeSetting, "TRADES", 1, 2, false, null);
     }
 
     // ── TICK CALLBACKS ────────────────────────────────────────────────────────
@@ -570,11 +596,12 @@ public class IbClient : EWrapper, IBroker
 
     public void historicalDataEnd(int reqId, string start, string end)
     {
-        // Hourly NW request complete — clean up, do NOT start live subscription.
+        // NW historical request complete — clean up, do NOT start live subscription.
         if (_hourlyReqIdToSymbol.TryRemove(reqId, out string hourlySymbol))
         {
             int bars = _broker.GetNadarayaWatson1HourBarCount(hourlySymbol);
-            Console.WriteLine($"[IBKR] 1-hour history loaded for {hourlySymbol}: {bars} completed bars " +
+            int tf = _broker.NadarayaWatsonTimeframeMinutes;
+            Console.WriteLine($"[IBKR] {tf}-min NW history loaded for {hourlySymbol}: {bars} completed bars " +
                               $"(need {_broker.NadarayaWatsonLookback} for NW).");
             return;
         }

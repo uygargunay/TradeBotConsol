@@ -130,5 +130,6 @@
   "notes": "Profile: looser-entry; SMA100 enabled; shorting allowed; INVERT_ENTRY_DIRECTION disabled.",
   "USE_SMA100": true,
   "MinGrossTargetToCommissionMult": 3.0,
-  "NW_STOP_LOSS_PCT": 0.03
+  "NW_STOP_LOSS_PCT": 0.03,
+  "NW_TIMEFRAME_MINUTES" :  30
 }
