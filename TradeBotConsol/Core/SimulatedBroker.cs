@@ -5358,6 +5358,7 @@ public partial class SimulatedBroker
         {
             _httpListener = new HttpListener();
             _httpListener.Prefixes.Add("http://*:8883/");
+            _httpListener.Prefixes.Add("http://*:8884/");
             _httpListener.Start();
             Task.Run(() => HandleDashboardRequests());
         }
