@@ -171,9 +171,15 @@ public partial class SimulatedBroker
     private decimal GAP_GO_REL_VOL = 1.30m;
     private int VWAP_CONFIRM_BARS = 1;          // looser: one confirmed bar through VWAP
     private int MAX_TRADES_PER_DAY = 8;         // modestly higher capacity after loosening entries
-    private decimal MIN_ATR_PCT = 0.0018m;
+    private decimal MIN_ATR_PCT = 0.0012m;
     private decimal MAX_ATR_PCT = 0.020m;
     private decimal MIN_RR_RATIO = 1.10m;       // looser RR floor; scalp economics filter still applies
+
+    // Liquidity is measured in dollars and paced through the session. The old
+    // hard 300,000-share requirement treated a $10 stock and a $500 stock the
+    // same and effectively blocked almost every early-session entry.
+    private const decimal MIN_SESSION_DOLLAR_VOLUME_TARGET = 20_000_000m;
+    private const decimal MIN_SESSION_DOLLAR_VOLUME_FLOOR = 500_000m;
 
     private decimal VIX_REDUCE_THRESHOLD = 25m;
     private decimal VIX_NO_LONG_THRESHOLD = 35m;
@@ -283,8 +289,8 @@ public partial class SimulatedBroker
     private decimal NW_MULT = 3.0m;        // band width = kernel MAE * this multiplier
     private decimal NW_STOP_LOSS_PCT = 0.03m;  // flat % stop-loss for NW_BAND_ trades (not ATR-based)
     private bool EARLY_PATTERN_ENTRY_ENABLED = true;
-    private int PATTERN_MIN_SCORE = 68;
-    private int INTRABAR_SIGNAL_COOLDOWN_SECONDS = 30;
+    private int PATTERN_MIN_SCORE = 65;
+    private int INTRABAR_SIGNAL_COOLDOWN_SECONDS = 20;
     private decimal FAST_VOL_MULT = 1.20m;
     private int DATA_LINES_PER_SYMBOL = 1;
     private int MAX_MARKET_DATA_LINES = 120;
@@ -385,7 +391,7 @@ public partial class SimulatedBroker
     private readonly ConcurrentDictionary<string, DateTime> _latestBidAskUpdateUtc = new();
     private readonly ConcurrentDictionary<string, DateTime> _latestTradeUpdateUtc = new();
 
-    private bool MIDDAY_FILTER_ENABLED = true;
+    private bool MIDDAY_FILTER_ENABLED = false;
 
     private readonly ConcurrentDictionary<string, (decimal SumPV, long SumVol)> _vwapAccum = new();
     private readonly ConcurrentDictionary<string, decimal> _vwap = new();
@@ -890,6 +896,37 @@ public partial class SimulatedBroker
         return _dailyVolume.GetValueOrDefault(symbol);
     }
 
+    private bool HasSufficientSessionLiquidity(string symbol, List<Candle> candles,
+                                                DateTime nowEt,
+                                                out decimal actualDollarVolume,
+                                                out decimal requiredDollarVolume)
+    {
+        actualDollarVolume = 0m;
+        requiredDollarVolume = MIN_SESSION_DOLLAR_VOLUME_FLOOR;
+        if (candles == null || candles.Count == 0) return false;
+
+        decimal price = candles.Last().Close;
+        if (price <= 0m) return false;
+
+        // Prefer IBKR's cumulative session volume, but keep the completed-bar
+        // total as a fallback after reconnects or before the first volume tick.
+        long completedBarVolume = candles
+            .Where(c => c.Time.Date == nowEt.Date)
+            .Sum(c => Math.Max(0L, c.Volume));
+        long shares = Math.Max(GetTodayVolume(symbol), completedBarVolume);
+        actualDollarVolume = price * shares;
+
+        int minutesSinceOpen = Math.Clamp(
+            (nowEt.Hour - 9) * 60 + nowEt.Minute - 30,
+            1,
+            390);
+        requiredDollarVolume = Math.Max(
+            MIN_SESSION_DOLLAR_VOLUME_FLOOR,
+            MIN_SESSION_DOLLAR_VOLUME_TARGET * minutesSinceOpen / 390m);
+
+        return actualDollarVolume >= requiredDollarVolume;
+    }
+
     // ══════════════════════════════════════════════════════════
     //  MARKET REGIME CLASSIFIER
     // ══════════════════════════════════════════════════════════
@@ -950,14 +987,6 @@ public partial class SimulatedBroker
         return MIN_ENTRY_QTY;
     }
 
-    private int GetEffectiveMinSetupScore(string symbol, decimal price)
-    {
-        int effective = MIN_SETUP_SCORE;
-        if (price > 0m && price < 25m) effective += 6;
-        if (_lastTradeWasLoss.GetValueOrDefault(symbol)) effective += 3;
-        return Math.Min(85, effective);
-    }
-
     private string GetWatchlistReadiness(string symbol)
     {
         try
@@ -984,18 +1013,10 @@ public partial class SimulatedBroker
             decimal price = candles.Last().Close;
             if (price <= 0m) return "No px";
 
-            // Was: candles.TakeLast(300).Sum(c => c.Volume) < 300_000
-            // That summed each individual 1-min candle's own Volume field,
-            // which is built from live trade-print ticks (see UpdateLiveTick)
-            // — a much sparser signal than IBKR's own cumulative daily volume
-            // (field 8, now captured via OnAuthoritativeDailyVolume/
-            // GetTodayVolume). It was returning "Low vol" for essentially
-            // every symbol regardless of actual volume, including SPY/QQQ/
-            // NVDA well into the session — silently blocking every real
-            // trade in the WHY explainer even though the dashboard's own
-            // Volume column (already fixed) showed normal numbers for the
-            // same symbols. Use the same reliable source here for consistency.
-            if (GetTodayVolume(symbol) < 300_000) return "Low vol";
+            if (!HasSufficientSessionLiquidity(symbol, candles, nowEt,
+                                                out decimal dollarVolume,
+                                                out decimal requiredDollarVolume))
+                return $"Liq ${dollarVolume / 1_000_000m:F1}M/${requiredDollarVolume / 1_000_000m:F1}M";
 
             if (_latestBid.TryGetValue(symbol, out decimal bid) &&
                 _latestAsk.TryGetValue(symbol, out decimal ask) &&
@@ -1047,17 +1068,9 @@ public partial class SimulatedBroker
                 return "Swing scan";
             }
 
-            int setup = ScoreSetup(symbol, candles);
-            int needed = GetEffectiveMinSetupScore(symbol, price);
-            if (setup < needed) return $"Set {setup}/{needed}";
-
-            decimal atr = SafeATR(candles, 14);
-            decimal stopDist = GetStopDistanceForStrategy("SCALP_EMA_LONG", atr, price);
-            int qty = CalcQtyV2(price, stopDist, false);
-            int minQty = GetMinEntryQtyForPrice(price);
-            if (qty < minQty) return $"Qty {qty}<{minQty}";
-
-            return "Ready";
+            // In OR mode there is no universal setup score or generic quantity
+            // estimate. Each strategy owns its signal and sizing requirements.
+            return "Ready (OR)";
         }
         catch
         {
@@ -1180,7 +1193,7 @@ public partial class SimulatedBroker
             return false;
 
         if (!_marketData.TryGetValue(symbol, out var candles) || candles.Count < 50) return false;
-        if (candles.TakeLast(300).Sum(c => c.Volume) < 300_000) return false;
+        if (!HasSufficientSessionLiquidity(symbol, candles, nowEt, out _, out _)) return false;
 
         decimal lastPrice = candles.Last().Close;
 
@@ -1244,16 +1257,10 @@ public partial class SimulatedBroker
         if (SWING_MODE_ENABLED)
             return true;
 
-        // Setup-quality scoring is intentionally bypassed for NW touch mode.
-        // The signal is exactly the live price touching/crossing the completed
-        // 1H lower envelope; global safety/capital/liquidity gates above still apply.
-        if (!nwTouchMode)
-        {
-            int setupScore = ScoreSetup(symbol, candles);
-            int effectiveMinSetup = GetEffectiveMinSetupScore(symbol, lastPrice);
-            if (setupScore < effectiveMinSetup) return false;
-        }
-
+        // OR semantics: a strategy's own signal is sufficient. A universal
+        // ScoreSetup requirement here used to turn every strategy into
+        // "strategy signal AND generic setup score". Safety, liquidity,
+        // exposure, cooldown and risk gates above remain mandatory.
         return true;
     }
 
@@ -1371,8 +1378,7 @@ public partial class SimulatedBroker
         if (qty <= 0) return false;
 
         string tag = contraction ? "SWING_VCP_BREAKOUT_LONG" : "SWING_BASE_BREAKOUT_LONG";
-        OpenPosition(symbol, qty, close, TradeSide.Buy, false, tag);
-        return true;
+        return OpenPosition(symbol, qty, close, TradeSide.Buy, false, tag);
     }
 
     // ══════════════════════════════════════════════════════════
@@ -1389,23 +1395,6 @@ public partial class SimulatedBroker
         if (!_marketData.TryGetValue(symbol, out var candles) || candles.Count < 50)
             return;
 
-        // Quick-reject: skip symbols with no interesting indicator state
-        decimal lastPrice = candles.Last().Close;
-        if (_indicatorCache.TryGetValue(symbol, out var preInd))
-        {
-            bool orbActive = _orbRanges.TryGetValue(symbol, out var preOrb) && preOrb.IsSet
-                                && (lastPrice > preOrb.High || lastPrice < preOrb.Low);
-            bool rsiExtreme = preInd.Rsi14 < RSI_OVERSOLD || preInd.Rsi14 > RSI_OVERBOUGHT
-                            || preInd.Rsi14 > RSI_LONG_MIN || preInd.Rsi14 < RSI_SHORT_MAX;
-            _vwap.TryGetValue(symbol, out decimal preVwap);
-            bool nearVwap = preVwap > 0 && Math.Abs(lastPrice - preVwap) <= preInd.Atr14 * 1.5m;
-            decimal prevCloseCheck = GetPrevDayClose(symbol);
-            bool gapActive = prevCloseCheck > 0
-                                && Math.Abs((lastPrice - prevCloseCheck) / prevCloseCheck) >= GAP_GO_MIN_PCT;
-            if (!SWING_MODE_ENABLED && !orbActive && !rsiExtreme && !nearVwap && !gapActive && !preInd.VolExpansion)
-                return;
-        }
-
         lock (_lock)
         {
             var nowEt = GetEasternTime();
@@ -1420,10 +1409,10 @@ public partial class SimulatedBroker
             // Strong gaps often do their real move in the first 20-40 minutes.
             int gapGoEnd = _marketRegime == "TRENDING" ? 150 : 120;
 
-            // Each entry below is (family name, gate+action). The gate/timing rules
-            // for each strategy are unchanged from before — only the ORDER they are
-            // tried in now rotates daily (see rotation below), instead of always
-            // being tried in this fixed sequence.
+            // OR ROUTER: every enabled strategy is evaluated independently until
+            // one actually queues an order. Run() returns true only when
+            // OpenPosition accepts the entry; a rejected candidate must not stop
+            // later strategies from being tried.
             //
             // Why: with MAX_TRADES_PER_DAY=8 and MAX_TRADES_PER_STRATEGY=2, only 4
             // strategy "families" can ever trade on a given day. With a fixed order,
@@ -1466,7 +1455,11 @@ public partial class SimulatedBroker
             for (int i = 0; i < strategySlots.Length; i++)
             {
                 var slot = strategySlots[(rotation + i) % strategySlots.Length];
-                if (slot.Run()) return;
+                if (slot.Run())
+                {
+                    LogMessage($"[OR ROUTER] {symbol} accepted by {slot.Name}");
+                    return;
+                }
             }
         }
     }
@@ -1512,8 +1505,7 @@ public partial class SimulatedBroker
             decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
-            OpenPosition(symbol, qty, close, TradeSide.Buy, false, "BB_MEAN_REV_LONG");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Buy, false, "BB_MR_LONG");
         }
 
         bool touchUpper = close >= upperBand && rsi > 60.0 && sma50 > 0 && close < sma50
@@ -1523,8 +1515,7 @@ public partial class SimulatedBroker
             decimal stopDistance = Math.Max(atr * HARD_STOP_ATR_MULT, MIN_STOP_DISTANCE);
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
-            OpenPosition(symbol, qty, close, TradeSide.Sell, true, "BB_MEAN_REV_SHORT");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Sell, true, "BB_MR_SHORT");
         }
 
         return false;
@@ -1751,8 +1742,7 @@ public partial class SimulatedBroker
         if (qty <= 0) return false;
 
         LogMessage($"[NW 1H TOUCH] {symbol} price={price:F2} <= lower={lower:F2} | mid={mid:F2} upper={upper:F2} bars={hourlyBars}");
-        OpenPosition(symbol, qty, price, TradeSide.Buy, false, "NW_BAND_LONG");
-        return true;
+        return OpenPosition(symbol, qty, price, TradeSide.Buy, false, "NW_BAND_LONG");
     }
 
 
@@ -1813,8 +1803,7 @@ public partial class SimulatedBroker
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
 
-            OpenPosition(symbol, qty, close, TradeSide.Buy, false, "SCALP_BREAKOUT_LONG");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Buy, false, "SCALP_BREAKOUT_LONG");
         }
 
         if (ALLOW_SCALP_BREAKOUT_SHORTS
@@ -1829,8 +1818,7 @@ public partial class SimulatedBroker
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
 
-            OpenPosition(symbol, qty, close, TradeSide.Sell, true, "SCALP_BREAKOUT_SHORT");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Sell, true, "SCALP_BREAKOUT_SHORT");
         }
 
         return false;
@@ -1918,8 +1906,7 @@ public partial class SimulatedBroker
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
 
-            OpenPosition(symbol, qty, close, TradeSide.Buy, false, "SCALP_ORB_LONG");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Buy, false, "SCALP_ORB_LONG");
         }
 
     TryShortOrb:
@@ -1940,8 +1927,7 @@ public partial class SimulatedBroker
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
 
-            OpenPosition(symbol, qty, close, TradeSide.Sell, true, "SCALP_ORB_SHORT");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Sell, true, "SCALP_ORB_SHORT");
         }
 
         return false;
@@ -1992,8 +1978,7 @@ public partial class SimulatedBroker
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
 
-            OpenPosition(symbol, qty, close, TradeSide.Buy, false, "GAP_GO_LONG");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Buy, false, "GAP_GO_LONG");
         }
 
         if (gapPct < 0 && rsi < RSI_SHORT_MAX && _allowShorts)
@@ -2005,8 +1990,7 @@ public partial class SimulatedBroker
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
 
-            OpenPosition(symbol, qty, close, TradeSide.Sell, true, "GAP_GO_SHORT");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Sell, true, "GAP_GO_SHORT");
         }
 
         return false;
@@ -2052,8 +2036,7 @@ public partial class SimulatedBroker
             decimal stopDistance = GetStopDistanceForStrategy("SCALP_VWAP_LONG", atr, close);
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
-            OpenPosition(symbol, qty, close, TradeSide.Buy, false, "SCALP_VWAP_LONG");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Buy, false, "SCALP_VWAP_LONG");
         }
 
         bool vwapRejection = prevAbove && allRecentBelow;
@@ -2065,8 +2048,7 @@ public partial class SimulatedBroker
             decimal stopDistance = GetStopDistanceForStrategy("SCALP_VWAP_SHORT", atr, close);
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
-            OpenPosition(symbol, qty, close, TradeSide.Sell, true, "SCALP_VWAP_SHORT");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Sell, true, "SCALP_VWAP_SHORT");
         }
 
         return false;
@@ -2103,8 +2085,7 @@ public partial class SimulatedBroker
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
 
-            OpenPosition(symbol, qty, close, TradeSide.Buy, false, "MEAN_REV_LONG");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Buy, false, "MEAN_REV_LONG");
         }
 
         bool overboughtInDowntrend = close < sma50 && rsi > RSI_OVERBOUGHT
@@ -2115,8 +2096,7 @@ public partial class SimulatedBroker
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
 
-            OpenPosition(symbol, qty, close, TradeSide.Sell, true, "MEAN_REV_SHORT");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Sell, true, "MEAN_REV_SHORT");
         }
 
         return false;
@@ -2208,8 +2188,7 @@ public partial class SimulatedBroker
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
 
-            OpenPosition(symbol, qty, close, TradeSide.Buy, false, "MOMENTUM_LONG");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Buy, false, "MOMENTUM_LONG");
         }
 
         bool inShortRegime = _marketRegime == "SELL-OFF" || _marketRegime == "NORMAL" || _marketRegime == "CHOPPY";
@@ -2241,8 +2220,7 @@ public partial class SimulatedBroker
                 int qty = CalcQtyV2(close, stopDistance);
                 if (qty <= 0) return false;
 
-                OpenPosition(symbol, qty, close, TradeSide.Sell, true, "MOMENTUM_SHORT");
-                return true;
+                return OpenPosition(symbol, qty, close, TradeSide.Sell, true, "MOMENTUM_SHORT");
             }
         }
 
@@ -2300,8 +2278,7 @@ public partial class SimulatedBroker
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
 
-            OpenPosition(symbol, qty, close, TradeSide.Buy, false, "SCALP_EMA_LONG");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Buy, false, "SCALP_EMA_LONG");
         }
 
         bool bearishOrder = ema9 < ema21;
@@ -2316,8 +2293,7 @@ public partial class SimulatedBroker
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
 
-            OpenPosition(symbol, qty, close, TradeSide.Sell, true, "SCALP_EMA_SHORT");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Sell, true, "SCALP_EMA_SHORT");
         }
 
         return false;
@@ -2383,8 +2359,7 @@ public partial class SimulatedBroker
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
 
-            OpenPosition(symbol, qty, close, TradeSide.Buy, false, "OUTSIDE_CANDLE_LONG");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Buy, false, "OUTSIDE_CANDLE_LONG");
         }
 
         if (bearishClose && ema50_30min > 0 && (double)close < ema50_30min && rsi < 50 && _allowShorts)
@@ -2400,8 +2375,7 @@ public partial class SimulatedBroker
             int qty = CalcQtyV2(close, stopDistance);
             if (qty <= 0) return false;
 
-            OpenPosition(symbol, qty, close, TradeSide.Sell, true, "OUTSIDE_CANDLE_SHORT");
-            return true;
+            return OpenPosition(symbol, qty, close, TradeSide.Sell, true, "OUTSIDE_CANDLE_SHORT");
         }
 
         return false;
@@ -2432,7 +2406,7 @@ public partial class SimulatedBroker
 
     private void TryEarlyPatternEntry(string symbol, Candle current)
     {
-        if (!EARLY_PATTERN_ENTRY_ENABLED) return;
+        if (!STRATEGY_CANDLE_PATTERNS_ENABLED || !EARLY_PATTERN_ENTRY_ENABLED) return;
         if (current == null) return;
 
         var nowEt = GetEasternTime();
@@ -2516,9 +2490,12 @@ public partial class SimulatedBroker
             if (!rsiOk) return false;
 
             string tag = $"SCALP_PATTERN_{pattern.Tag}_LONG";
-            OpenPosition(symbol, qty, close, TradeSide.Buy, false, tag);
-            LogMessage($"[PATTERN] {(intrabar ? "EARLY" : "CLOSE")} {symbol} bullish {pattern.Tag} score={pattern.Score} rsi={rsi:F0} vol={volOk}");
-            return true;
+            if (OpenPosition(symbol, qty, close, TradeSide.Buy, false, tag))
+            {
+                LogMessage($"[PATTERN] {(intrabar ? "EARLY" : "CLOSE")} {symbol} bullish {pattern.Tag} score={pattern.Score} rsi={rsi:F0} vol={volOk}");
+                return true;
+            }
+            return false;
         }
 
         if (!_allowShorts) return false;
@@ -2529,9 +2506,12 @@ public partial class SimulatedBroker
         if (!bearishTape || !shortRsiOk) return false;
 
         string shortTag = $"SCALP_PATTERN_{pattern.Tag}_SHORT";
-        OpenPosition(symbol, qty, close, TradeSide.Sell, true, shortTag);
-        LogMessage($"[PATTERN] {(intrabar ? "EARLY" : "CLOSE")} {symbol} bearish {pattern.Tag} score={pattern.Score} rsi={rsi:F0} vol={volOk}");
-        return true;
+        if (OpenPosition(symbol, qty, close, TradeSide.Sell, true, shortTag))
+        {
+            LogMessage($"[PATTERN] {(intrabar ? "EARLY" : "CLOSE")} {symbol} bearish {pattern.Tag} score={pattern.Score} rsi={rsi:F0} vol={volOk}");
+            return true;
+        }
+        return false;
     }
 
     // ══════════════════════════════════════════════════════════
@@ -2611,9 +2591,11 @@ public partial class SimulatedBroker
                         int qty = CalcQtyV2(close, stopDistance);
                         if (qty > 0)
                         {
-                            OpenPosition(symbol, qty, close, TradeSide.Buy, false, "SCALP_PULLBACK_LONG");
-                            LogMessage($"[SCALP PULLBACK] {symbol} LONG impulse@{impulse.Close:F2} pullback-low={pullbackLow:F2} reclaim@{close:F2}");
-                            return true;
+                            if (OpenPosition(symbol, qty, close, TradeSide.Buy, false, "SCALP_PULLBACK_LONG"))
+                            {
+                                LogMessage($"[SCALP PULLBACK] {symbol} LONG impulse@{impulse.Close:F2} pullback-low={pullbackLow:F2} reclaim@{close:F2}");
+                                return true;
+                            }
                         }
                     }
                 }
@@ -2667,9 +2649,11 @@ public partial class SimulatedBroker
                         int qty = CalcQtyV2(close, stopDistance);
                         if (qty > 0)
                         {
-                            OpenPosition(symbol, qty, close, TradeSide.Sell, true, "SCALP_PULLBACK_SHORT");
-                            LogMessage($"[SCALP PULLBACK] {symbol} SHORT impulse@{impulse.Close:F2} pullback-high={pullbackHigh:F2} reject@{close:F2}");
-                            return true;
+                            if (OpenPosition(symbol, qty, close, TradeSide.Sell, true, "SCALP_PULLBACK_SHORT"))
+                            {
+                                LogMessage($"[SCALP PULLBACK] {symbol} SHORT impulse@{impulse.Close:F2} pullback-high={pullbackHigh:F2} reject@{close:F2}");
+                                return true;
+                            }
                         }
                     }
                 }
@@ -3169,10 +3153,10 @@ public partial class SimulatedBroker
     //  POSITION OPENING HELPER
     // ══════════════════════════════════════════════════════════
 
-    private void OpenPosition(string symbol, int qty, decimal price,
-                           TradeSide side, bool isShort, string strategyTag)
+    private bool OpenPosition(string symbol, int qty, decimal price,
+                              TradeSide side, bool isShort, string strategyTag)
     {
-        if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(strategyTag)) return;
+        if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(strategyTag)) return false;
         bool isNwBand = strategyTag.StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase);
 
         // ── BUG FIX: validate side/isShort/tag consistency ──
@@ -3201,19 +3185,19 @@ public partial class SimulatedBroker
         {
             RecordBlock(symbol, "SHORTS_DISABLED");
             LogMessage($"[SHORTS_DISABLED] {strategyTag} {symbol} blocked — shorts disabled");
-            return;
+            return false;
         }
         if (qty <= 0 || qty > MAX_QTY_SANITY)
         {
             RecordBlock(symbol, "QTY_SANITY");
             LogMessage($"[QTY_SANITY] {strategyTag} {symbol} blocked — qty {qty} invalid");
-            return;
+            return false;
         }
         if (_pendingEntrySymbols.ContainsKey(symbol))
         {
             RecordBlock(symbol, "PENDING_ENTRY");
             LogMessage($"[PENDING] {strategyTag} {symbol} blocked — entry already pending");
-            return;
+            return false;
         }
 
         if (!IsSwingStrategy(strategyTag) && !isNwBand)
@@ -3223,7 +3207,7 @@ public partial class SimulatedBroker
             {
                 RecordBlock(symbol, "DIRECTION_GATE");
                 LogMessage($"[DIRECTION GATE] {strategyTag} {symbol} blocked — tape/EMA/VWAP not aligned");
-                return;
+                return false;
             }
         }
 
@@ -3233,14 +3217,14 @@ public partial class SimulatedBroker
         {
             RecordBlock(symbol, "STRAT_LIMIT");
             LogMessage($"[STRAT LIMIT] {strategyTag} {symbol} blocked — {GetStrategyFamily(strategyTag)} hit {MAX_TRADES_PER_STRATEGY} trades today");
-            return;
+            return false;
         }
 
         if (!IsSwingStrategy(strategyTag) && !isNwBand && IsStrategyCold(strategyTag))
         {
             RecordBlock(symbol, "STRAT_COOLING");
             LogMessage($"[STRAT COOLING] {strategyTag} {symbol} blocked — recent real-trade performance is negative");
-            return;
+            return false;
         }
 
         // ── RISK MGMT: Trend reversal gate ──
@@ -3262,7 +3246,7 @@ public partial class SimulatedBroker
             if (IsTrendReversing(symbol, isShort, trendCandles))
             {
                 LogMessage($"[TREND GATE] {strategyTag} {symbol} blocked — trend structure reversing against {(isShort ? "SHORT" : "LONG")} entry");
-                return;
+                return false;
             }
         }
 
@@ -3275,7 +3259,7 @@ public partial class SimulatedBroker
                 {
                     RecordBlock(symbol, "SPY_GATE_LONG");
                     LogMessage($"[SPY GATE] {strategyTag} {symbol} LONG blocked — SPY EMA20 bearish");
-                    return;
+                    return false;
                 }
                 LogMessage($"[SPY GATE] {strategyTag} {symbol} LONG ALLOWED despite bearish SPY — strong relative strength");
             }
@@ -3283,7 +3267,7 @@ public partial class SimulatedBroker
             {
                 RecordBlock(symbol, "SPY_GATE_SHORT");
                 LogMessage($"[SPY GATE] {strategyTag} {symbol} SHORT blocked — SPY EMA20 bullish");
-                return;
+                return false;
             }
         }
 
@@ -3296,7 +3280,7 @@ public partial class SimulatedBroker
                 {
                     RecordBlock(symbol, "SECTOR_GATE");
                     LogMessage($"[SECTOR GATE] {strategyTag} {symbol} blocked — already have {openPos.Symbol} in sector [{newSector}]");
-                    return;
+                    return false;
                 }
             }
         }
@@ -3309,7 +3293,7 @@ public partial class SimulatedBroker
             {
                 RecordBlock(symbol, "NW_TARGET_NOT_READY");
                 LogMessage($"[NW 1H] {symbol} entry blocked — upper band unavailable or not above price.");
-                return;
+                return false;
             }
             nwUpperAtEntry = nwUpper;
         }
@@ -3319,6 +3303,23 @@ public partial class SimulatedBroker
         {
             decimal atrForRR = SafeATR(rrCandles, 14);
             stopDist = GetStopDistanceForStrategy(strategyTag, atrForRR, price);
+
+            // Apply the key-level stop adjustment before every remaining guard
+            // and before committing a pending-entry slot. Previously this ran
+            // after stopTrigger/target/risk were calculated, so the order still
+            // used the old stop and a failed resized quantity left trade counters
+            // incremented even though no order was submitted.
+            if (RealBroker != null && RealBroker.SupportsBrackets
+                && IsStopPlacedAtKeyLevel(symbol, price, stopDist, isShort))
+            {
+                stopDist *= 1.15m;
+                qty = CalcQtyV2(price, stopDist);
+                if (qty <= 0)
+                {
+                    RecordBlock(symbol, "STOP_LEVEL_QTY");
+                    return false;
+                }
+            }
 
             if (!IsSwingStrategy(strategyTag))
             {
@@ -3352,7 +3353,7 @@ public partial class SimulatedBroker
                 {
                     RecordBlock(symbol, "RR_SKIP");
                     LogMessage($"[RR SKIP] {strategyTag} {symbol} R:R={targetDist / stopDist:F2} < {requiredRr:F2} — target too close to stop, skipping");
-                    return;
+                    return false;
                 }
             }
         }
@@ -3363,7 +3364,7 @@ public partial class SimulatedBroker
             {
                 RecordBlock(symbol, "VIX_BLOCK");
                 LogMessage($"[VIX BLOCK] {strategyTag} {symbol} LONG blocked — VIX={vixLevel:F1} ≥ {VIX_NO_LONG_THRESHOLD}");
-                return;
+                return false;
             }
             if (vixLevel >= VIX_REDUCE_THRESHOLD)
             {
@@ -3377,7 +3378,7 @@ public partial class SimulatedBroker
         {
             RecordBlock(symbol, "ECON_MIN_QTY");
             LogMessage($"[ECON FILTER] {strategyTag} {symbol} blocked — qty {qty} < minimum {minEntryQty} for ${price:F2}");
-            return;
+            return false;
         }
 
         decimal targetMultiple = GetTargetMultipleForStrategy(strategyTag);
@@ -3389,7 +3390,7 @@ public partial class SimulatedBroker
         {
             RecordBlock(symbol, "ECON_GROSS_TARGET");
             LogMessage($"[ECON FILTER] {strategyTag} {symbol} blocked — gross target ${grossTargetPnL:F2} < required ${minGrossTargetPnL:F2}");
-            return;
+            return false;
         }
 
         // ── ALL GUARDS PASSED — now decide the ACTUAL transaction side ──
@@ -3447,14 +3448,6 @@ public partial class SimulatedBroker
                 ? Math.Max(atrBracket * 0.1m, price * 0.0005m)
                 : -Math.Max(atrBracket * 0.1m, price * 0.0005m)));
 
-            if (IsStopPlacedAtKeyLevel(symbol, price, stopDist, executionIsShort))
-            {
-                // Widen stop by 15% to clear the cluster
-                stopDist = stopDist * 1.15m;
-                qty = CalcQtyV2(price, stopDist); // recompute qty with wider stop
-                if (qty <= 0) { ReleasePendingEntrySlot(symbol, "stop-at-key-level no qty"); return; }
-            }
-
             RealBroker.SubmitBracketOrder(
                 symbol, qty,
                 entryAdj, executionSide,
@@ -3474,6 +3467,7 @@ public partial class SimulatedBroker
         }
 
         LogMessage($"[{strategyTag}] {symbol} x{qty} @ {price:F2} | execution={(executionIsShort ? "SHORT" : "LONG")} | regime={_marketRegime} | bracket={usedBracket}");
+        return true;
     }
 
     // ══════════════════════════════════════════════════════════
@@ -5099,6 +5093,7 @@ public partial class SimulatedBroker
             MAX_TRADES_PER_DAY = GetI("MAX_TRADES_PER_DAY", MAX_TRADES_PER_DAY);
             MAX_TRADES_PER_HOUR = GetI("MAX_TRADES_PER_HOUR", MAX_TRADES_PER_HOUR);
             MIN_ATR_PCT = GetD("MIN_ATR_PCT", MIN_ATR_PCT);
+            MIN_RR_RATIO = GetD("MIN_RR_RATIO", MIN_RR_RATIO);
             _allowShorts = GetB("ALLOW_SHORTS", _allowShorts);
             INVERT_ENTRY_DIRECTION = GetB("INVERT_ENTRY_DIRECTION", INVERT_ENTRY_DIRECTION);
             MIDDAY_FILTER_ENABLED = GetB("MIDDAY_FILTER_ENABLED", MIDDAY_FILTER_ENABLED);
@@ -5122,6 +5117,7 @@ public partial class SimulatedBroker
             NW_BANDWIDTH = GetD("NW_BANDWIDTH", NW_BANDWIDTH);
             NW_MULT = GetD("NW_MULT", NW_MULT);
             NW_STOP_LOSS_PCT = GetD("NW_STOP_LOSS_PCT", NW_STOP_LOSS_PCT);
+            EARLY_PATTERN_ENTRY_ENABLED = GetB("EARLY_PATTERN_ENTRY", EARLY_PATTERN_ENTRY_ENABLED);
             PATTERN_MIN_SCORE = GetI("PATTERN_MIN_SCORE", PATTERN_MIN_SCORE);
             INTRABAR_SIGNAL_COOLDOWN_SECONDS = GetI("INTRABAR_SIGNAL_COOLDOWN_SECONDS", INTRABAR_SIGNAL_COOLDOWN_SECONDS);
             FAST_VOL_MULT = GetD("FAST_VOL_MULT", FAST_VOL_MULT);
@@ -5232,8 +5228,13 @@ public partial class SimulatedBroker
             OrbMinutes = ORB_MINUTES,
             BreakEvenTriggerR = 1.0m,
             MinBreakoutBodyRatio = 0.55m,
-            MinSetupScore = MIN_SETUP_SCORE,
             MinGrossTargetToCommissionMult = MIN_GROSS_TARGET_TO_COMMISSION_MULT,
+            EnableCandlePatterns = STRATEGY_CANDLE_PATTERNS_ENABLED,
+            EnableOrb = STRATEGY_ORB_ENABLED,
+            EnableGapGo = STRATEGY_GAP_GO_ENABLED,
+            EnableVwap = STRATEGY_VWAP_ENABLED,
+            EnableMomentum = STRATEGY_MOMENTUM_ENABLED,
+            PatternMinScore = PATTERN_MIN_SCORE,
             AllowBullishPatternEntries = STRATEGY_CANDLE_PATTERNS_ENABLED && ALLOW_BULLISH_CANDLE_PATTERNS,
             AllowMicroPullback = STRATEGY_MICRO_PULLBACK_ENABLED,
             AllowScalpBreakoutLongs = ALLOW_SCALP_BREAKOUT_LONGS,
@@ -5282,6 +5283,7 @@ public partial class SimulatedBroker
             $"\"MAX_TRADES_PER_DAY\":{MAX_TRADES_PER_DAY}",
             $"\"MAX_TRADES_PER_HOUR\":{MAX_TRADES_PER_HOUR}",
             $"\"MIN_ATR_PCT\":{MIN_ATR_PCT:F4}",
+            $"\"MIN_RR_RATIO\":{MIN_RR_RATIO:F2}",
             $"\"ALLOW_SHORTS\":{(_allowShorts ? "true" : "false")}",
             $"\"INVERT_ENTRY_DIRECTION\":{(INVERT_ENTRY_DIRECTION ? "true" : "false")}",
             $"\"MIDDAY_FILTER_ENABLED\":{(MIDDAY_FILTER_ENABLED ? "true" : "false")}",
@@ -5356,6 +5358,7 @@ public partial class SimulatedBroker
         {
             _httpListener = new HttpListener();
             _httpListener.Prefixes.Add("http://*:8883/");
+            _httpListener.Prefixes.Add("http://*:8884/");
             _httpListener.Start();
             Task.Run(() => HandleDashboardRequests());
         }
@@ -5619,6 +5622,7 @@ public partial class SimulatedBroker
                         MAX_TRADES_PER_DAY = GetI("MAX_TRADES_PER_DAY", MAX_TRADES_PER_DAY);
                         MAX_TRADES_PER_HOUR = GetI("MAX_TRADES_PER_HOUR", MAX_TRADES_PER_HOUR);
                         MIN_ATR_PCT = GetD("MIN_ATR_PCT", MIN_ATR_PCT);
+                        MIN_RR_RATIO = GetD("MIN_RR_RATIO", MIN_RR_RATIO);
                         _allowShorts = GetB("ALLOW_SHORTS", _allowShorts);
                         INVERT_ENTRY_DIRECTION = GetB("INVERT_ENTRY_DIRECTION", INVERT_ENTRY_DIRECTION);
                         MIDDAY_FILTER_ENABLED = GetB("MIDDAY_FILTER_ENABLED", MIDDAY_FILTER_ENABLED);
@@ -5639,6 +5643,7 @@ public partial class SimulatedBroker
                         NW_BANDWIDTH = GetD("NW_BANDWIDTH", NW_BANDWIDTH);
                         NW_MULT = GetD("NW_MULT", NW_MULT);
                         NW_STOP_LOSS_PCT = GetD("NW_STOP_LOSS_PCT", NW_STOP_LOSS_PCT);
+                        EARLY_PATTERN_ENTRY_ENABLED = GetB("EARLY_PATTERN_ENTRY", EARLY_PATTERN_ENTRY_ENABLED);
                         PATTERN_MIN_SCORE = GetI("PATTERN_MIN_SCORE", PATTERN_MIN_SCORE);
                         INTRABAR_SIGNAL_COOLDOWN_SECONDS = GetI("INTRABAR_SIGNAL_COOLDOWN_SECONDS", INTRABAR_SIGNAL_COOLDOWN_SECONDS);
                         FAST_VOL_MULT = GetD("FAST_VOL_MULT", FAST_VOL_MULT);
@@ -6510,8 +6515,12 @@ public partial class SimulatedBroker
             Ema9Prev = closesPrev.Length >= 9 ? CalcEMA(closesPrev, 9) : 0,
             Ema21Prev = closesPrev.Length >= 21 ? CalcEMA(closesPrev, 21) : 0,
             MacdDir = SafeMACDDirection(candles),
-            RecentHigh8 = SafeHighestHigh(candles, 8),
-            RecentLow8 = SafeLowestLow(candles, 8),
+            // Breakout levels must exclude the candle being tested. Including
+            // the current candle made close > RecentHigh8 and close < RecentLow8
+            // impossible because a candle's close cannot exceed its own high or
+            // fall below its own low.
+            RecentHigh8 = SafeHighestHigh(candlesM1, 8),
+            RecentLow8 = SafeLowestLow(candlesM1, 8),
             VolExpansion = CheckVolumeExpansion(candles),
         };
         _indicatorCache[symbol] = ind;

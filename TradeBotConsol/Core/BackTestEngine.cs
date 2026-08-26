@@ -158,10 +158,15 @@ public class BacktestConfig
     public int OrbMinutes { get; set; } = 12;
     public decimal BreakEvenTriggerR { get; set; } = 1.0m;
     public decimal MinBreakoutBodyRatio { get; set; } = 0.45m;
-    public int MinSetupScore { get; set; } = 60;
     public int MinEntryMinutesAfterOpen { get; set; } = 18;
     public int MinEntryQty { get; set; } = 5;
     public decimal MinGrossTargetToCommissionMult { get; set; } = 4.0m;
+    public bool EnableCandlePatterns { get; set; } = false;
+    public bool EnableOrb { get; set; } = true;
+    public bool EnableGapGo { get; set; } = false;
+    public bool EnableVwap { get; set; } = true;
+    public bool EnableMomentum { get; set; } = true;
+    public int PatternMinScore { get; set; } = 65;
     public bool AllowBullishPatternEntries { get; set; } = false;
     public bool AllowMicroPullback { get; set; } = false;
     public bool AllowScalpBreakoutLongs { get; set; } = false;
@@ -1066,30 +1071,23 @@ public static class BacktestEngine
             if (atr <= 0 || close <= 0) continue;
             var todayWin = win.Where(c => c.Time.Date == etTime.Date).ToList();
             decimal todayDollarVolume = todayWin.Sum(c => c.Close * c.Volume);
-            if (todayWin.Count >= 20 && todayDollarVolume < 20000000m) continue;
+            decimal requiredDollarVolume = Math.Max(
+                500_000m,
+                20_000_000m * Math.Clamp(minsSinceOpen, 1, 390) / 390m);
+            if (todayDollarVolume < requiredDollarVolume) continue;
             double rsi = BtCalc.CalcRSI(win, 14);
             decimal sma20 = BtCalc.CalcSMA(win, 20);
             decimal sma50 = BtCalc.CalcSMA(win, Math.Min(50, win.Count));
             bool volExp = BtCalc.IsVolExpansion(win);
             long avgVol10 = (long)win.TakeLast(10).Average(c => c.Volume);
             bool volOk = candle.Volume >= avgVol10;
-            int setupScore = 0;
-            if (sma50 > 0 && close > sma50) setupScore += 15;
-            if (sma20 > 0 && close > sma20) setupScore += 10;
-            if (vwap > 0 && close > vwap) setupScore += 10;
-            if (volExp) setupScore += 25;
-            decimal atrPct = close > 0 ? atr / close : 0m;
-            if (atrPct >= 0.003m && atrPct <= 0.02m) setupScore += 20;
-            setupScore += regime == "TRENDING" ? 15 : regime == "NORMAL" ? 10 : regime == "SELL-OFF" ? 5 : 0;
-            if (setupScore < cfg.MinSetupScore) continue;
-
             BtPosition newPos = null;
 
             // ── Candlestick pattern entry (runs FIRST — early signals) ──
-            if (newPos == null && win.Count >= 6)
+            if (newPos == null && cfg.EnableCandlePatterns && win.Count >= 6)
             {
                 var patternResult = DetectBtPattern(win, atr);
-                if (patternResult.score >= 55)
+                if (patternResult.score >= cfg.PatternMinScore)
                 {
                     if (patternResult.bullish && cfg.AllowBullishPatternEntries && !blockLongs && rsi >= 44 && (vwap <= 0 || close >= vwap - atr * 0.5m) && volOk)
                     {
@@ -1097,7 +1095,7 @@ public static class BacktestEngine
                         if (qty > 0)
                             newPos = new BtPosition { Symbol = symbol, IsShort = false, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = $"SCALP_PATTERN_{patternResult.tag}_LONG", Regime = regime, HardStop = close - atr * cfg.HardStopAtrMult, Target = close + atr * cfg.TargetAtrMult, AtrAtEntry = atr, WorstPrice = close };
                     }
-                    else if (!patternResult.bullish && rsi <= 56 && (vwap > 0 && close <= vwap + atr * 0.5m))
+                    else if (cfg.AllowShorts && !patternResult.bullish && rsi <= 56 && (vwap > 0 && close <= vwap + atr * 0.5m))
                     {
                         int qty = CalcQty(close, atr * cfg.HardStopAtrMult, cfg);
                         if (qty > 0)
@@ -1176,7 +1174,7 @@ public static class BacktestEngine
             }
 
             // ── ORB strategy ─────────────────────────────────────────────
-            if (orbRanges.TryGetValue(symbol, out orb) && orb.IsSet && regime != "CHOPPY")
+            if (newPos == null && cfg.EnableOrb && orbRanges.TryGetValue(symbol, out orb) && orb.IsSet && regime != "CHOPPY")
             {
                 bool orbLongHold = win.Count >= 2 && win[^1].Close > orb.High && win[^2].Close > orb.High;
                 bool orbShortHold = win.Count >= 2 && win[^1].Close < orb.Low && win[^2].Close < orb.Low;
@@ -1217,7 +1215,7 @@ public static class BacktestEngine
             }
 
             // ── Gap and Go ─────────────────────────────────────────────────
-            if (newPos == null && prevClose.TryGetValue(symbol, out var pdClose) && pdClose > 0)
+            if (newPos == null && cfg.EnableGapGo && prevClose.TryGetValue(symbol, out var pdClose) && pdClose > 0)
             {
                 decimal gapPct = (close - pdClose) / pdClose;
                 decimal relVol = avgVol10 > 0 ? candle.Volume / (decimal)avgVol10 : 0m;
@@ -1236,7 +1234,7 @@ public static class BacktestEngine
             }
 
             // ── VWAP Reclaim (blocked in SELL-OFF and bearish open) ───────
-            if (newPos == null && vwap > 0 && volExp && !blockLongs && HasStrongBodyClose(candle, true, cfg))
+            if (newPos == null && cfg.EnableVwap && vwap > 0 && volExp && !blockLongs && HasStrongBodyClose(candle, true, cfg))
             {
                 bool reclaim = win.Count >= 3 && win[^1].Close > vwap && win[^2].Close > vwap && win[^3].Close <= vwap;
                 if (reclaim && rsi > cfg.RsiLongMin)
@@ -1248,7 +1246,7 @@ public static class BacktestEngine
             }
 
             // ── VWAP Reject Short ──────────────────────────────────────────
-            if (newPos == null && cfg.AllowShorts && vwap > 0 && volExp && HasStrongBodyClose(candle, false, cfg))
+            if (newPos == null && cfg.EnableVwap && cfg.AllowShorts && vwap > 0 && volExp && HasStrongBodyClose(candle, false, cfg))
             {
                 bool reject = win.Count >= 3 && win[^1].Close < vwap && win[^2].Close < vwap && win[^3].Close >= vwap;
                 if (reject && rsi < cfg.RsiShortMax)
@@ -1260,9 +1258,9 @@ public static class BacktestEngine
             }
 
             // ── Momentum Breakout (TRENDING only, blocked in SELL-OFF) ────
-            if (newPos == null && volExp && sma20 > sma50 && sma50 > 0 && regime == "TRENDING" && !blockLongs && HasStrongBodyClose(candle, true, cfg))
+            if (newPos == null && cfg.EnableMomentum && volExp && sma20 > sma50 && sma50 > 0 && regime == "TRENDING" && !blockLongs && HasStrongBodyClose(candle, true, cfg))
             {
-                decimal recentHigh = win.TakeLast(8).Max(c => c.High);
+                decimal recentHigh = win.Take(win.Count - 1).TakeLast(8).Max(c => c.High);
                 // Require volatility compression before the breakout (coil → spring)
                 bool compressed = win.Count >= 20 && BtCalc.CalcATR(win.TakeLast(20).ToList(), 10) < BtCalc.CalcATR(win, 14) * 0.8m;
                 bool breakout = close > recentHigh && rsi > cfg.RsiLongMin && compressed;
@@ -1275,9 +1273,9 @@ public static class BacktestEngine
             }
 
             // ── Momentum short continuation ────────────────────────────────
-            if (newPos == null && cfg.AllowShorts && volExp && sma50 > 0 && close < sma20 && close < sma50 && HasStrongBodyClose(candle, false, cfg))
+            if (newPos == null && cfg.EnableMomentum && cfg.AllowShorts && volExp && sma50 > 0 && close < sma20 && close < sma50 && HasStrongBodyClose(candle, false, cfg))
             {
-                decimal recentLow = win.TakeLast(8).Min(c => c.Low);
+                decimal recentLow = win.Take(win.Count - 1).TakeLast(8).Min(c => c.Low);
                 bool breakdown = close < recentLow && rsi < cfg.RsiShortMax && (regime == "SELL-OFF" || regime == "NORMAL");
                 if (breakdown)
                 {
