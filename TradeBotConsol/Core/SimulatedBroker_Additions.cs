@@ -56,10 +56,10 @@ public partial class SimulatedBroker
             if (!_positions.TryGetValue(symbol, out var pos)) return;
             if (pos.ExitSubmitted) return;
 
-            // NW 1H positions are intentionally managed by the 1H lower/upper
+            // NW positions are intentionally managed by the configured lower/upper
             // envelope plus their configured protective NW stop. Do not arm the
             // generic 1R breakeven stop, because that can close the trade before
-            // the live price reaches the NW 1H upper band.
+            // the live price reaches the NW upper band.
             if ((pos.StrategyTag ?? "").StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase))
                 return;
 

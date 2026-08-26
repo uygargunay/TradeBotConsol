@@ -1776,6 +1776,8 @@
                                     <th data-k="s">Symbol</th>
                                     <th data-k="price" class="tr">Price</th>
                                     <th data-k="chg" class="tr">Chg %</th>
+                                    <th data-k="nwHi" class="tr" title="Nadaraya-Watson envelope high from completed regular-session bars (timeframe set in Settings)">NW Hi</th>
+                                    <th data-k="nwLo" class="tr" title="Nadaraya-Watson envelope low from completed regular-session bars (timeframe set in Settings)">NW Lo</th>
                                     <th data-k="vwap" class="tr">VWAP</th>
                                     <th data-k="sma20" class="tr">SMA20</th>
                                     <th data-k="sma50" class="tr">SMA50</th>
@@ -1787,8 +1789,6 @@
                                     <th data-k="atr" class="tr">ATR %</th>
                                     <th data-k="orbHi" class="tr">ORB Hi</th>
                                     <th data-k="orbLo" class="tr">ORB Lo</th>
-                                    <th data-k="nwHi" class="tr" title="Nadaraya-Watson envelope high from completed regular-session bars (timeframe set in Settings)">NW Hi</th>
-                                    <th data-k="nwLo" class="tr" title="Nadaraya-Watson envelope low from completed regular-session bars (timeframe set in Settings)">NW Lo</th>
                                     <th data-k="trend" class="tc">Trend</th>
                                     <th data-k="abvVwap" class="tc">VW↕</th>
                                     <th data-k="sig" class="tc">Signal</th>
@@ -2423,8 +2423,8 @@
                 const gC = w.gap >= 0 ? 'g' : 'r';
                 const oHi = w.orbHi > 0 ? `$${w.orbHi.toFixed(2)}` : '<span class="m">—</span>';
                 const oLo = w.orbLo > 0 ? `$${w.orbLo.toFixed(2)}` : '<span class="m">—</span>';
-                const nwNeed = (CFG && CFG.NW_LOOKBACK) ? CFG.NW_LOOKBACK : 500;
-                const nwTf = (CFG && CFG.NW_TIMEFRAME_MINUTES) ? CFG.NW_TIMEFRAME_MINUTES : 60;
+                const nwNeed = (CFG && CFG.NW_LOOKBACK) ? CFG.NW_LOOKBACK : 250;
+                const nwTf = (CFG && CFG.NW_TIMEFRAME_MINUTES) ? CFG.NW_TIMEFRAME_MINUTES : 30;
                 const nwLoading = w.nwBars > 0 ? `<span class="m" title="NW history loading: ${w.nwBars}/${nwNeed} completed ${nwTf}-min bars">${w.nwBars}/${nwNeed}</span>` : '<span class="m">—</span>';
                 const nwHiTxt = w.nwHi > 0 ? `$${w.nwHi.toFixed(2)}` : nwLoading;
                 const nwLoTxt = w.nwLo > 0 ? `$${w.nwLo.toFixed(2)}` : nwLoading;
@@ -2435,10 +2435,15 @@
                 const s200C = w.sma200 > 0 ? (w.price > w.sma200 ? 'g' : w.price < w.sma200 ? 'r' : 'm') : 'm';
                 const atrC = w.atr >= 0.4 ? 'g' : w.atr >= 0.2 ? 'y' : 'm';
                 const isSelected = w.s === selectedSym;
+                const nwTouch = w.nwLo > 0 && w.last > 0 && w.pxSrc === 'last' && w.last <= w.nwLo;
+                const nwDecision = w.nwWhy && (/^(TOUCH|ENTRY|Last)/).test(w.nwWhy);
+                const whyText = (nwTouch || nwDecision) && w.nwWhy ? w.nwWhy : (w.why || '—');
                 return `<tr class="${w.hot ? 'hot' : ''} ${isSelected ? 'selected' : ''}" onclick="onSymClick('${w.s}')">
                                                                                                                                       <td><div class="sym-cell">${w.hot ? '<span class="hot-arrow">►</span>' : ''}<span>${w.s}</span></div></td>
                                                                                                                                       <td class="tr ${pC}" title="${priceTitle(w)}">$${w.price.toFixed(2)}${priceSourceBadge(w)}</td>
                                                                                                                                       <td class="tr ${(w.chg ?? 0) >= 0 ? 'g' : 'r'}" style="font-weight:700">${w.chg != null && w.chg !== 0 ? (w.chg >= 0 ? '+' : '') + w.chg.toFixed(2) + '%' : '<span class="m">—</span>'}</td>
+                                                                                                                                      <td class="tr m" title="${w.nwWhy || ''}">${nwHiTxt}</td>
+                                                                                                                                      <td class="tr m" title="${w.nwWhy || ''}">${nwLoTxt}</td>
                                                                                                                                       <td class="tr m">$${w.vwap > 0 ? w.vwap.toFixed(2) : '—'}</td>
                                                                                                                                       <td class="tr ${s20C}">$${w.sma20 > 0 ? w.sma20.toFixed(2) : '—'}</td>
                                                                                                                                       <td class="tr ${s50C}">$${w.sma50 > 0 ? w.sma50.toFixed(2) : '—'}</td>
@@ -2450,12 +2455,10 @@
                                                                                                                                       <td class="tr ${atrC}">${w.atr.toFixed(2)}%</td>
                                                                                                                                       <td class="tr m">${oHi}</td>
                                                                                                                                       <td class="tr m">${oLo}</td>
-                                                                                                                                      <td class="tr m">${nwHiTxt}</td>
-                                                                                                                                      <td class="tr m">${nwLoTxt}</td>
                                                                                                                                       <td class="tc">${trH}</td>
                                                                                                                                       <td class="tc"><span class="led" style="background:${ledC}"></span></td>
                                                                                                                                       <td class="tc">${sigBadge(w.sig)}</td>
-                                                                                                                                      <td class="tc m" title="${w.why || ''}">${w.why || '—'}</td>
+                                                                                                                                      <td class="tc m" title="${whyText}">${whyText}</td>
                                                                                                                                     </tr>`;
             }).join('');
         }
@@ -2756,7 +2759,7 @@
 
             // Scanner — only rebuild if watchlist data actually changed
             rawWL = d.watchlist;
-            const scanFp = d.watchlist.map(w => w.s + w.price.toFixed(2) + w.rsi.toFixed(0) + (w.sma20 || 0).toFixed(0) + (w.sma50 || 0).toFixed(0) + (w.why || '')).join('|');
+            const scanFp = d.watchlist.map(w => w.s + w.price.toFixed(2) + w.rsi.toFixed(0) + (w.sma20 || 0).toFixed(0) + (w.sma50 || 0).toFixed(0) + (w.nwHi || 0).toFixed(2) + (w.nwLo || 0).toFixed(2) + (w.nwWhy || '') + (w.why || '')).join('|');
             if (scanFp !== _prevScannerFingerprint) {
                 _prevScannerFingerprint = scanFp;
                 renderScanner();
@@ -2978,10 +2981,10 @@
             STRATEGY_CANDLE_PATTERNS: true,
             STRATEGY_MICRO_PULLBACK: true,
             STRATEGY_NADARAYA_WATSON: true,
-            NW_TIMEFRAME_MINUTES: 60,
-            NW_LOOKBACK: 500,
-            NW_BANDWIDTH: 8.0,
-            NW_MULT: 3.0,
+            NW_TIMEFRAME_MINUTES: 30,
+            NW_LOOKBACK: 250,
+            NW_BANDWIDTH: 6.0,
+            NW_MULT: 2.5,
             EARLY_PATTERN_ENTRY: true,
             PATTERN_MIN_SCORE: 65,
             INTRABAR_SIGNAL_COOLDOWN_SECONDS: 20,
@@ -3211,7 +3214,7 @@
                                                                                                                                             ${toggleField('STRATEGY_OUTSIDE_CANDLE', 'Outside Candle', 'Trades bullish or bearish outside-candle reversals.')}
                                                                                                                                             ${toggleField('STRATEGY_CANDLE_PATTERNS', 'Candle Patterns', 'Trades the multi-pattern candlestick engine when its own score passes.')}
                                                                                                                                             ${toggleField('STRATEGY_MICRO_PULLBACK', 'Micro Pullback', 'Trades shallow pullbacks after a strong impulse bar.')}
-                                                                                                                                            ${toggleField('STRATEGY_NADARAYA_WATSON', 'Nadaraya-Watson Bands', 'Buys a live touch of the lower hourly band and exits the long at the upper band; it never opens a short at the upper band.')}
+                                                                                                                                            ${toggleField('STRATEGY_NADARAYA_WATSON', 'Nadaraya-Watson Bands', 'Buys a live LAST-price touch of the lower configured-timeframe band and exits the long at the upper band; it never opens a short at the upper band.')}
                                                                                                                                         </div>
                                                                                                                                     </div>
                                                                                                                                     <div class="sm-section">
@@ -3225,7 +3228,7 @@
                 { value: 30, label: '30 min' },
                 { value: 60, label: '1 hour' }
             ], CFG.NW_TIMEFRAME_MINUTES, 'Bar size for Nadaraya-Watson. 15/30-min bars pull a shorter IBKR history window than 1-hour, so a high Lookback may take longer to fully populate.')}
-                                                                                                                                            ${field('NW_LOOKBACK', 'NW Lookback (bars)', 'number', CFG.NW_LOOKBACK, 'Completed regular-session bars (at the selected NW Timeframe) used by Nadaraya-Watson. Standard endpoint setting = 500')}
+                                                                                                                                            ${field('NW_LOOKBACK', 'NW Lookback (bars)', 'number', CFG.NW_LOOKBACK, 'Completed regular-session bars (at the selected NW Timeframe) used by Nadaraya-Watson. Current 30-minute profile = 250')}
                                                                                                                                             ${field('NW_BANDWIDTH', 'NW Bandwidth', 'number', CFG.NW_BANDWIDTH, 'Gaussian kernel bandwidth — larger = smoother centerline, fewer signals')}
                                                                                                                                             ${field('NW_MULT', 'NW Band Multiplier', 'number', CFG.NW_MULT, 'Band width = kernel MAE x this multiplier — larger = wider bands, fewer signals')}
                                                                                                                                         </div>
