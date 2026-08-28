@@ -73,6 +73,8 @@
   "NW_LOOKBACK": 250,
   "NW_BANDWIDTH": 6.0,
   "NW_MULT": 2.5,
+  "NW_MAX_TRADES_PER_HOUR": 2,
+  "NW_MAX_TRADES_PER_DAY": 2,
   "earnings_blacklist": [],
   "watchlist": [
     "SPY",

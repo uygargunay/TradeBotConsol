@@ -2992,6 +2992,9 @@
             NW_LOOKBACK: 250,
             NW_BANDWIDTH: 6.0,
             NW_MULT: 2.5,
+            NW_STOP_LOSS_PCT: 0.03,
+            NW_MAX_TRADES_PER_HOUR: 2,
+            NW_MAX_TRADES_PER_DAY: 2,
             EARLY_PATTERN_ENTRY: true,
             PATTERN_MIN_SCORE: 68,
             INTRABAR_SIGNAL_COOLDOWN_SECONDS: 30,
@@ -3081,14 +3084,14 @@
                                                                                                                                             ${field('MAX_LOSS_PER_TRADE', 'Max Loss / Trade ($)', 'number', CFG.MAX_LOSS_PER_TRADE, 'Dollar stop per individual trade')}
                                                                                                                                             ${field('RISK_PCT', 'Risk % of Budget', 'number', CFG.RISK_PCT, 'Fractional risk per trade (e.g. 0.015 = 1.5%)')}
                                                                                                                                             ${field('MAX_TRADES_PER_DAY', 'Max Trades / Day', 'number', CFG.MAX_TRADES_PER_DAY, 'Hard cap on daily trade count')}
-                                                                                                                                            ${field('MAX_TRADES_PER_HOUR', 'Max Trades / Rolling Hour', 'number', CFG.MAX_TRADES_PER_HOUR, 'Hard cap on entries in any rolling 60-minute window')}
+                                                                                                                                            ${field('MAX_TRADES_PER_HOUR', 'Non-NW Trades / Rolling Hour', 'number', CFG.MAX_TRADES_PER_HOUR, 'Rolling-hour cap for the ordinary OR-router strategies. NW uses its own independent cap.')}
                                                                                                                                         </div>
                                                                                                                                     </div>
                                                                                                                                     <div class="sm-section">
                                                                                                                                         <div class="sm-section-title">Advanced Risk Management</div>
                                                                                                                                         <div class="sm-grid">
                                                                                                                                             ${field('UNREALIZED_DD_HALT', 'Unrealized DD Halt ($)', 'number', CFG.UNREALIZED_DD_HALT, 'Block new entries when realized+unrealized PnL breaches this (negative value)')}
-                                                                                                                                            ${field('MAX_TRADES_PER_STRATEGY', 'Max Trades / Strategy', 'number', CFG.MAX_TRADES_PER_STRATEGY, 'Cap per strategy family per day (0=unlimited)')}
+                                                                                                                                            ${field('MAX_TRADES_PER_STRATEGY', 'Non-NW Trades / Strategy', 'number', CFG.MAX_TRADES_PER_STRATEGY, 'Daily cap for each ordinary strategy family (0=unlimited). NW uses its own daily cap.')}
                                                                                                                                             ${field('MAX_TRADES_PER_SYMBOL_PER_DAY', 'Max Trades / Symbol', 'number', CFG.MAX_TRADES_PER_SYMBOL_PER_DAY, 'Cap per ticker per day so one cheap name cannot dominate the bot')}
                                                                                                                                             ${field('MAX_CONSECUTIVE_LOSSES', 'Max Consecutive Losses', 'number', CFG.MAX_CONSECUTIVE_LOSSES, 'Halt trading after N straight losses')}
                                                                                                                                             ${field('VIX_REDUCE_THRESHOLD', 'VIX Reduce Threshold', 'number', CFG.VIX_REDUCE_THRESHOLD, 'Halve position size above this VIX level')}
@@ -3227,9 +3230,22 @@
                                                                                                                                     <div class="sm-section">
                                                                                                                                         <div class="sm-section-title">Independent Nadaraya-Watson Strategy</div>
                                                                                                                                         <div style="background:rgba(188,140,255,.08);border:1px solid rgba(188,140,255,.28);border-radius:5px;padding:8px 10px;margin-bottom:10px;font-size:10px;color:var(--muted);line-height:1.6">
-                                                                                                                                            NW is evaluated separately on every fresh live LAST tick. A lower-band touch can submit its own long without confirmation from the OR strategies; portfolio, liquidity, spread, cooldown and loss limits still apply.
+                                                                                                                                            NW is evaluated separately on every fresh live LAST tick. A lower-band touch can submit its own long without confirmation from—or consuming the rolling-hour allowance of—the OR strategies. NW has its own hourly cap; account-level day, position, cash, spread and loss limits still apply.
                                                                                                                                         </div>
                                                                                                                                         ${toggleField('STRATEGY_NADARAYA_WATSON', 'Nadaraya-Watson Bands', 'Buys a fresh live LAST-price touch of the lower configured-timeframe band and exits the long at the upper band; it never opens a short at the upper band.')}
+                                                                                                                                        <div class="sm-grid" style="margin-top:10px">
+                                                                                                                                            ${selectField('NW_TIMEFRAME_MINUTES', 'NW Timeframe', [
+                { value: 15, label: '15 min' },
+                { value: 30, label: '30 min' },
+                { value: 60, label: '1 hour' }
+            ], CFG.NW_TIMEFRAME_MINUTES, 'Bar size for Nadaraya-Watson. 15/30-min bars pull a shorter IBKR history window than 1-hour, so a high Lookback may take longer to fully populate.')}
+                                                                                                                                            ${field('NW_LOOKBACK', 'NW Lookback (bars)', 'number', CFG.NW_LOOKBACK, 'Completed regular-session bars used by the independent NW envelope. Current profile = 250.')}
+                                                                                                                                            ${field('NW_BANDWIDTH', 'NW Bandwidth', 'number', CFG.NW_BANDWIDTH, 'Gaussian kernel bandwidth — larger = smoother centerline, fewer signals')}
+                                                                                                                                            ${field('NW_MULT', 'NW Band Multiplier', 'number', CFG.NW_MULT, 'Band width = kernel MAE x this multiplier — larger = wider bands, fewer signals')}
+                                                                                                                                            ${field('NW_STOP_LOSS_PCT', 'NW Stop Loss (decimal)', 'number', CFG.NW_STOP_LOSS_PCT, 'Flat NW protective stop as a decimal. 0.03 = 3%.')}
+                                                                                                                                            ${field('NW_MAX_TRADES_PER_HOUR', 'NW Trades / Rolling Hour', 'number', CFG.NW_MAX_TRADES_PER_HOUR, 'Dedicated NW entry cap. Ordinary strategy trades do not consume it; 0 disables this NW-specific cap.')}
+                                                                                                                                            ${field('NW_MAX_TRADES_PER_DAY', 'NW Trades / Day', 'number', CFG.NW_MAX_TRADES_PER_DAY, 'Dedicated NW strategy-family cap. Account-wide Max Trades / Day still applies; 0 disables only this NW-specific cap.')}
+                                                                                                                                        </div>
                                                                                                                                     </div>
                                                                                                                                    <div class="sm-section">
                                                                                                                                         <div class="sm-section-title">Pattern &amp; Fast-Entry Controls</div>
@@ -3237,14 +3253,6 @@
                                                                                                                                             ${field('PATTERN_MIN_SCORE', 'Pattern Min Score', 'number', CFG.PATTERN_MIN_SCORE, 'Minimum quality score before a candlestick pattern can trigger an entry')}
                                                                                                                                             ${field('INTRABAR_SIGNAL_COOLDOWN_SECONDS', 'Intrabar Cooldown (sec)', 'number', CFG.INTRABAR_SIGNAL_COOLDOWN_SECONDS, 'Prevents repeated intrabar pattern re-triggers on the same symbol')}
                                                                                                                                             ${field('FAST_VOL_MULT', 'Fast Vol Surge Mult', 'number', CFG.FAST_VOL_MULT, 'Short-term volume surge multiplier used by the pattern engine')}
-                                                                                                                                            ${selectField('NW_TIMEFRAME_MINUTES', 'NW Timeframe', [
-                { value: 15, label: '15 min' },
-                { value: 30, label: '30 min' },
-                { value: 60, label: '1 hour' }
-            ], CFG.NW_TIMEFRAME_MINUTES, 'Bar size for Nadaraya-Watson. 15/30-min bars pull a shorter IBKR history window than 1-hour, so a high Lookback may take longer to fully populate.')}
-                                                                                                                                            ${field('NW_LOOKBACK', 'NW Lookback (bars)', 'number', CFG.NW_LOOKBACK, 'Completed regular-session bars (at the selected NW Timeframe) used by Nadaraya-Watson. Current 30-minute profile = 250')}
-                                                                                                                                            ${field('NW_BANDWIDTH', 'NW Bandwidth', 'number', CFG.NW_BANDWIDTH, 'Gaussian kernel bandwidth — larger = smoother centerline, fewer signals')}
-                                                                                                                                            ${field('NW_MULT', 'NW Band Multiplier', 'number', CFG.NW_MULT, 'Band width = kernel MAE x this multiplier — larger = wider bands, fewer signals')}
                                                                                                                                         </div>
                                                                                                                                         <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
                                                                                                                                             <div class="sm-toggle-row">

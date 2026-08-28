@@ -95,8 +95,10 @@ public class BotPersistData
     public Dictionary<string, bool> LastTradeWasLoss { get; set; } = new();
     public Dictionary<string, int> DailyEntryCount { get; set; } = new();
     public int TradesThisHour { get; set; }
+    public int NwTradesThisHour { get; set; }
     public DateTime TradeHourSlot { get; set; } = DateTime.MinValue;
     public List<DateTime> RecentEntryTimesUtc { get; set; } = new();
+    public List<DateTime> RecentNwEntryTimesUtc { get; set; } = new();
     public Dictionary<string, int> StrategyTradeCount { get; set; } = new();
     public List<TradeRecord> CompletedTrades { get; set; } = new();
     public DateTime LastVolumeResetDate { get; set; } = DateTime.MinValue;
@@ -210,8 +212,8 @@ public partial class SimulatedBroker
     private bool DYNAMIC_SIZING_ENABLED = true;
 
     // ── RISK MGMT: Strategy Allocation Limits ──
-    // Max trades per strategy family per day. Prevents one misfiring strategy
-    // from consuming the entire daily trade budget.
+    // Max trades per ordinary strategy family per day. NW uses its own dedicated
+    // daily cap so ordinary strategies cannot consume its allowance.
     private int MAX_TRADES_PER_STRATEGY = 2;
     private int MAX_TRADES_PER_SYMBOL_PER_DAY = 1;
 
@@ -466,9 +468,16 @@ public partial class SimulatedBroker
     private decimal _totalRealizedPnL = 0m;
     private int _tradesToday = 0;
     private int _tradesThisHour = 0;
+    private int _nwTradesThisHour = 0;
     private int MAX_TRADES_PER_HOUR = 2;
+    private int NW_MAX_TRADES_PER_HOUR = 2;
+    private int NW_MAX_TRADES_PER_DAY = 2;
     private DateTime _currentTradeHour = DateTime.MinValue;
+    // Separate rolling entry lanes: ordinary strategies cannot consume NW's
+    // allowance, and NW attempts cannot consume the ordinary-strategy allowance.
+    // Account-level day/loss/cash/position caps still cover both lanes.
     private readonly Queue<DateTime> _recentEntryTimesUtc = new();
+    private readonly Queue<DateTime> _recentNwEntryTimesUtc = new();
     private bool _haltTrading = false;
     private string _haltReason = "";
     private DateTime _lastHaltGateLogUtc = DateTime.MinValue;
@@ -1047,6 +1056,28 @@ public partial class SimulatedBroker
         return _tradesThisHour;
     }
 
+    // NW has a dedicated rolling-hour allowance. This is deliberately separate
+    // from GetRollingHourEntryCountLocked(): a valid NW touch must not be rejected
+    // just because ordinary OR-router strategies already traded in the last hour.
+    private int GetRollingNwHourEntryCountLocked(DateTime nowUtc)
+    {
+        DateTime cutoff = nowUtc.AddHours(-1);
+        while (_recentNwEntryTimesUtc.Count > 0 && _recentNwEntryTimesUtc.Peek() <= cutoff)
+            _recentNwEntryTimesUtc.Dequeue();
+
+        _nwTradesThisHour = _recentNwEntryTimesUtc.Count;
+        return _nwTradesThisHour;
+    }
+
+    // Called only while holding _lock.
+    private static void RemoveEntryAttemptTimeLocked(Queue<DateTime> queue, DateTime submittedUtc)
+    {
+        if (submittedUtc == DateTime.MinValue || !queue.Contains(submittedUtc)) return;
+        var retained = queue.Where(t => t != submittedUtc).ToList();
+        queue.Clear();
+        foreach (DateTime t in retained) queue.Enqueue(t);
+    }
+
     private string GetWatchlistReadiness(string symbol, bool nwTouchMode = false)
     {
         try
@@ -1087,7 +1118,7 @@ public partial class SimulatedBroker
             {
                 decimal mid = (ask + bid) / 2m;
                 decimal spreadPct = mid > 0m ? (ask - bid) / mid : 0m;
-                if (spreadPct > 0.0020m) return "Wide spr";
+                if (spreadPct > 0.0020m) return $"Wide spr {spreadPct:P2}>0.20%";
             }
 
             if (!nwTouchMode && candles.Count >= 11 && IsLiquiditySweep(candles)) return "Sweep";
@@ -1106,8 +1137,17 @@ public partial class SimulatedBroker
 
             lock (_lock)
             {
-                if (_tradesToday >= MAX_TRADES_PER_DAY) return "Day cap";
-                if (GetRollingHourEntryCountLocked(DateTime.UtcNow) >= MAX_TRADES_PER_HOUR) return "Hour cap";
+                if (_tradesToday + _pendingEntryCount >= MAX_TRADES_PER_DAY) return "Day cap";
+                if (nwTouchMode)
+                {
+                    if (NW_MAX_TRADES_PER_HOUR > 0 &&
+                        GetRollingNwHourEntryCountLocked(DateTime.UtcNow) >= NW_MAX_TRADES_PER_HOUR)
+                        return $"NW hour cap {_nwTradesThisHour}/{NW_MAX_TRADES_PER_HOUR}";
+                }
+                else if (GetRollingHourEntryCountLocked(DateTime.UtcNow) >= MAX_TRADES_PER_HOUR)
+                {
+                    return $"Hour cap {_tradesThisHour}/{MAX_TRADES_PER_HOUR}";
+                }
                 if (_positions.ContainsKey(symbol)) return "In pos";
                 if (_pendingEntrySymbols.ContainsKey(symbol)) return "Pending";
                 if (_positions.Count + _pendingEntryCount >= MAX_POSITIONS) return "Max pos";
@@ -1163,13 +1203,12 @@ public partial class SimulatedBroker
                 if (symbolAttempts <= 1) _dailyEntryCount.Remove(symbol);
                 else _dailyEntryCount[symbol] = symbolAttempts - 1;
 
-                if (submittedUtc != DateTime.MinValue && _recentEntryTimesUtc.Contains(submittedUtc))
-                {
-                    var retained = _recentEntryTimesUtc.Where(t => t != submittedUtc).ToList();
-                    _recentEntryTimesUtc.Clear();
-                    foreach (DateTime t in retained) _recentEntryTimesUtc.Enqueue(t);
-                    GetRollingHourEntryCountLocked(DateTime.UtcNow);
-                }
+                // The same release path handles both lanes; removing from both is
+                // safe because an attempt timestamp is enqueued in exactly one.
+                RemoveEntryAttemptTimeLocked(_recentEntryTimesUtc, submittedUtc);
+                RemoveEntryAttemptTimeLocked(_recentNwEntryTimesUtc, submittedUtc);
+                GetRollingHourEntryCountLocked(DateTime.UtcNow);
+                GetRollingNwHourEntryCountLocked(DateTime.UtcNow);
             }
             LogMessage($"[PENDING RELEASE] {symbol} — {reason}; slot freed.");
         }
@@ -1307,8 +1346,21 @@ public partial class SimulatedBroker
         // Position / budget / rate limits (needs lock)
         lock (_lock)
         {
-            if (_tradesToday >= MAX_TRADES_PER_DAY) return false;
-            if (GetRollingHourEntryCountLocked(DateTime.UtcNow) >= MAX_TRADES_PER_HOUR) return false;
+            // Pending attempts reserve their daily slots. Without this, several
+            // simultaneous NW touches could all pass while fills were still in
+            // flight and overshoot MAX_TRADES_PER_DAY.
+            if (_tradesToday + _pendingEntryCount >= MAX_TRADES_PER_DAY) return false;
+
+            if (nwTouchMode)
+            {
+                if (NW_MAX_TRADES_PER_HOUR > 0 &&
+                    GetRollingNwHourEntryCountLocked(DateTime.UtcNow) >= NW_MAX_TRADES_PER_HOUR)
+                    return false;
+            }
+            else if (GetRollingHourEntryCountLocked(DateTime.UtcNow) >= MAX_TRADES_PER_HOUR)
+            {
+                return false;
+            }
 
             if (_positions.ContainsKey(symbol)) return false;
             if (_pendingEntrySymbols.ContainsKey(symbol)) return false;
@@ -1827,6 +1879,7 @@ public partial class SimulatedBroker
         {
             decimal distancePct = lower > 0 ? (price - lower) / lower * 100m : 0m;
             _lastNwDecisionBySymbol[symbol] = $"Waiting: {distancePct:F2}% above NW Low";
+            _lastNwTouchDecisionBySymbol.TryRemove(symbol, out _);
             return false;
         }
         if (!PassesEntryGates(symbol, out _, nwTouchMode: true))
@@ -3375,9 +3428,10 @@ public partial class SimulatedBroker
         // Prevents one misfiring strategy from consuming the full daily budget.
         if (!IsSwingStrategy(strategyTag) && IsStrategyAtDailyLimit(strategyTag))
         {
+            int strategyDailyCap = GetStrategyDailyCap(strategyTag);
             RecordBlock(symbol, "STRAT_LIMIT",
-                $"{GetStrategyFamily(strategyTag)} cap {MAX_TRADES_PER_STRATEGY}");
-            LogMessage($"[STRAT LIMIT] {strategyTag} {symbol} blocked — {GetStrategyFamily(strategyTag)} hit {MAX_TRADES_PER_STRATEGY} trades today");
+                $"{GetStrategyFamily(strategyTag)} cap {strategyDailyCap}");
+            LogMessage($"[STRAT LIMIT] {strategyTag} {symbol} blocked — {GetStrategyFamily(strategyTag)} hit {strategyDailyCap} trades today");
             return false;
         }
 
@@ -3591,8 +3645,16 @@ public partial class SimulatedBroker
         lock (_lock)
         {
             _dailyEntryCount[symbol] = _dailyEntryCount.GetValueOrDefault(symbol) + 1;
-            _recentEntryTimesUtc.Enqueue(entryAttemptUtc);
-            GetRollingHourEntryCountLocked(entryAttemptUtc);
+            if (isNwBand)
+            {
+                _recentNwEntryTimesUtc.Enqueue(entryAttemptUtc);
+                GetRollingNwHourEntryCountLocked(entryAttemptUtc);
+            }
+            else
+            {
+                _recentEntryTimesUtc.Enqueue(entryAttemptUtc);
+                GetRollingHourEntryCountLocked(entryAttemptUtc);
+            }
             DateTime entryEt = GetEasternTime();
             _currentTradeHour = new DateTime(
                 entryEt.Year, entryEt.Month, entryEt.Day, entryEt.Hour, 0, 0);
@@ -4331,8 +4393,10 @@ public partial class SimulatedBroker
         _manualResumeOverride = false;
         _tradesToday = 0;
         _tradesThisHour = 0;
+        _nwTradesThisHour = 0;
         _currentTradeHour = DateTime.MinValue;
         _recentEntryTimesUtc.Clear();
+        _recentNwEntryTimesUtc.Clear();
         _winCount = 0;
         _lossCount = 0;
         _consecutiveLosses = 0;
@@ -4411,10 +4475,13 @@ public partial class SimulatedBroker
         try
         {
             List<DateTime> recentEntryTimes;
+            List<DateTime> recentNwEntryTimes;
             lock (_lock)
             {
                 GetRollingHourEntryCountLocked(DateTime.UtcNow);
+                GetRollingNwHourEntryCountLocked(DateTime.UtcNow);
                 recentEntryTimes = _recentEntryTimesUtc.ToList();
+                recentNwEntryTimes = _recentNwEntryTimesUtc.ToList();
             }
 
             var json = JsonSerializer.Serialize(new BotPersistData
@@ -4431,8 +4498,10 @@ public partial class SimulatedBroker
                 LastTradeWasLoss = _lastTradeWasLoss,
                 DailyEntryCount = _dailyEntryCount,
                 TradesThisHour = _tradesThisHour,
+                NwTradesThisHour = _nwTradesThisHour,
                 TradeHourSlot = _currentTradeHour,
                 RecentEntryTimesUtc = recentEntryTimes,
+                RecentNwEntryTimesUtc = recentNwEntryTimes,
                 StrategyTradeCount = _strategyTradeCount.ToDictionary(kv => kv.Key, kv => kv.Value),
                 CompletedTrades = _completedTrades.ToList(),
                 LastVolumeResetDate = _lastVolumeResetEt
@@ -4496,6 +4565,7 @@ public partial class SimulatedBroker
             lock (_lock)
             {
                 _recentEntryTimesUtc.Clear();
+                _recentNwEntryTimesUtc.Clear();
                 foreach (DateTime entryTime in data.RecentEntryTimesUtc ?? new List<DateTime>())
                 {
                     DateTime utc = entryTime.Kind == DateTimeKind.Utc
@@ -4503,6 +4573,14 @@ public partial class SimulatedBroker
                         : entryTime.ToUniversalTime();
                     if (utc > DateTime.UtcNow.AddHours(-1) && utc <= DateTime.UtcNow.AddMinutes(1))
                         _recentEntryTimesUtc.Enqueue(utc);
+                }
+                foreach (DateTime entryTime in data.RecentNwEntryTimesUtc ?? new List<DateTime>())
+                {
+                    DateTime utc = entryTime.Kind == DateTimeKind.Utc
+                        ? entryTime
+                        : entryTime.ToUniversalTime();
+                    if (utc > DateTime.UtcNow.AddHours(-1) && utc <= DateTime.UtcNow.AddMinutes(1))
+                        _recentNwEntryTimesUtc.Enqueue(utc);
                 }
 
                 // One-time compatibility with pre-queue state files: entries
@@ -4521,7 +4599,21 @@ public partial class SimulatedBroker
                             _recentEntryTimesUtc.Enqueue(DateTime.UtcNow);
                     }
                 }
+                if (_recentNwEntryTimesUtc.Count == 0
+                    && data.NwTradesThisHour > 0
+                    && data.TradeHourSlot != DateTime.MinValue)
+                {
+                    DateTime nowEt = GetEasternTime();
+                    DateTime currentEtHour = new DateTime(
+                        nowEt.Year, nowEt.Month, nowEt.Day, nowEt.Hour, 0, 0);
+                    if (data.TradeHourSlot == currentEtHour)
+                    {
+                        for (int i = 0; i < data.NwTradesThisHour; i++)
+                            _recentNwEntryTimesUtc.Enqueue(DateTime.UtcNow);
+                    }
+                }
                 GetRollingHourEntryCountLocked(DateTime.UtcNow);
+                GetRollingNwHourEntryCountLocked(DateTime.UtcNow);
             }
             if (data.TradeHourSlot != DateTime.MinValue) _currentTradeHour = data.TradeHourSlot;
             if (data.CompletedTrades?.Count > 0)
@@ -4581,7 +4673,7 @@ public partial class SimulatedBroker
             }
 
             LogMessage($"[RESUME] State file: {primaryPath}");
-            LogMessage($"[RESUME] Loaded {_positions.Count} positions | PnL={_totalRealizedPnL:C2} | Trades today={_tradesToday} | Wins={_winCount} Losses={_lossCount} | ThisHour={_tradesThisHour}");
+            LogMessage($"[RESUME] Loaded {_positions.Count} positions | PnL={_totalRealizedPnL:C2} | Trades today={_tradesToday} | Wins={_winCount} Losses={_lossCount} | OR-hour={_tradesThisHour} NW-hour={_nwTradesThisHour}");
             LoadConfig();
             CheckDailyReset();
             _needsReconciliation = true;
@@ -5440,6 +5532,8 @@ public partial class SimulatedBroker
             NW_BANDWIDTH = GetD("NW_BANDWIDTH", NW_BANDWIDTH);
             NW_MULT = GetD("NW_MULT", NW_MULT);
             NW_STOP_LOSS_PCT = GetD("NW_STOP_LOSS_PCT", NW_STOP_LOSS_PCT);
+            NW_MAX_TRADES_PER_HOUR = Math.Max(0, GetI("NW_MAX_TRADES_PER_HOUR", NW_MAX_TRADES_PER_HOUR));
+            NW_MAX_TRADES_PER_DAY = Math.Max(0, GetI("NW_MAX_TRADES_PER_DAY", NW_MAX_TRADES_PER_DAY));
             EARLY_PATTERN_ENTRY_ENABLED = GetB("EARLY_PATTERN_ENTRY", EARLY_PATTERN_ENTRY_ENABLED);
             PATTERN_MIN_SCORE = GetI("PATTERN_MIN_SCORE", PATTERN_MIN_SCORE);
             INTRABAR_SIGNAL_COOLDOWN_SECONDS = GetI("INTRABAR_SIGNAL_COOLDOWN_SECONDS", INTRABAR_SIGNAL_COOLDOWN_SECONDS);
@@ -5503,7 +5597,7 @@ public partial class SimulatedBroker
             Console.WriteLine($"[CONFIG] Loaded from {CONFIG_FILE}");
             Console.WriteLine($"[CONFIG] Effective: budget={TOTAL_BUDGET:F0}, position={POSITION_SIZE:F0}, " +
                               $"NW={NW_TIMEFRAME_MINUTES}m/{NW_LOOKBACK}/{NW_BANDWIDTH:F1}/{NW_MULT:F1}, " +
-                              $"day/hour/strategyCap={MAX_TRADES_PER_DAY}/{MAX_TRADES_PER_HOUR}/{MAX_TRADES_PER_STRATEGY}, " +
+                              $"day/OR-hour/NW-hour/NW-day/strategyCap={MAX_TRADES_PER_DAY}/{MAX_TRADES_PER_HOUR}/{NW_MAX_TRADES_PER_HOUR}/{NW_MAX_TRADES_PER_DAY}/{MAX_TRADES_PER_STRATEGY}, " +
                               $"consecutiveLossCap={MAX_CONSECUTIVE_LOSSES}, firstEntry={MIN_ENTRY_MINUTES_AFTER_OPEN}m");
             if (string.IsNullOrWhiteSpace(EffectiveConfigPassword()))
                 Console.WriteLine("[SECURITY] BOT_CONFIG_PASSWORD is not set; dashboard mutation endpoints are disabled.");
@@ -5642,6 +5736,8 @@ public partial class SimulatedBroker
             $"\"NW_BANDWIDTH\":{NW_BANDWIDTH:F2}",
             $"\"NW_MULT\":{NW_MULT:F2}",
             $"\"NW_STOP_LOSS_PCT\":{NW_STOP_LOSS_PCT:F4}",
+            $"\"NW_MAX_TRADES_PER_HOUR\":{NW_MAX_TRADES_PER_HOUR}",
+            $"\"NW_MAX_TRADES_PER_DAY\":{NW_MAX_TRADES_PER_DAY}",
             $"\"EARLY_PATTERN_ENTRY\":{(EARLY_PATTERN_ENTRY_ENABLED ? "true" : "false")}",
             $"\"PATTERN_MIN_SCORE\":{PATTERN_MIN_SCORE}",
             $"\"INTRABAR_SIGNAL_COOLDOWN_SECONDS\":{INTRABAR_SIGNAL_COOLDOWN_SECONDS}",
@@ -5981,6 +6077,8 @@ public partial class SimulatedBroker
                         NW_BANDWIDTH = GetD("NW_BANDWIDTH", NW_BANDWIDTH);
                         NW_MULT = GetD("NW_MULT", NW_MULT);
                         NW_STOP_LOSS_PCT = GetD("NW_STOP_LOSS_PCT", NW_STOP_LOSS_PCT);
+                        NW_MAX_TRADES_PER_HOUR = Math.Max(0, GetI("NW_MAX_TRADES_PER_HOUR", NW_MAX_TRADES_PER_HOUR));
+                        NW_MAX_TRADES_PER_DAY = Math.Max(0, GetI("NW_MAX_TRADES_PER_DAY", NW_MAX_TRADES_PER_DAY));
                         EARLY_PATTERN_ENTRY_ENABLED = GetB("EARLY_PATTERN_ENTRY", EARLY_PATTERN_ENTRY_ENABLED);
                         PATTERN_MIN_SCORE = GetI("PATTERN_MIN_SCORE", PATTERN_MIN_SCORE);
                         INTRABAR_SIGNAL_COOLDOWN_SECONDS = GetI("INTRABAR_SIGNAL_COOLDOWN_SECONDS", INTRABAR_SIGNAL_COOLDOWN_SECONDS);
@@ -6510,10 +6608,12 @@ public partial class SimulatedBroker
 
             decimal unrealizedPnl = 0m;
             int rollingHourTrades;
+            int rollingNwHourTrades;
             lock (_lock)
             {
                 foreach (var p in _positions.Values) unrealizedPnl += p.UnrealizedPnL(p.CurrentPrice);
                 rollingHourTrades = GetRollingHourEntryCountLocked(DateTime.UtcNow);
+                rollingNwHourTrades = GetRollingNwHourEntryCountLocked(DateTime.UtcNow);
             }
             decimal totalEquityPnl = _totalRealizedPnL + unrealizedPnl;
             decimal sizeMultiplier = GetDynamicSizeMultiplier();
@@ -6543,6 +6643,7 @@ public partial class SimulatedBroker
             __sb.AppendFormat("\"trades\":{0},", _tradesToday);
             __sb.AppendFormat("\"maxTrades\":{0},", MAX_TRADES_PER_DAY);
             __sb.AppendFormat("\"rollingHourTrades\":{0},", rollingHourTrades);
+            __sb.AppendFormat("\"rollingNwHourTrades\":{0},", rollingNwHourTrades);
             __sb.AppendFormat("\"wins\":{0},", _winCount);
             __sb.AppendFormat("\"losses\":{0},", _lossCount);
             __sb.AppendFormat("\"wr\":{0:F1},", wr);
@@ -6751,7 +6852,8 @@ public partial class SimulatedBroker
                 $"MinHold:{MIN_HOLD_SECONDS / 60}min  Risk:{RISK_PCT * 100:F0}%/trade  " +
                 $"MaxLoss:{MAX_LOSS_PER_TRADE:C0}  ATRTrail:{ATR_TRAIL_MULT}x  " +
                 $"ORBWindow:{ORB_MINUTES}min  VolExp:{VOL_EXPAND_MULT}x  " +
-                $"Strategies: non-NW OR router | NW independent {NW_TIMEFRAME_MINUTES}m");
+                $"Strategies: non-NW OR router | NW independent {NW_TIMEFRAME_MINUTES}m " +
+                $"({NW_MAX_TRADES_PER_HOUR}/rolling-hour, {NW_MAX_TRADES_PER_DAY}/day)");
             sb.AppendLine(new string('─', W));
 
             sb.AppendLine("  RECENT TRADES");
@@ -7521,11 +7623,22 @@ public partial class SimulatedBroker
         return IsScalpStrategy(strategyTag) ? 0.15m : decimal.MinValue;
     }
 
+    private int GetStrategyDailyCap(string strategyTag)
+    {
+        return strategyTag.StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase)
+            ? NW_MAX_TRADES_PER_DAY
+            : MAX_TRADES_PER_STRATEGY;
+    }
+
     private bool IsStrategyAtDailyLimit(string strategyTag)
     {
-        if (MAX_TRADES_PER_STRATEGY <= 0) return false; // disabled
+        int strategyDailyCap = GetStrategyDailyCap(strategyTag);
+        if (strategyDailyCap <= 0) return false; // disabled
         string family = GetStrategyFamily(strategyTag);
-        return _strategyTradeCount.GetValueOrDefault(family) >= MAX_TRADES_PER_STRATEGY;
+        int filled = _strategyTradeCount.GetValueOrDefault(family);
+        int pending = _pendingStrategyTag?.Values.Count(tag =>
+            string.Equals(GetStrategyFamily(tag), family, StringComparison.OrdinalIgnoreCase)) ?? 0;
+        return filled + pending >= strategyDailyCap;
     }
 
     private void IncrementStrategyCount(string strategyTag)
