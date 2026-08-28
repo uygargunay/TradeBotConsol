@@ -1014,7 +1014,7 @@ public class SimulatedBroker : IBroker
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
             var fromAddress = new MailAddress("uygargunay@gmail.com", "TradeBot Live");
             var toAddress = new MailAddress("uygargunay@gmail.com");
-            const string fromPassword = "sznd kafk nhec skqh";
+            string fromPassword = Environment.GetEnvironmentVariable("BOT_EMAIL_PASS") ?? "";
 
             var smtp = new SmtpClient
             {

@@ -502,8 +502,9 @@ public partial class SimulatedBroker
     }
 
     // ══════════════════════════════════════════════════════════
-    //  IMPROVED PassesDirectionalQualityGate
-    //  Adds: order flow check, volatility check, regime velocity
+    //  Additional non-NW safety gates: time window, volatility and regime velocity.
+    //  NW is intentionally exempt in OpenPosition because its envelope touch is
+    //  a complete, independent reversal signal.
     // ══════════════════════════════════════════════════════════
     private bool PassesEnhancedDirectionalGates(string symbol, List<Candle> candles,
         bool isShort, string strategyTag, decimal price, int minutesSinceOpen)
@@ -539,25 +540,6 @@ public partial class SimulatedBroker
         {
             LogMessage($"[REGIME VEL] {strategyTag} {symbol} SHORT blocked — SPY surging");
             return false;
-        }
-
-        // 4. Order flow confirmation (for trend-following only)
-        bool isTrend = strategyTag.StartsWith("SCALP_ORB_", StringComparison.OrdinalIgnoreCase)
-                    || strategyTag.StartsWith("MOMENTUM_", StringComparison.OrdinalIgnoreCase)
-                    || strategyTag.StartsWith("SCALP_BREAKOUT_", StringComparison.OrdinalIgnoreCase)
-                    || strategyTag.StartsWith("GAP_GO_", StringComparison.OrdinalIgnoreCase);
-        if (isTrend)
-        {
-            if (!isShort && !HasBullishOrderFlow(symbol, price))
-            {
-                LogMessage($"[OFI GATE] {strategyTag} {symbol} LONG blocked — bearish order flow (price at bid)");
-                return false;
-            }
-            if (isShort && !HasBearishOrderFlow(symbol, price))
-            {
-                LogMessage($"[OFI GATE] {strategyTag} {symbol} SHORT blocked — bullish order flow (price at ask)");
-                return false;
-            }
         }
 
         return true;
