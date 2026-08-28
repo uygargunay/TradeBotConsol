@@ -18,7 +18,11 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="bin\Debug\net8.0\index.html" />
+    <!-- The bot reads both files from AppDomain.BaseDirectory at runtime.
+         PreserveNewest seeds clean Debug/Release/publish outputs without
+         overwriting a newer configuration saved from the live dashboard. -->
+    <None Update="index.html" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Update="bot-config.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

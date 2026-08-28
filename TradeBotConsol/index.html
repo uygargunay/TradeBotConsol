@@ -1776,6 +1776,8 @@
                                     <th data-k="s">Symbol</th>
                                     <th data-k="price" class="tr">Price</th>
                                     <th data-k="chg" class="tr">Chg %</th>
+                                    <th data-k="nwHi" class="tr" title="Nadaraya-Watson envelope high from completed regular-session bars (timeframe set in Settings)">NW Hi</th>
+                                    <th data-k="nwLo" class="tr" title="Nadaraya-Watson envelope low from completed regular-session bars (timeframe set in Settings)">NW Lo</th>
                                     <th data-k="vwap" class="tr">VWAP</th>
                                     <th data-k="sma20" class="tr">SMA20</th>
                                     <th data-k="sma50" class="tr">SMA50</th>
@@ -1787,8 +1789,6 @@
                                     <th data-k="atr" class="tr">ATR %</th>
                                     <th data-k="orbHi" class="tr">ORB Hi</th>
                                     <th data-k="orbLo" class="tr">ORB Lo</th>
-                                    <th data-k="nwHi" class="tr" title="Nadaraya-Watson envelope high from completed regular-session bars (timeframe set in Settings)">NW Hi</th>
-                                    <th data-k="nwLo" class="tr" title="Nadaraya-Watson envelope low from completed regular-session bars (timeframe set in Settings)">NW Lo</th>
                                     <th data-k="trend" class="tc">Trend</th>
                                     <th data-k="abvVwap" class="tc">VW↕</th>
                                     <th data-k="sig" class="tc">Signal</th>
@@ -2423,8 +2423,8 @@
                 const gC = w.gap >= 0 ? 'g' : 'r';
                 const oHi = w.orbHi > 0 ? `$${w.orbHi.toFixed(2)}` : '<span class="m">—</span>';
                 const oLo = w.orbLo > 0 ? `$${w.orbLo.toFixed(2)}` : '<span class="m">—</span>';
-                const nwNeed = (CFG && CFG.NW_LOOKBACK) ? CFG.NW_LOOKBACK : 500;
-                const nwTf = (CFG && CFG.NW_TIMEFRAME_MINUTES) ? CFG.NW_TIMEFRAME_MINUTES : 60;
+                const nwNeed = (CFG && CFG.NW_LOOKBACK) ? CFG.NW_LOOKBACK : 250;
+                const nwTf = (CFG && CFG.NW_TIMEFRAME_MINUTES) ? CFG.NW_TIMEFRAME_MINUTES : 30;
                 const nwLoading = w.nwBars > 0 ? `<span class="m" title="NW history loading: ${w.nwBars}/${nwNeed} completed ${nwTf}-min bars">${w.nwBars}/${nwNeed}</span>` : '<span class="m">—</span>';
                 const nwHiTxt = w.nwHi > 0 ? `$${w.nwHi.toFixed(2)}` : nwLoading;
                 const nwLoTxt = w.nwLo > 0 ? `$${w.nwLo.toFixed(2)}` : nwLoading;
@@ -2435,10 +2435,15 @@
                 const s200C = w.sma200 > 0 ? (w.price > w.sma200 ? 'g' : w.price < w.sma200 ? 'r' : 'm') : 'm';
                 const atrC = w.atr >= 0.4 ? 'g' : w.atr >= 0.2 ? 'y' : 'm';
                 const isSelected = w.s === selectedSym;
+                const nwTouch = w.nwLo > 0 && w.last > 0 && w.pxSrc === 'last' && w.last <= w.nwLo;
+                const nwDecision = w.nwWhy && (/^(TOUCH|ENTRY|Last)/).test(w.nwWhy);
+                const whyText = (nwTouch || nwDecision) && w.nwWhy ? w.nwWhy : (w.why || '—');
                 return `<tr class="${w.hot ? 'hot' : ''} ${isSelected ? 'selected' : ''}" onclick="onSymClick('${w.s}')">
                                                                                                                                       <td><div class="sym-cell">${w.hot ? '<span class="hot-arrow">►</span>' : ''}<span>${w.s}</span></div></td>
                                                                                                                                       <td class="tr ${pC}" title="${priceTitle(w)}">$${w.price.toFixed(2)}${priceSourceBadge(w)}</td>
                                                                                                                                       <td class="tr ${(w.chg ?? 0) >= 0 ? 'g' : 'r'}" style="font-weight:700">${w.chg != null && w.chg !== 0 ? (w.chg >= 0 ? '+' : '') + w.chg.toFixed(2) + '%' : '<span class="m">—</span>'}</td>
+                                                                                                                                      <td class="tr m" title="${w.nwWhy || ''}">${nwHiTxt}</td>
+                                                                                                                                      <td class="tr m" title="${w.nwWhy || ''}">${nwLoTxt}</td>
                                                                                                                                       <td class="tr m">$${w.vwap > 0 ? w.vwap.toFixed(2) : '—'}</td>
                                                                                                                                       <td class="tr ${s20C}">$${w.sma20 > 0 ? w.sma20.toFixed(2) : '—'}</td>
                                                                                                                                       <td class="tr ${s50C}">$${w.sma50 > 0 ? w.sma50.toFixed(2) : '—'}</td>
@@ -2450,12 +2455,10 @@
                                                                                                                                       <td class="tr ${atrC}">${w.atr.toFixed(2)}%</td>
                                                                                                                                       <td class="tr m">${oHi}</td>
                                                                                                                                       <td class="tr m">${oLo}</td>
-                                                                                                                                      <td class="tr m">${nwHiTxt}</td>
-                                                                                                                                      <td class="tr m">${nwLoTxt}</td>
                                                                                                                                       <td class="tc">${trH}</td>
                                                                                                                                       <td class="tc"><span class="led" style="background:${ledC}"></span></td>
                                                                                                                                       <td class="tc">${sigBadge(w.sig)}</td>
-                                                                                                                                      <td class="tc m" title="${w.why || ''}">${w.why || '—'}</td>
+                                                                                                                                      <td class="tc m" title="${whyText}">${whyText}</td>
                                                                                                                                     </tr>`;
             }).join('');
         }
@@ -2684,7 +2687,13 @@
             regimeBadge(d.regime);
 
             const dot = $('sdot'), stxt = $('stxt');
-            if (d.halted) { dot.className = 'dot halt'; stxt.textContent = 'HALTED'; stxt.style.color = 'var(--red)'; }
+            stxt.title = '';
+            if (d.halted) {
+                dot.className = 'dot halt';
+                stxt.textContent = d.haltReason ? `HALTED · ${d.haltReason.replaceAll('_', ' ')}` : 'HALTED';
+                stxt.title = d.haltReason || '';
+                stxt.style.color = 'var(--red)';
+            }
             else if (d.ddBreached) { dot.className = 'dot wait'; stxt.textContent = 'DD BLOCK'; stxt.style.color = 'var(--orange)'; }
             else if (!d.reconciled) { dot.className = 'dot wait'; stxt.textContent = 'Reconciling…'; stxt.style.color = 'var(--yellow)'; }
             else { dot.className = 'dot live'; stxt.textContent = 'LIVE'; stxt.style.color = 'var(--green)'; }
@@ -2756,7 +2765,7 @@
 
             // Scanner — only rebuild if watchlist data actually changed
             rawWL = d.watchlist;
-            const scanFp = d.watchlist.map(w => w.s + w.price.toFixed(2) + w.rsi.toFixed(0) + (w.sma20 || 0).toFixed(0) + (w.sma50 || 0).toFixed(0) + (w.why || '')).join('|');
+            const scanFp = d.watchlist.map(w => w.s + w.price.toFixed(2) + w.rsi.toFixed(0) + (w.sma20 || 0).toFixed(0) + (w.sma50 || 0).toFixed(0) + (w.nwHi || 0).toFixed(2) + (w.nwLo || 0).toFixed(2) + (w.nwWhy || '') + (w.why || '')).join('|');
             if (scanFp !== _prevScannerFingerprint) {
                 _prevScannerFingerprint = scanFp;
                 renderScanner();
@@ -2921,13 +2930,14 @@
             MAX_POSITIONS: 4,
             POSITION_SIZE: 750,
             MAX_LOSS_PER_TRADE: 35,
-            MAX_TRADES_PER_DAY: 8,
+            MAX_TRADES_PER_DAY: 4,
+            MAX_TRADES_PER_HOUR: 2,
             DAILY_PROFIT_GOAL: 120,
-            MAX_DAILY_LOSS: -70,
+            MAX_DAILY_LOSS: -40,
             RISK_PCT: 0.004,
             COMMISSION_PER_SIDE: 1,
             MAX_QTY_SANITY: 500,
-            MAX_CONSECUTIVE_LOSSES: 3,
+            MAX_CONSECUTIVE_LOSSES: 2,
             UNREALIZED_DD_HALT: -50,
             DYNAMIC_SIZING: true,
             MAX_TRADES_PER_STRATEGY: 2,
@@ -2938,7 +2948,7 @@
             VIX_NO_LONG_THRESHOLD: 35,
             // Strategy
             MIN_HOLD_SECONDS: 90,
-            MIN_ENTRY_MINUTES_AFTER_OPEN: 6,
+            MIN_ENTRY_MINUTES_AFTER_OPEN: 15,
             COOLDOWN_SECONDS: 600,
             SWING_MODE_ENABLED: false,
             EOD_LIQUIDATE_ENABLED: true,
@@ -2953,18 +2963,18 @@
             SHORT_ATR_TRAIL: 1.20,
             HARD_STOP_ATR_MULT: 1.35,
             MIN_STOP_DISTANCE: 0.10,
-            VWAP_CONFIRM_BARS: 1,
+            VWAP_CONFIRM_BARS: 2,
             MIN_RR_RATIO: 1.10,
             ALLOW_SHORTS: true,
-            MIDDAY_FILTER_ENABLED: false,
+            MIDDAY_FILTER_ENABLED: true,
             MIN_SETUP_SCORE: 50,
             // Filters & Signals
-            MIN_ATR_PCT: 0.0012,
-            VOL_EXPAND_MULT: 1.2,
+            MIN_ATR_PCT: 0.0018,
+            VOL_EXPAND_MULT: 1.3,
             GAP_GO_MIN_PCT: 0.012,
             GAP_GO_REL_VOL: 1.3,
-            RSI_LONG_MIN: 54.0,
-            RSI_SHORT_MAX: 46.0,
+            RSI_LONG_MIN: 58.0,
+            RSI_SHORT_MAX: 42.0,
             RSI_OVERSOLD: 35.0,
             RSI_OVERBOUGHT: 65.0,
             STRATEGY_ORB: true,
@@ -2978,14 +2988,17 @@
             STRATEGY_CANDLE_PATTERNS: true,
             STRATEGY_MICRO_PULLBACK: true,
             STRATEGY_NADARAYA_WATSON: true,
-            NW_TIMEFRAME_MINUTES: 60,
-            NW_LOOKBACK: 500,
-            NW_BANDWIDTH: 8.0,
-            NW_MULT: 3.0,
+            NW_TIMEFRAME_MINUTES: 30,
+            NW_LOOKBACK: 250,
+            NW_BANDWIDTH: 6.0,
+            NW_MULT: 2.5,
+            NW_STOP_LOSS_PCT: 0.03,
+            NW_MAX_TRADES_PER_HOUR: 2,
+            NW_MAX_TRADES_PER_DAY: 2,
             EARLY_PATTERN_ENTRY: true,
-            PATTERN_MIN_SCORE: 65,
-            INTRABAR_SIGNAL_COOLDOWN_SECONDS: 20,
-            FAST_VOL_MULT: 1.2,
+            PATTERN_MIN_SCORE: 68,
+            INTRABAR_SIGNAL_COOLDOWN_SECONDS: 30,
+            FAST_VOL_MULT: 1.3,
             // IBKR Data Lines
             DATA_LINES_PER_SYMBOL: 1,
             MAX_MARKET_DATA_LINES: 120,
@@ -3067,17 +3080,18 @@
                                                                                                                                         <div class="sm-section-title">P&amp;L Limits</div>
                                                                                                                                         <div class="sm-grid">
                                                                                                                                             ${field('DAILY_PROFIT_GOAL', 'Daily Profit Goal ($)', 'number', CFG.DAILY_PROFIT_GOAL, 'Target profit to halt new entries')}
-                                                                                                                                            ${field('MAX_DAILY_LOSS', 'Max Daily Loss ($)', 'number', CFG.MAX_DAILY_LOSS, 'Bot halts when this loss is hit (stored as positive)')}
+                                                                                                                                            ${field('MAX_DAILY_LOSS', 'Max Daily Loss ($)', 'number', CFG.MAX_DAILY_LOSS, 'Negative PnL threshold that halts new entries')}
                                                                                                                                             ${field('MAX_LOSS_PER_TRADE', 'Max Loss / Trade ($)', 'number', CFG.MAX_LOSS_PER_TRADE, 'Dollar stop per individual trade')}
                                                                                                                                             ${field('RISK_PCT', 'Risk % of Budget', 'number', CFG.RISK_PCT, 'Fractional risk per trade (e.g. 0.015 = 1.5%)')}
                                                                                                                                             ${field('MAX_TRADES_PER_DAY', 'Max Trades / Day', 'number', CFG.MAX_TRADES_PER_DAY, 'Hard cap on daily trade count')}
+                                                                                                                                            ${field('MAX_TRADES_PER_HOUR', 'Non-NW Trades / Rolling Hour', 'number', CFG.MAX_TRADES_PER_HOUR, 'Rolling-hour cap for the ordinary OR-router strategies. NW uses its own independent cap.')}
                                                                                                                                         </div>
                                                                                                                                     </div>
                                                                                                                                     <div class="sm-section">
                                                                                                                                         <div class="sm-section-title">Advanced Risk Management</div>
                                                                                                                                         <div class="sm-grid">
                                                                                                                                             ${field('UNREALIZED_DD_HALT', 'Unrealized DD Halt ($)', 'number', CFG.UNREALIZED_DD_HALT, 'Block new entries when realized+unrealized PnL breaches this (negative value)')}
-                                                                                                                                            ${field('MAX_TRADES_PER_STRATEGY', 'Max Trades / Strategy', 'number', CFG.MAX_TRADES_PER_STRATEGY, 'Cap per strategy family per day (0=unlimited)')}
+                                                                                                                                            ${field('MAX_TRADES_PER_STRATEGY', 'Non-NW Trades / Strategy', 'number', CFG.MAX_TRADES_PER_STRATEGY, 'Daily cap for each ordinary strategy family (0=unlimited). NW uses its own daily cap.')}
                                                                                                                                             ${field('MAX_TRADES_PER_SYMBOL_PER_DAY', 'Max Trades / Symbol', 'number', CFG.MAX_TRADES_PER_SYMBOL_PER_DAY, 'Cap per ticker per day so one cheap name cannot dominate the bot')}
                                                                                                                                             ${field('MAX_CONSECUTIVE_LOSSES', 'Max Consecutive Losses', 'number', CFG.MAX_CONSECUTIVE_LOSSES, 'Halt trading after N straight losses')}
                                                                                                                                             ${field('VIX_REDUCE_THRESHOLD', 'VIX Reduce Threshold', 'number', CFG.VIX_REDUCE_THRESHOLD, 'Halve position size above this VIX level')}
@@ -3193,7 +3207,7 @@
                                                                                                                                                 <span class="toggle-slider"></span>
                                                                                                                                             </label>
                                                                                                                                         </div>
-                                                                                                                                        ${toggleField('MIDDAY_FILTER_ENABLED', 'Avoid Midday Chop', 'When enabled, blocks new non-NW scalp entries from 11:45 AM to 1:05 PM ET unless the market regime is trending. Disabled in the OR profile so a valid strategy signal can trade during this window.')}
+                                                                                                                                        ${toggleField('MIDDAY_FILTER_ENABLED', 'Avoid Midday Chop', 'Blocks new non-NW scalp entries from 11:45 AM to 1:05 PM ET unless the market regime is trending. NW remains independent and exempt.')}
                                                                                                                                     </div>
                                                                                                                                     <div class="sm-section">
                                                                                                                                         <div class="sm-section-title">Enabled Strategies · OR Mode</div>
@@ -3211,23 +3225,34 @@
                                                                                                                                             ${toggleField('STRATEGY_OUTSIDE_CANDLE', 'Outside Candle', 'Trades bullish or bearish outside-candle reversals.')}
                                                                                                                                             ${toggleField('STRATEGY_CANDLE_PATTERNS', 'Candle Patterns', 'Trades the multi-pattern candlestick engine when its own score passes.')}
                                                                                                                                             ${toggleField('STRATEGY_MICRO_PULLBACK', 'Micro Pullback', 'Trades shallow pullbacks after a strong impulse bar.')}
-                                                                                                                                            ${toggleField('STRATEGY_NADARAYA_WATSON', 'Nadaraya-Watson Bands', 'Buys a live touch of the lower hourly band and exits the long at the upper band; it never opens a short at the upper band.')}
                                                                                                                                         </div>
                                                                                                                                     </div>
                                                                                                                                     <div class="sm-section">
-                                                                                                                                        <div class="sm-section-title">Pattern &amp; Fast-Entry Controls</div>
-                                                                                                                                        <div class="sm-grid">
-                                                                                                                                            ${field('PATTERN_MIN_SCORE', 'Pattern Min Score', 'number', CFG.PATTERN_MIN_SCORE, 'Minimum quality score before a candlestick pattern can trigger an entry')}
-                                                                                                                                            ${field('INTRABAR_SIGNAL_COOLDOWN_SECONDS', 'Intrabar Cooldown (sec)', 'number', CFG.INTRABAR_SIGNAL_COOLDOWN_SECONDS, 'Prevents repeated intrabar pattern re-triggers on the same symbol')}
-                                                                                                                                            ${field('FAST_VOL_MULT', 'Fast Vol Surge Mult', 'number', CFG.FAST_VOL_MULT, 'Short-term volume surge multiplier used by the pattern engine')}
+                                                                                                                                        <div class="sm-section-title">Independent Nadaraya-Watson Strategy</div>
+                                                                                                                                        <div style="background:rgba(188,140,255,.08);border:1px solid rgba(188,140,255,.28);border-radius:5px;padding:8px 10px;margin-bottom:10px;font-size:10px;color:var(--muted);line-height:1.6">
+                                                                                                                                            NW is evaluated separately on every fresh live LAST tick. A lower-band touch can submit its own long without confirmation from—or consuming the rolling-hour allowance of—the OR strategies. NW has its own hourly cap; account-level day, position, cash, spread and loss limits still apply.
+                                                                                                                                        </div>
+                                                                                                                                        ${toggleField('STRATEGY_NADARAYA_WATSON', 'Nadaraya-Watson Bands', 'Buys a fresh live LAST-price touch of the lower configured-timeframe band and exits the long at the upper band; it never opens a short at the upper band.')}
+                                                                                                                                        <div class="sm-grid" style="margin-top:10px">
                                                                                                                                             ${selectField('NW_TIMEFRAME_MINUTES', 'NW Timeframe', [
                 { value: 15, label: '15 min' },
                 { value: 30, label: '30 min' },
                 { value: 60, label: '1 hour' }
             ], CFG.NW_TIMEFRAME_MINUTES, 'Bar size for Nadaraya-Watson. 15/30-min bars pull a shorter IBKR history window than 1-hour, so a high Lookback may take longer to fully populate.')}
-                                                                                                                                            ${field('NW_LOOKBACK', 'NW Lookback (bars)', 'number', CFG.NW_LOOKBACK, 'Completed regular-session bars (at the selected NW Timeframe) used by Nadaraya-Watson. Standard endpoint setting = 500')}
+                                                                                                                                            ${field('NW_LOOKBACK', 'NW Lookback (bars)', 'number', CFG.NW_LOOKBACK, 'Completed regular-session bars used by the independent NW envelope. Current profile = 250.')}
                                                                                                                                             ${field('NW_BANDWIDTH', 'NW Bandwidth', 'number', CFG.NW_BANDWIDTH, 'Gaussian kernel bandwidth — larger = smoother centerline, fewer signals')}
                                                                                                                                             ${field('NW_MULT', 'NW Band Multiplier', 'number', CFG.NW_MULT, 'Band width = kernel MAE x this multiplier — larger = wider bands, fewer signals')}
+                                                                                                                                            ${field('NW_STOP_LOSS_PCT', 'NW Stop Loss (decimal)', 'number', CFG.NW_STOP_LOSS_PCT, 'Flat NW protective stop as a decimal. 0.03 = 3%.')}
+                                                                                                                                            ${field('NW_MAX_TRADES_PER_HOUR', 'NW Trades / Rolling Hour', 'number', CFG.NW_MAX_TRADES_PER_HOUR, 'Dedicated NW entry cap. Ordinary strategy trades do not consume it; 0 disables this NW-specific cap.')}
+                                                                                                                                            ${field('NW_MAX_TRADES_PER_DAY', 'NW Trades / Day', 'number', CFG.NW_MAX_TRADES_PER_DAY, 'Dedicated NW strategy-family cap. Account-wide Max Trades / Day still applies; 0 disables only this NW-specific cap.')}
+                                                                                                                                        </div>
+                                                                                                                                    </div>
+                                                                                                                                   <div class="sm-section">
+                                                                                                                                        <div class="sm-section-title">Pattern &amp; Fast-Entry Controls</div>
+                                                                                                                                        <div class="sm-grid">
+                                                                                                                                            ${field('PATTERN_MIN_SCORE', 'Pattern Min Score', 'number', CFG.PATTERN_MIN_SCORE, 'Minimum quality score before a candlestick pattern can trigger an entry')}
+                                                                                                                                            ${field('INTRABAR_SIGNAL_COOLDOWN_SECONDS', 'Intrabar Cooldown (sec)', 'number', CFG.INTRABAR_SIGNAL_COOLDOWN_SECONDS, 'Prevents repeated intrabar pattern re-triggers on the same symbol')}
+                                                                                                                                            ${field('FAST_VOL_MULT', 'Fast Vol Surge Mult', 'number', CFG.FAST_VOL_MULT, 'Short-term volume surge multiplier used by the pattern engine')}
                                                                                                                                         </div>
                                                                                                                                         <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
                                                                                                                                             <div class="sm-toggle-row">

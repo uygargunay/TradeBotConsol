@@ -17,12 +17,12 @@ public class IbClient : EWrapper, IBroker
     // 10000–19999 : live market data subscriptions  (reqMktData)
     // 20000–29999 : 1-min historical data requests  (reqHistoricalData, 1 min)
     // 30000–39999 : daily historical data requests  (reqHistoricalData, 1 day)
-    // 40000–49999 : 1-hour NW historical requests  (reqHistoricalData, 1 hour)
+    // 40000–49999 : dedicated NW timeframe historical requests
     // Using separate counters and ranges prevents reqId collisions between paths.
     private int _liveReqId = 10000;
     private int _histReqId = 20000;   // FIX #1: was sharing _liveReqId → collision risk
     private int _dailyReqId = 30000;
-    private int _hourlyReqId = 40000;  // dedicated 1-hour history for Nadaraya-Watson
+    private int _hourlyReqId = 40000;  // dedicated timeframe history for Nadaraya-Watson
 
     private readonly ConcurrentDictionary<int, string> _reqIdToSymbol = new();
     private readonly ConcurrentDictionary<string, int> _symToLiveReqId = new();
@@ -169,7 +169,7 @@ public class IbClient : EWrapper, IBroker
         };
 
         // Protective stop. For a normal bracket it waits for the target order
-        // to transmit the whole chain. For NW 1H trades targetPrice=0, so the
+        // to transmit the whole chain. For NW trades targetPrice=0, so the
         // stop itself is the final child and transmits the parent+stop atomically.
         int stopId = Interlocked.Increment(ref _currentOrderId);
         string ocaGroup = $"OCA_{symbol}_{parentId}";
@@ -366,8 +366,8 @@ public class IbClient : EWrapper, IBroker
         _client.reqHistoricalData(id, contract, "", "1 Y", "1 day", "TRADES", 1, 1, false, null);
     }
 
-    // ── HISTORICAL DATA REQUEST (1-hour bars, 1 year RTH) ──────────────────
-    // Dedicated feed for the Nadaraya-Watson 1-hour envelope. Keeping it
+    // ── HISTORICAL DATA REQUEST (dedicated NW timeframe, RTH) ──────────────
+    // Dedicated feed for the Nadaraya-Watson envelope. Keeping it
     // separate from the 1-minute buffer prevents the NW calculation from
     // silently collapsing to a 1-minute/15-minute indicator when the intraday
     // buffer is trimmed.

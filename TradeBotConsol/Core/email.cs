@@ -17,7 +17,12 @@ namespace TradeBotConsol.Core
                 ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
                 var fromAddress = new MailAddress("uygargunay@gmail.com", "TradeBot Live");
                 var toAddress = new MailAddress("uygargunay@gmail.com");
-                const string fromPassword = "sznd kafk nhec skqh";
+                string fromPassword = Environment.GetEnvironmentVariable("BOT_EMAIL_PASS")?.Trim() ?? "sznd kafk nhec skqh";
+                if (string.IsNullOrWhiteSpace(fromPassword))
+                {
+                    Console.WriteLine("[EMAIL] BOT_EMAIL_PASS is not configured; notification skipped.");
+                    return;
+                }
 
                 var smtp = new SmtpClient
                 {
