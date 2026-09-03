@@ -39,8 +39,10 @@ public interface IBroker
     void RequestDailyHistoricalData(string symbol);
     void RequestHourlyHistoricalData(string symbol, int timeframeMinutes);
     bool SupportsBrackets { get; }
-    void SubmitBracketOrder(string symbol, int qty, decimal entryPrice, TradeSide side,
-                            decimal stopPrice, decimal stopLimit, decimal targetPrice);
+    bool SubmitBracketOrder(string symbol, int qty, decimal entryPrice, TradeSide side,
+                            decimal stopPrice, decimal stopLimit, decimal targetPrice,
+                            bool useStopMarket = false,
+                            bool overridePercentageConstraints = false);
 }
 
 public enum TradeSide { Buy, Sell }
@@ -438,8 +440,10 @@ public partial class SimulatedBroker
     private readonly ConcurrentDictionary<string, bool> _pendingEntrySymbols = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTime> _pendingEntryCreatedUtc = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTime> _lastIntrabarSignalUtc = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DateTime> _entryOrderRejectionCooldownUntilUtc = new(StringComparer.OrdinalIgnoreCase);
 
     private const int PENDING_ENTRY_TIMEOUT_SECONDS = 120;
+    private const int ORDER_REJECTION_COOLDOWN_SECONDS = 600;
     private int _pendingEntryCount = 0;
 
     private readonly Dictionary<string, bool> _lastTradeWasLoss = new();
@@ -506,7 +510,7 @@ public partial class SimulatedBroker
     private const string EmailFrom = "uygargunay@gmail.com";
     private const string EmailTo = "uygargunay@gmail.com";
     private static readonly string EmailPassword =
-        Environment.GetEnvironmentVariable("BOT_EMAIL_PASS")?.Trim() ?? "sznd kafk nhec skqh";
+        Environment.GetEnvironmentVariable("BOT_EMAIL_PASS")?.Trim() ?? "";
 
     private static readonly Dictionary<string, string[]> DEFAULT_WATCHLIST_GROUPS =
         new(StringComparer.OrdinalIgnoreCase)
@@ -1078,6 +1082,46 @@ public partial class SimulatedBroker
         foreach (DateTime t in retained) queue.Enqueue(t);
     }
 
+    private bool TryGetEntryOrderRejectionCooldown(string symbol, out DateTime untilUtc)
+    {
+        untilUtc = DateTime.MinValue;
+        if (string.IsNullOrWhiteSpace(symbol)) return false;
+        if (!_entryOrderRejectionCooldownUntilUtc.TryGetValue(symbol, out untilUtc)) return false;
+        if (untilUtc > DateTime.UtcNow) return true;
+
+        _entryOrderRejectionCooldownUntilUtc.TryRemove(symbol, out _);
+        untilUtc = DateTime.MinValue;
+        return false;
+    }
+
+    private string GetOrderRejectionCooldownLabel(DateTime untilUtc)
+    {
+        DateTime untilEt = TimeZoneInfo.ConvertTimeFromUtc(
+            untilUtc.Kind == DateTimeKind.Utc ? untilUtc : DateTime.SpecifyKind(untilUtc, DateTimeKind.Utc),
+            Eastern);
+        return $"IBKR reject cooldown until {untilEt:HH:mm:ss} ET";
+    }
+
+    private void StartEntryOrderRejectionCooldown(string symbol, bool isNw, int errorCode, string reason)
+    {
+        DateTime untilUtc = DateTime.UtcNow.AddSeconds(ORDER_REJECTION_COOLDOWN_SECONDS);
+        _entryOrderRejectionCooldownUntilUtc[symbol] = untilUtc;
+
+        string label = GetOrderRejectionCooldownLabel(untilUtc);
+        string codeText = errorCode > 0 ? $"error {errorCode}" : "local validation";
+        RecordBlock(symbol, "IBKR_REJECT_COOLDOWN", $"{codeText}; {label}");
+        LogMessage($"[IBKR COOLDOWN] {symbol} {codeText} — {label}. {reason}");
+
+        if (isNw)
+        {
+            string decision = $"TOUCH blocked: {codeText}; {label}";
+            _lastNwDecisionBySymbol[symbol] = decision;
+            _lastNwTouchDecisionBySymbol[symbol] =
+                $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
+        }
+
+    }
+
     private string GetWatchlistReadiness(string symbol, bool nwTouchMode = false)
     {
         try
@@ -1086,6 +1130,8 @@ public partial class SimulatedBroker
             if (_haltTrading) return string.IsNullOrWhiteSpace(_haltReason) ? "Halted" : $"Halted: {_haltReason}";
             if (!_reconciled) return "Recon";
             if (!_manualResumeOverride && IsUnrealizedDrawdownBreached()) return "DD block";
+            if (TryGetEntryOrderRejectionCooldown(symbol, out DateTime rejectedUntilUtc))
+                return GetOrderRejectionCooldownLabel(rejectedUntilUtc);
 
             var nowEt = GetEasternTime();
             if (nowEt.DayOfWeek == DayOfWeek.Saturday || nowEt.DayOfWeek == DayOfWeek.Sunday) return "Closed";
@@ -1190,7 +1236,13 @@ public partial class SimulatedBroker
         _pendingEntryCreatedUtc.TryRemove(symbol, out DateTime submittedUtc);
         _pendingStrategyTag?.TryRemove(symbol, out _);
         _pendingInitialRisk.TryRemove(symbol, out _);
-        _pendingBracketChildren.TryRemove(symbol, out _);
+        if (_pendingBracketChildren.TryRemove(symbol, out var bracketIds))
+        {
+            if (bracketIds.stopId > 0)
+                _bracketExitReasonByOrderId.TryRemove(bracketIds.stopId, out _);
+            if (bracketIds.targetId > 0)
+                _bracketExitReasonByOrderId.TryRemove(bracketIds.targetId, out _);
+        }
 
         if (hadPending)
         {
@@ -1251,6 +1303,12 @@ public partial class SimulatedBroker
     {
         minutesSinceOpen = -1;
         ExpireStalePendingEntries();
+        if (TryGetEntryOrderRejectionCooldown(symbol, out DateTime rejectedUntilUtc))
+        {
+            string detail = GetOrderRejectionCooldownLabel(rejectedUntilUtc);
+            RecordBlock(symbol, "IBKR_REJECT_COOLDOWN", detail);
+            return false;
+        }
         if (_haltTrading)
         {
             // Previously silent — a stuck _haltTrading blocked every entry
@@ -3403,6 +3461,13 @@ public partial class SimulatedBroker
             LogMessage($"[PENDING] {strategyTag} {symbol} blocked — entry already pending");
             return false;
         }
+        if (TryGetEntryOrderRejectionCooldown(symbol, out DateTime rejectedUntilUtc))
+        {
+            string detail = GetOrderRejectionCooldownLabel(rejectedUntilUtc);
+            RecordBlock(symbol, "IBKR_REJECT_COOLDOWN", detail);
+            LogMessage($"[IBKR COOLDOWN] {strategyTag} {symbol} blocked — {detail}");
+            return false;
+        }
 
         if (!IsSwingStrategy(strategyTag) && !isNwBand)
         {
@@ -3536,7 +3601,8 @@ public partial class SimulatedBroker
             // after stopTrigger/target/risk were calculated, so the order still
             // used the old stop and a failed resized quantity left trade counters
             // incremented even though no order was submitted.
-            if (RealBroker != null && RealBroker.SupportsBrackets
+            if (!isNwBand
+                && RealBroker != null && RealBroker.SupportsBrackets
                 && IsStopPlacedAtKeyLevel(symbol, price, stopDist, isShort))
             {
                 stopDist *= 1.15m;
@@ -3666,12 +3732,33 @@ public partial class SimulatedBroker
             _marketData.TryGetValue(symbol, out var bracketCandles);
             decimal atrBracket = SafeATR(bracketCandles, 14);
 
+            Func<decimal, decimal> tickRound = p => p >= 1.0m
+                ? Math.Round(p, 2, MidpointRounding.AwayFromZero)
+                : Math.Round(p, 4, MidpointRounding.AwayFromZero);
+
+            decimal entryAdj = tickRound(price + (executionSide == TradeSide.Buy
+                ? Math.Max(atrBracket * 0.1m, price * 0.0005m)
+                : -Math.Max(atrBracket * 0.1m, price * 0.0005m)));
+
+            // NW's configured 3% stop is measured from the actual submitted parent
+            // price. The previous code measured it from the earlier signal price and
+            // then moved the parent, making the child >3% away before IBKR even checked
+            // the additional STP-LMT offset.
+            decimal bracketStopDistance = isNwBand
+                ? Math.Max(MIN_STOP_DISTANCE, entryAdj * NW_STOP_LOSS_PCT)
+                : stopDist;
+            decimal stopBasePrice = isNwBand ? entryAdj : price;
             decimal stopTrigger = executionIsShort
-                ? price + stopDist
-                : price - stopDist;
-            decimal stopLimitPrice = executionIsShort
-                ? stopTrigger + atrBracket * 0.5m
-                : stopTrigger - atrBracket * 0.5m;
+                ? stopBasePrice + bracketStopDistance
+                : stopBasePrice - bracketStopDistance;
+            decimal stopLimitPrice = isNwBand
+                ? 0m
+                : executionIsShort
+                    ? stopTrigger + atrBracket * 0.5m
+                    : stopTrigger - atrBracket * 0.5m;
+
+            if (isNwBand)
+                _pendingInitialRisk[symbol] = bracketStopDistance;
 
             // NW exits are dynamic: the upper band is recalculated from the
             // newest completed timeframe bar. Pass targetPrice=0 so IbClient creates
@@ -3682,23 +3769,28 @@ public partial class SimulatedBroker
                     ? price - stopDist * targetMultiple
                     : price + stopDist * targetMultiple;
 
-            Func<decimal, decimal> tickRound = p => p >= 1.0m
-                ? Math.Round(p, 2, MidpointRounding.AwayFromZero)
-                : Math.Round(p, 4, MidpointRounding.AwayFromZero);
-
-            decimal entryAdj = tickRound(price + (executionSide == TradeSide.Buy
-                ? Math.Max(atrBracket * 0.1m, price * 0.0005m)
-                : -Math.Max(atrBracket * 0.1m, price * 0.0005m)));
-
-            RealBroker.SubmitBracketOrder(
+            bool bracketSubmitted = RealBroker.SubmitBracketOrder(
                 symbol, qty,
                 entryAdj, executionSide,
-                tickRound(stopTrigger), tickRound(stopLimitPrice),
-                tickRound(targetPrice));
+                tickRound(stopTrigger), isNwBand ? 0m : tickRound(stopLimitPrice),
+                tickRound(targetPrice),
+                useStopMarket: isNwBand,
+                overridePercentageConstraints: isNwBand);
+
+            if (!bracketSubmitted)
+            {
+                StartEntryOrderRejectionCooldown(
+                    symbol, isNwBand, 0, "Broker rejected bracket before submission.");
+                ReleasePendingEntrySlot(symbol, "bracket validation/submission failed");
+                return false;
+            }
 
             string bracketTargetText = isNwBand ? $"NW_{NW_TIMEFRAME_MINUTES}M_DYNAMIC" : $"{tickRound(targetPrice):F2}";
+            string stopOrderText = isNwBand
+                ? $"{tickRound(stopTrigger):F2}/STP-MKT"
+                : $"{tickRound(stopTrigger):F2}/{tickRound(stopLimitPrice):F2}";
             LogMessage($"[BRACKET] {strategyTag} {symbol} x{qty} execution={(executionIsShort ? "SHORT" : "LONG")} entry={entryAdj:F2} " +
-                       $"stop={tickRound(stopTrigger):F2}/{tickRound(stopLimitPrice):F2} " +
+                       $"stop={stopOrderText} " +
                        $"target={bracketTargetText}");
             usedBracket = true;
         }
@@ -4081,7 +4173,11 @@ public partial class SimulatedBroker
         { OrderId = orderId, Symbol = symbol, Side = side, Qty = qty };
     }
 
-    public void RemoveLiveOrder(int orderId) => _ordersById.TryRemove(orderId, out _);
+    public void RemoveLiveOrder(int orderId)
+    {
+        _ordersById.TryRemove(orderId, out _);
+        _bracketExitReasonByOrderId.TryRemove(orderId, out _);
+    }
 
     public void RegisterBracketChildren(string symbol, int stopId, int targetId)
     {
@@ -4092,10 +4188,14 @@ public partial class SimulatedBroker
             _bracketExitReasonByOrderId[targetId] = "BRACKET_TARGET";
     }
 
-    public void OnOrderRejected(int orderId)
+    public void OnOrderRejected(int orderId, int errorCode = 0, string errorMessage = "")
     {
         if (!_ordersById.TryRemove(orderId, out var order)) return;
 
+        string? pendingTag = "";
+        _pendingStrategyTag?.TryGetValue(order.Symbol, out pendingTag);
+        bool wasNwEntry = !string.IsNullOrWhiteSpace(pendingTag)
+            && pendingTag.StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase);
         bool wasExit = false;
         lock (_lock)
         {
@@ -4113,11 +4213,19 @@ public partial class SimulatedBroker
         }
 
         if (!wasExit)
-            ReleasePendingEntrySlot(order.Symbol, $"IBKR rejected orderId={orderId}");
+        {
+            StartEntryOrderRejectionCooldown(
+                order.Symbol, wasNwEntry, errorCode,
+                string.IsNullOrWhiteSpace(errorMessage) ? "Order rejected." : errorMessage);
+            ReleasePendingEntrySlot(order.Symbol, $"IBKR rejected orderId={orderId} code={errorCode}");
+        }
 
-        LogMessage($"[REJECTED] orderId={orderId} {order.Side} {order.Symbol} x{order.Qty} — {(wasExit ? "exit retry enabled" : "entry slot freed")}.");
+        string codeText = errorCode > 0 ? $" code={errorCode}" : "";
+        LogMessage($"[REJECTED] orderId={orderId}{codeText} {order.Side} {order.Symbol} x{order.Qty} — " +
+                   $"{(wasExit ? "exit retry enabled" : $"entry slot freed; {ORDER_REJECTION_COOLDOWN_SECONDS / 60}m cooldown started")}.");
         _ = SendEmail($"⚠️ Order Rejected: {order.Symbol}",
-            $"IBKR rejected orderId={orderId} {order.Side} {order.Symbol} x{order.Qty}. Check errors.log.");
+            $"IBKR rejected orderId={orderId}{codeText} {order.Side} {order.Symbol} x{order.Qty}. " +
+            $"{errorMessage} Check errors.log.");
     }
 
     public void OnOrderFilled(int orderId, int fillQty, decimal fillPrice)
@@ -4381,6 +4489,7 @@ public partial class SimulatedBroker
         _lastNwTouchDecisionBySymbol.Clear();
         _pendingEntrySymbols.Clear();
         _pendingEntryCreatedUtc.Clear();
+        _entryOrderRejectionCooldownUntilUtc.Clear();
         _pendingStrategyTag?.Clear();
         _pendingInitialRisk.Clear();
         _pendingBracketChildren.Clear();
