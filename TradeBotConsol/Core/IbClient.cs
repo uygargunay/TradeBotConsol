@@ -43,6 +43,14 @@ public class IbClient : EWrapper, IBroker
     // ── Bracket child order tracking ──────────────────────────────────────────
     private readonly ConcurrentDictionary<int, string> _bracketChildToSymbol = new();
     private readonly ConcurrentDictionary<int, int> _bracketSiblings = new();
+    private readonly ConcurrentDictionary<int, int[]> _bracketGroupByOrderId = new();
+    private readonly ConcurrentDictionary<int, bool> _activeOrderIds = new();
+    private readonly ConcurrentDictionary<int, bool> _terminalOrderIds = new();
+    private readonly ConcurrentDictionary<int, bool> _cancelRequestedOrderIds = new();
+
+    // A precautionary override is allowed only on a validated protective child.
+    // This hard ceiling prevents a bad calculation from bypassing TWS safeguards.
+    private const decimal MAX_OVERRIDDEN_STOP_DISTANCE_PCT = 0.04m;
 
     // ── Bid/Ask spread tracking ───────────────────────────────────────────────
     private readonly ConcurrentDictionary<string, decimal> _latestBid = new();
@@ -117,7 +125,18 @@ public class IbClient : EWrapper, IBroker
         };
 
         _broker.RegisterLiveOrder(orderId, symbol, effectiveSide, qty);
-        _client.placeOrder(orderId, contract, order);
+        _activeOrderIds[orderId] = true;
+        try
+        {
+            _client.placeOrder(orderId, contract, order);
+        }
+        catch (Exception ex)
+        {
+            _activeOrderIds.TryRemove(orderId, out _);
+            _broker.OnOrderRejected(orderId, 0, ex.Message);
+            Console.WriteLine($"[IBKR] SubmitOrder failed for {symbol}: {ex.Message}");
+            return;
+        }
 
         Console.WriteLine($"[ORDER] {symbol} x{qty} {ActionString(effectiveSide)} " +
                           $"(signal={ActionString(side)} reversed={ReverseSignals}) " +
@@ -130,15 +149,21 @@ public class IbClient : EWrapper, IBroker
     // ── SUBMIT BRACKET ORDER ──────────────────────────────────────────────────
     // FIX #6: qty guard added.
     // REVERSAL: entry and exit sides are both flipped via ApplyReversal.
-    public void SubmitBracketOrder(string symbol, int qty, decimal entryPrice, TradeSide side,
-                                   decimal stopPrice, decimal stopLimit, decimal targetPrice)
+    public bool SubmitBracketOrder(string symbol, int qty, decimal entryPrice, TradeSide side,
+                                   decimal stopPrice, decimal stopLimit, decimal targetPrice,
+                                   bool useStopMarket = false,
+                                   bool overridePercentageConstraints = false)
     {
-        if (!_isReady) return;
+        if (!_isReady)
+        {
+            Console.WriteLine($"[IBKR] SubmitBracketOrder rejected: client not ready for {symbol}");
+            return false;
+        }
 
         if (qty <= 0)
         {
             Console.WriteLine($"[IBKR] SubmitBracketOrder rejected: qty={qty} for {symbol} (must be > 0)");
-            return;
+            return false;
         }
 
         TradeSide effectiveSide = ApplyReversal(side);
@@ -147,6 +172,41 @@ public class IbClient : EWrapper, IBroker
         string entryAction = ActionString(effectiveSide);
         string exitAction = ActionString(exitSide);
         bool hasProfitTarget = targetPrice > 0m;
+
+        if (entryPrice <= 0m || stopPrice <= 0m)
+        {
+            Console.WriteLine($"[IBKR] SubmitBracketOrder rejected: invalid entry/stop for {symbol} " +
+                              $"entry={entryPrice:F4} stop={stopPrice:F4}");
+            return false;
+        }
+
+        decimal stopDistancePct = effectiveSide == TradeSide.Buy
+            ? (entryPrice - stopPrice) / entryPrice
+            : (stopPrice - entryPrice) / entryPrice;
+        if (stopDistancePct <= 0m)
+        {
+            Console.WriteLine($"[IBKR] SubmitBracketOrder rejected: protective stop is on the wrong side for {symbol} " +
+                              $"entry={entryPrice:F4} stop={stopPrice:F4} side={entryAction}");
+            return false;
+        }
+        if (overridePercentageConstraints && stopDistancePct > MAX_OVERRIDDEN_STOP_DISTANCE_PCT)
+        {
+            Console.WriteLine($"[IBKR] SubmitBracketOrder rejected: guarded percentage override exceeded for {symbol} " +
+                              $"distance={stopDistancePct:P2} max={MAX_OVERRIDDEN_STOP_DISTANCE_PCT:P2}");
+            return false;
+        }
+        if (!useStopMarket)
+        {
+            bool invalidStopLimit = stopLimit <= 0m
+                || effectiveSide == TradeSide.Buy && stopLimit > stopPrice
+                || effectiveSide == TradeSide.Sell && stopLimit < stopPrice;
+            if (invalidStopLimit)
+            {
+                Console.WriteLine($"[IBKR] SubmitBracketOrder rejected: invalid stop-limit for {symbol} " +
+                                  $"entry={entryPrice:F4} stop={stopPrice:F4} limit={stopLimit:F4}");
+                return false;
+            }
+        }
 
         Contract contract = new Contract
         {
@@ -176,29 +236,25 @@ public class IbClient : EWrapper, IBroker
         Order stopOrder = new Order
         {
             Action = exitAction,
-            OrderType = "STP LMT",
+            OrderType = useStopMarket ? "STP" : "STP LMT",
             TotalQuantity = qty,
             AuxPrice = (double)stopPrice,
-            LmtPrice = (double)stopLimit,
             ParentId = parentId,
             OcaGroup = hasProfitTarget ? ocaGroup : "",
             OcaType = hasProfitTarget ? 1 : 0,
             Tif = "DAY",
-            Transmit = !hasProfitTarget
+            Transmit = !hasProfitTarget,
+            OverridePercentageConstraints = overridePercentageConstraints
         };
-
-        _broker.RegisterLiveOrder(parentId, symbol, effectiveSide, qty);
-        _broker.RegisterLiveOrder(stopId, symbol, exitSide, qty);
-        _bracketChildToSymbol[stopId] = symbol;
-
-        _client.placeOrder(parentId, contract, parent);
-        _client.placeOrder(stopId, contract, stopOrder);
+        if (!useStopMarket)
+            stopOrder.LmtPrice = (double)stopLimit;
 
         int targetId = 0;
+        Order? targetOrder = null;
         if (hasProfitTarget)
         {
             targetId = Interlocked.Increment(ref _currentOrderId);
-            Order targetOrder = new Order
+            targetOrder = new Order
             {
                 Action = exitAction,
                 OrderType = "LMT",
@@ -210,21 +266,68 @@ public class IbClient : EWrapper, IBroker
                 Tif = "DAY",
                 Transmit = true
             };
+        }
 
+        int[] bracketIds = targetId > 0
+            ? new[] { parentId, stopId, targetId }
+            : new[] { parentId, stopId };
+        foreach (int orderId in bracketIds)
+        {
+            _bracketGroupByOrderId[orderId] = bracketIds;
+            _activeOrderIds[orderId] = true;
+        }
+
+        _broker.RegisterLiveOrder(parentId, symbol, effectiveSide, qty);
+        _broker.RegisterLiveOrder(stopId, symbol, exitSide, qty);
+        _bracketChildToSymbol[stopId] = symbol;
+        if (targetId > 0)
+        {
             _broker.RegisterLiveOrder(targetId, symbol, exitSide, qty);
             _bracketChildToSymbol[targetId] = symbol;
             _bracketSiblings[stopId] = targetId;
             _bracketSiblings[targetId] = stopId;
-            _client.placeOrder(targetId, contract, targetOrder);
         }
-
         _broker.RegisterBracketChildren(symbol, stopId, targetId);
 
+        var placedOrderIds = new List<int>();
+        try
+        {
+            // Parent first, transmitting child last. For NW there is no fixed
+            // target, so its STP child is the final transmitter.
+            _client.placeOrder(parentId, contract, parent);
+            placedOrderIds.Add(parentId);
+            _client.placeOrder(stopId, contract, stopOrder);
+            placedOrderIds.Add(stopId);
+            if (targetOrder != null)
+            {
+                _client.placeOrder(targetId, contract, targetOrder);
+                placedOrderIds.Add(targetId);
+            }
+        }
+        catch (Exception ex)
+        {
+            CleanupBracketTracking(bracketIds);
+            foreach (int orderId in placedOrderIds)
+                TryCancelActiveOrder(orderId, "bracket submission exception");
+            foreach (int orderId in bracketIds)
+            {
+                _activeOrderIds.TryRemove(orderId, out _);
+                _broker.RemoveLiveOrder(orderId);
+            }
+            Console.WriteLine($"[IBKR] SubmitBracketOrder failed for {symbol}: {ex.Message}");
+            return false;
+        }
+
         string targetText = hasProfitTarget ? targetPrice.ToString("F2") : "DYNAMIC/NONE";
+        string stopText = useStopMarket
+            ? $"{stopPrice:F2}/STP-MKT"
+            : $"{stopPrice:F2}/{stopLimit:F2}";
         Console.WriteLine($"[BRACKET] {symbol} x{qty} entry={entryAction}@{entryPrice:F2} " +
                           $"(signal={ActionString(side)} reversed={ReverseSignals}) " +
-                          $"stop={stopPrice:F2}/{stopLimit:F2} target={targetText} " +
+                          $"stop={stopText} target={targetText} " +
+                          $"overridePct={overridePercentageConstraints} " +
                           $"parentId={parentId} stopId={stopId} targetId={targetId}");
+        return true;
     }
 
 
@@ -249,12 +352,49 @@ public class IbClient : EWrapper, IBroker
 
     public void Disconnect() => _client.eDisconnect();
 
+    private void CleanupBracketTracking(IEnumerable<int> orderIds)
+    {
+        foreach (int orderId in orderIds.Distinct())
+        {
+            _bracketGroupByOrderId.TryRemove(orderId, out _);
+            _bracketChildToSymbol.TryRemove(orderId, out _);
+            _bracketSiblings.TryRemove(orderId, out _);
+        }
+    }
+
+    private bool TryCancelActiveOrder(int orderId, string reason)
+    {
+        if (!_isReady) return false;
+        if (_terminalOrderIds.ContainsKey(orderId))
+        {
+            Console.WriteLine($"[IBKR] cancelOrder({orderId}) skipped — order already terminal ({reason}).");
+            return false;
+        }
+
+        bool wasTrackedActive = _activeOrderIds.TryRemove(orderId, out _);
+        _terminalOrderIds[orderId] = true;
+        try
+        {
+            _cancelRequestedOrderIds[orderId] = true;
+            _client.cancelOrder(orderId);
+            Console.WriteLine($"[IBKR] cancelOrder({orderId}) — {reason}" +
+                              (wasTrackedActive ? "" : " (reconciled/untracked order)"));
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _cancelRequestedOrderIds.TryRemove(orderId, out _);
+            _terminalOrderIds.TryRemove(orderId, out _);
+            if (wasTrackedActive) _activeOrderIds[orderId] = true;
+            Console.WriteLine($"[IBKR] cancelOrder({orderId}) failed: {ex.Message}");
+            return false;
+        }
+    }
+
     // IBroker.CancelOrder
     public void CancelOrder(int orderId)
     {
-        if (!_isReady) return;
-        _client.cancelOrder(orderId);
-        Console.WriteLine($"[IBKR] cancelOrder({orderId})");
+        TryCancelActiveOrder(orderId, "broker request");
     }
 
     // IBroker.RequestPositions
@@ -489,20 +629,37 @@ public class IbClient : EWrapper, IBroker
     {
         Console.WriteLine($"[ORDER STATUS] Id={orderId} Status={status} Filled={filled} Remaining={remaining}");
 
+        if (status == "PendingSubmit" || status == "PreSubmitted" || status == "Submitted" || status == "PendingCancel")
+        {
+            if (!_terminalOrderIds.ContainsKey(orderId))
+                _activeOrderIds[orderId] = true;
+        }
+        else if (status == "Filled" || status == "Cancelled" || status == "ApiCancelled")
+        {
+            _activeOrderIds.TryRemove(orderId, out _);
+            _terminalOrderIds[orderId] = true;
+            if (status == "Filled")
+                _cancelRequestedOrderIds.TryRemove(orderId, out _);
+        }
+
         if (status == "Filled")
         {
             if (_bracketChildToSymbol.TryRemove(orderId, out _))
             {
                 if (_filledOrders.TryAdd(orderId, true))
                 {
+                    int[] bracketIds = _bracketGroupByOrderId.TryGetValue(orderId, out int[] trackedIds)
+                        ? trackedIds
+                        : new[] { orderId };
                     if (_bracketSiblings.TryRemove(orderId, out int siblingId))
                     {
-                        _client.cancelOrder(siblingId);
+                        TryCancelActiveOrder(siblingId, $"bracket sibling {orderId} filled");
                         _bracketChildToSymbol.TryRemove(siblingId, out _);
                         _bracketSiblings.TryRemove(siblingId, out _);
                         _broker.RemoveLiveOrder(siblingId);
                     }
                     _broker.OnOrderFilled(orderId, (int)filled, (decimal)avgFillPrice);
+                    CleanupBracketTracking(bracketIds);
 
                     // FIX #3: consistent cleanup in both bracket and normal paths
                     _filledOrders.TryRemove(orderId, out _);
@@ -513,6 +670,9 @@ public class IbClient : EWrapper, IBroker
             if (_filledOrders.TryAdd(orderId, true))
             {
                 _broker.OnOrderFilled(orderId, (int)filled, (decimal)avgFillPrice);
+                // A filled bracket parent is no longer a valid rejection anchor;
+                // its protective children keep their own group mappings.
+                _bracketGroupByOrderId.TryRemove(orderId, out _);
                 _filledOrders.TryRemove(orderId, out _);
             }
         }
@@ -665,27 +825,61 @@ public class IbClient : EWrapper, IBroker
 
     public void error(string str) => Console.WriteLine($"[IB MSG] {str}");
 
+    private static bool IsHardOrderRejection(int errorCode)
+        => errorCode == 201 || errorCode == 202
+        || errorCode == 103 || errorCode == 109 || errorCode == 110
+        || errorCode == 163 || errorCode == 382 || errorCode == 383;
+
+    private void HandleOrderRejection(int id, int errorCode, string errorMsg)
+    {
+        _activeOrderIds.TryRemove(id, out _);
+        _terminalOrderIds[id] = true;
+
+        bool hasBracket = _bracketGroupByOrderId.TryGetValue(id, out int[] bracketIds);
+        bracketIds ??= new[] { id };
+
+        // Notify the strategy owner exactly once, using the rejected order while
+        // it is still tracked. This releases the pending entry and starts the
+        // per-symbol rejection cooldown before another live tick can retrigger NW.
+        _broker.OnOrderRejected(id, errorCode, errorMsg);
+
+        if (hasBracket)
+        {
+            foreach (int relatedId in bracketIds)
+            {
+                if (relatedId == id) continue;
+                TryCancelActiveOrder(relatedId, $"bracket rejected ({errorCode})");
+                _broker.RemoveLiveOrder(relatedId);
+            }
+        }
+
+        CleanupBracketTracking(bracketIds);
+    }
+
     public void error(int id, int errorCode, string errorMsg)
     {
         if (errorCode == 2104 || errorCode == 2106 || errorCode == 2158) return;
+
+        if (errorCode == 202 && _cancelRequestedOrderIds.TryRemove(id, out _))
+        {
+            Console.WriteLine($"[IBKR] cancel confirmed for order id={id}: {errorMsg}");
+            return;
+        }
+
+        // A cancel can race an IBKR discard/cancel status. It is informational
+        // after our active-order guard and must not trigger another cleanup cycle.
+        if (errorCode == 161)
+        {
+            _cancelRequestedOrderIds.TryRemove(id, out _);
+            Console.WriteLine($"[IBKR] cancel ignored for terminal order id={id}: {errorMsg}");
+            return;
+        }
+
         Console.WriteLine($"[IB ERROR] {errorCode}: {errorMsg}");
 
         // ── Order rejection / cancellation ─────────────────────────────────
-        if (errorCode == 201 || errorCode == 202 || errorCode == 103 || errorCode == 110)
-        {
-            _broker.OnOrderRejected(id);
-
-            // FIX #7: clean up bracket tracking state on rejection so dictionaries
-            // don't grow unboundedly and stale sibling cancellations can't fire.
-            if (_bracketChildToSymbol.TryRemove(id, out _))
-            {
-                if (_bracketSiblings.TryRemove(id, out int siblingId))
-                {
-                    _bracketChildToSymbol.TryRemove(siblingId, out _);
-                    _bracketSiblings.TryRemove(siblingId, out _);
-                }
-            }
-        }
+        if (IsHardOrderRejection(errorCode))
+            HandleOrderRejection(id, errorCode, errorMsg);
     }
 
     // ── EWRAPPER STUBS (required by interface) ────────────────────────────────
