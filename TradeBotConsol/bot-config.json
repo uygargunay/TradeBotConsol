@@ -135,5 +135,6 @@
   "USE_SMA100": true,
   "MinGrossTargetToCommissionMult": 3.0,
   "NW_STOP_LOSS_PCT": 0.03,
+  "NW_TAKE_PROFIT_PCT": 0.03,
   "NW_TIMEFRAME_MINUTES": 30
 }
