@@ -2993,6 +2993,7 @@
             NW_BANDWIDTH: 6.0,
             NW_MULT: 2.5,
             NW_STOP_LOSS_PCT: 0.03,
+            NW_TAKE_PROFIT_PCT: 0.03,
             NW_MAX_TRADES_PER_HOUR: 2,
             NW_MAX_TRADES_PER_DAY: 2,
             EARLY_PATTERN_ENTRY: true,
@@ -3233,7 +3234,7 @@
                                                                                                                                             <div style="background:rgba(188,140,255,.08);border:1px solid rgba(188,140,255,.28);border-radius:5px;padding:8px 10px;margin-bottom:10px;font-size:10px;color:var(--muted);line-height:1.6">
                                                                                                                                                 NW is evaluated separately on every fresh live LAST tick. A lower-band touch can submit its own long without confirmation from—or consuming the rolling-hour allowance of—the OR strategies. NW has its own hourly cap; account-level day, position, cash, spread and loss limits still apply.
                                                                                                                                             </div>
-                                                                                                                                            ${toggleField('STRATEGY_NADARAYA_WATSON', 'Nadaraya-Watson Bands', 'Buys a fresh live LAST-price touch of the lower configured-timeframe band and exits the long at the upper band; it never opens a short at the upper band.')}
+                                                                                                                                            ${toggleField('STRATEGY_NADARAYA_WATSON', 'Nadaraya-Watson Bands', 'Buys a fresh live LAST-price touch of the lower configured-timeframe band and exits the full position at the configured profit percentage.')}
                                                                                                                                             <div class="sm-grid" style="margin-top:10px">
                                                                                                                                                 ${selectField('NW_TIMEFRAME_MINUTES', 'NW Timeframe', [
                 { value: 15, label: '15 min' },
@@ -3244,6 +3245,7 @@
                                                                                                                                                 ${field('NW_BANDWIDTH', 'NW Bandwidth', 'number', CFG.NW_BANDWIDTH, 'Gaussian kernel bandwidth — larger = smoother centerline, fewer signals')}
                                                                                                                                                 ${field('NW_MULT', 'NW Band Multiplier', 'number', CFG.NW_MULT, 'Band width = kernel MAE x this multiplier — larger = wider bands, fewer signals')}
                                                                                                                                                 ${field('NW_STOP_LOSS_PCT', 'NW Stop Loss (decimal)', 'number', CFG.NW_STOP_LOSS_PCT, 'Flat NW protective stop as a decimal. 0.03 = 3%.')}
+                                                                                                                                                ${percentField('NW_TAKE_PROFIT_PCT', 'NW Take Profit (%)', CFG.NW_TAKE_PROFIT_PCT, 'Closes the entire NW position when this gain is reached from the actual average fill. Enter 3 for 3%.')}
                                                                                                                                                 ${field('NW_MAX_TRADES_PER_HOUR', 'NW Trades / Rolling Hour', 'number', CFG.NW_MAX_TRADES_PER_HOUR, 'Dedicated NW entry cap. Ordinary strategy trades do not consume it; 0 disables this NW-specific cap.')}
                                                                                                                                                 ${field('NW_MAX_TRADES_PER_DAY', 'NW Trades / Day', 'number', CFG.NW_MAX_TRADES_PER_DAY, 'Dedicated NW strategy-family cap. Account-wide Max Trades / Day still applies; 0 disables only this NW-specific cap.')}
                                                                                                                                             </div>
@@ -3383,6 +3385,18 @@
                                                                                                                                     </div>`;
         }
 
+        function percentField(id, label, val, hint = '') {
+            const numericValue = Number(val);
+            const displayValue = Number.isFinite(numericValue)
+                ? Number((numericValue * 100).toFixed(4))
+                : 0;
+            return `<div class="sm-field" title="${hint}">
+                    <span class="sm-label">${label}</span>
+                    <input class="sm-input" id="cfg-${id}" type="number" value="${displayValue}"
+                           min="0.01" max="100" step="0.01" data-percent="true">
+                </div>`;
+        }
+
         function toggleField(id, label, description) {
             return `<div class="sm-toggle-row">
                     <div>
@@ -3478,7 +3492,10 @@
             document.querySelectorAll('[id^="cfg-"]').forEach(inp => {
                 const key = inp.id.replace('cfg-', '');
                 if (inp.type === 'checkbox') CFG[key] = inp.checked;
-                else if (inp.type === 'number') CFG[key] = parseFloat(inp.value) || 0;
+                else if (inp.type === 'number') {
+                    const value = parseFloat(inp.value) || 0;
+                    CFG[key] = inp.dataset.percent === 'true' ? value / 100 : value;
+                }
                 else CFG[key] = inp.value;
             });
         }

@@ -229,8 +229,8 @@ public class IbClient : EWrapper, IBroker
         };
 
         // Protective stop. For a normal bracket it waits for the target order
-        // to transmit the whole chain. For NW trades targetPrice=0, so the
-        // stop itself is the final child and transmits the parent+stop atomically.
+        // to transmit the whole chain. Strategies with a local profit exit (NW)
+        // pass targetPrice=0, so the stop transmits the parent+stop atomically.
         int stopId = Interlocked.Increment(ref _currentOrderId);
         string ocaGroup = $"OCA_{symbol}_{parentId}";
         Order stopOrder = new Order
@@ -292,8 +292,8 @@ public class IbClient : EWrapper, IBroker
         var placedOrderIds = new List<int>();
         try
         {
-            // Parent first, transmitting child last. For NW there is no fixed
-            // target, so its STP child is the final transmitter.
+            // Parent first, transmitting child last. When profit exit management
+            // is local, the STP child is the final transmitter.
             _client.placeOrder(parentId, contract, parent);
             placedOrderIds.Add(parentId);
             _client.placeOrder(stopId, contract, stopOrder);
@@ -318,7 +318,7 @@ public class IbClient : EWrapper, IBroker
             return false;
         }
 
-        string targetText = hasProfitTarget ? targetPrice.ToString("F2") : "DYNAMIC/NONE";
+        string targetText = hasProfitTarget ? targetPrice.ToString("F2") : "LOCAL/NONE";
         string stopText = useStopMarket
             ? $"{stopPrice:F2}/STP-MKT"
             : $"{stopPrice:F2}/{stopLimit:F2}";

@@ -313,6 +313,7 @@ public partial class SimulatedBroker
     private decimal NW_BANDWIDTH = 6m;      // Gaussian kernel bandwidth — larger = smoother centerline
     private decimal NW_MULT = 2.5m;         // band width = kernel MAE * this multiplier
     private decimal NW_STOP_LOSS_PCT = 0.03m;  // flat % stop-loss for NW_BAND_ trades (not ATR-based)
+    private decimal NW_TAKE_PROFIT_PCT = 0.03m; // close the full NW position at this gain from average fill
     private bool EARLY_PATTERN_ENTRY_ENABLED = true;
     private int PATTERN_MIN_SCORE = 68;
     private int INTRABAR_SIGNAL_COOLDOWN_SECONDS = 30;
@@ -1719,8 +1720,9 @@ public partial class SimulatedBroker
     //  - NW is calculated ONLY from completed regular-session timeframe bars.
     //  - The live stock price is compared against those fixed bands on
     //    every LAST tick: price <= lower => BUY.
-    //  - An open NW long is sold when live price >= the current NW upper band.
-    //  - No NW short is opened at the upper band. The upper band is the exit.
+    //  - An open NW position is closed in full when its configured percentage
+    //    gain from the actual average fill is reached.
+    //  - No NW short is opened at the upper band.
     //
     //  Using completed bars avoids the old circular/repainting problem where
     //  the current 1-minute price was also moving the band it was trying to touch.
@@ -1751,6 +1753,16 @@ public partial class SimulatedBroker
         if (minutes <= 20) return 15;
         if (minutes <= 45) return 30;
         return 60;
+    }
+
+    private static decimal ValidateNwTakeProfitPct(decimal value)
+    {
+        if (value <= 0m || value > 1m)
+            throw new ArgumentOutOfRangeException(
+                nameof(value),
+                "NW_TAKE_PROFIT_PCT must be greater than 0 and no more than 1 (0.03 = 3%).");
+
+        return value;
     }
 
     private void UpdateHourlyFromMinute(string symbol, Candle minuteBar)
@@ -3600,19 +3612,6 @@ public partial class SimulatedBroker
             }
         }
 
-        decimal nwUpperAtEntry = 0m;
-        if (isNwBand && !isShort)
-        {
-            var (_, nwUpper, _, nwBars) = GetNadarayaWatson1HourEnvelope(symbol);
-            if (nwBars < NW_LOOKBACK || nwUpper <= price)
-            {
-                RecordBlock(symbol, "NW_TARGET_NOT_READY", "NW upper target unavailable/not above entry");
-                LogMessage($"[NW {NW_TIMEFRAME_MINUTES}M] {symbol} entry blocked — upper band unavailable or not above price.");
-                return false;
-            }
-            nwUpperAtEntry = nwUpper;
-        }
-
         decimal stopDist = MIN_STOP_DISTANCE;
         if (_marketData.TryGetValue(symbol, out var rrCandles))
         {
@@ -3637,19 +3636,16 @@ public partial class SimulatedBroker
                 }
             }
 
-            if (!IsSwingStrategy(strategyTag))
+            // NW has an explicit user-controlled percentage stop/target pair.
+            // Do not silently override that choice with the generic strategy R:R
+            // gate; the commission/economics guard below still applies.
+            if (!IsSwingStrategy(strategyTag) && !isNwBand)
             {
                 _vwap.TryGetValue(symbol, out decimal vwapRR);
                 var (pdHighRR, pdLowRR) = GetPrevDayHL(symbol);
 
                 decimal targetDist;
-                if (isNwBand && !isShort && nwUpperAtEntry > price)
-                {
-                    // NW trades are explicitly lower-band -> upper-band trades.
-                    // Use the actual 1H upper envelope for R:R, not VWAP/ATR proxies.
-                    targetDist = nwUpperAtEntry - price;
-                }
-                else if (!isShort)
+                if (!isShort)
                 {
                     decimal toVwap = vwapRR > price ? vwapRR - price : decimal.MaxValue;
                     decimal toPdHigh = pdHighRR > price ? pdHighRR - price : decimal.MaxValue;
@@ -3699,8 +3695,8 @@ public partial class SimulatedBroker
         }
 
         decimal targetMultiple = GetTargetMultipleForStrategy(strategyTag);
-        decimal grossTargetPnL = isNwBand && !isShort && nwUpperAtEntry > price
-            ? (nwUpperAtEntry - price) * qty
+        decimal grossTargetPnL = isNwBand
+            ? price * NW_TAKE_PROFIT_PCT * qty
             : stopDist * targetMultiple * qty;
         decimal minGrossTargetPnL = COMMISSION_PER_SIDE * 2m * MIN_GROSS_TARGET_TO_COMMISSION_MULT;
         if (grossTargetPnL < minGrossTargetPnL)
@@ -3783,9 +3779,9 @@ public partial class SimulatedBroker
             if (isNwBand)
                 _pendingInitialRisk[symbol] = bracketStopDistance;
 
-            // NW exits are dynamic: the upper band is recalculated from the
-            // newest completed timeframe bar. Pass targetPrice=0 so IbClient creates
-            // a parent + protective stop only; CheckExits() owns the upper-band sell.
+            // NW's exact percentage target is measured from the actual average fill
+            // and can change live in Settings. Keep only the protective stop at IBKR;
+            // CheckExits() owns the full-position profit sell.
             decimal targetPrice = isNwBand
                 ? 0m
                 : executionIsShort
@@ -3808,7 +3804,9 @@ public partial class SimulatedBroker
                 return false;
             }
 
-            string bracketTargetText = isNwBand ? $"NW_{NW_TIMEFRAME_MINUTES}M_DYNAMIC" : $"{tickRound(targetPrice):F2}";
+            string bracketTargetText = isNwBand
+                ? $"NW_{NW_TAKE_PROFIT_PCT * 100m:F2}PCT_LOCAL"
+                : $"{tickRound(targetPrice):F2}";
             string stopOrderText = isNwBand
                 ? $"{tickRound(stopTrigger):F2}/STP-MKT"
                 : $"{tickRound(stopTrigger):F2}/{tickRound(stopLimitPrice):F2}";
@@ -3903,21 +3901,6 @@ public partial class SimulatedBroker
 
     private void CheckExits(string symbol, decimal currentPrice)
     {
-        // Compute NW bands outside _lock. GetNadarayaWatson1HourEnvelope() locks
-        // the hourly-bar list, while FinalizeCandle() updates that list before
-        // it enters strategy code that may take _lock; reversing that order here
-        // would create a lock-order deadlock.
-        bool needsNwBands = false;
-        lock (_lock)
-        {
-            if (_positions.TryGetValue(symbol, out var probePos))
-                needsNwBands = (probePos.StrategyTag ?? "").StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase);
-        }
-
-        var nwExitEnvelope = needsNwBands
-            ? GetNadarayaWatson1HourEnvelope(symbol)
-            : (mid: 0m, upper: 0m, lower: 0m, bars: 0);
-
         lock (_lock)
         {
             if (!_positions.TryGetValue(symbol, out var pos)) return;
@@ -3926,32 +3909,36 @@ public partial class SimulatedBroker
 
             TradeSide exitSide = pos.IsShort ? TradeSide.Buy : TradeSide.Sell;
 
-            // NW upper-band exit has priority over the generic minimum-hold/partial/trailing
-            // logic. This is the requested rule: BUY at the configured lower envelope and
-            // SELL the long as soon as live price touches/crosses the upper envelope.
+            // NW's configured percentage exit has priority over the generic
+            // minimum-hold/partial/trailing logic and closes the full position.
             bool isNwPosition = (pos.StrategyTag ?? "").StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase);
             if (isNwPosition)
             {
                 // NW positions have exactly two strategy exits:
                 //   1) the protective NW_STOP_LOSS_PCT stop (handled in CheckHardStop / IBKR stop child), and
-                //   2) a live touch/cross of the completed opposite envelope here.
+                //   2) a live touch/cross of the configured gain from the actual average fill here.
                 // Generic time stops, partial exits, regime exits and trailing/breakeven exits are
-                // deliberately skipped so they cannot sell before the requested NW upper band.
-                if (nwExitEnvelope.bars < NW_LOOKBACK || nwExitEnvelope.upper <= 0 || nwExitEnvelope.lower <= 0)
-                    return;
+                // deliberately skipped so they cannot sell before the requested NW profit target.
+                if (pos.AvgPrice <= 0m) return;
+
+                decimal targetPrice = pos.IsShort
+                    ? pos.AvgPrice * (1m - NW_TAKE_PROFIT_PCT)
+                    : pos.AvgPrice * (1m + NW_TAKE_PROFIT_PCT);
 
                 bool nwExitHit = !pos.IsShort
-                    ? currentPrice >= nwExitEnvelope.upper
-                    : currentPrice <= nwExitEnvelope.lower;
+                    ? currentPrice >= targetPrice
+                    : currentPrice <= targetPrice;
 
                 if (nwExitHit)
                 {
                     CancelBracketChildren(pos);
                     pos.ExitSubmitted = true;
-                    string reason = pos.IsShort
-                        ? $"NW_{NW_TIMEFRAME_MINUTES}M_LOWER_EXIT"
-                        : $"NW_{NW_TIMEFRAME_MINUTES}M_UPPER_EXIT";
-                    LogMessage($"[{reason}] {symbol} price={currentPrice:F2} | lower={nwExitEnvelope.lower:F2} upper={nwExitEnvelope.upper:F2}");
+                    const string reason = "NW_TAKE_PROFIT";
+                    decimal actualGainPct = pos.IsShort
+                        ? (pos.AvgPrice - currentPrice) / pos.AvgPrice * 100m
+                        : (currentPrice - pos.AvgPrice) / pos.AvgPrice * 100m;
+                    LogMessage($"[{reason}] {symbol} price={currentPrice:F2} target={targetPrice:F2} " +
+                               $"entry={pos.AvgPrice:F2} gain={actualGainPct:F2}% configured={NW_TAKE_PROFIT_PCT * 100m:F2}%");
                     SubmitOrder(symbol, pos.Quantity, currentPrice, exitSide, reason, "MKT");
                 }
                 return;
@@ -5664,6 +5651,7 @@ public partial class SimulatedBroker
             NW_BANDWIDTH = GetD("NW_BANDWIDTH", NW_BANDWIDTH);
             NW_MULT = GetD("NW_MULT", NW_MULT);
             NW_STOP_LOSS_PCT = GetD("NW_STOP_LOSS_PCT", NW_STOP_LOSS_PCT);
+            NW_TAKE_PROFIT_PCT = ValidateNwTakeProfitPct(GetD("NW_TAKE_PROFIT_PCT", NW_TAKE_PROFIT_PCT));
             NW_MAX_TRADES_PER_HOUR = Math.Max(0, GetI("NW_MAX_TRADES_PER_HOUR", NW_MAX_TRADES_PER_HOUR));
             NW_MAX_TRADES_PER_DAY = Math.Max(0, GetI("NW_MAX_TRADES_PER_DAY", NW_MAX_TRADES_PER_DAY));
             EARLY_PATTERN_ENTRY_ENABLED = GetB("EARLY_PATTERN_ENTRY", EARLY_PATTERN_ENTRY_ENABLED);
@@ -5869,6 +5857,7 @@ public partial class SimulatedBroker
             $"\"NW_BANDWIDTH\":{NW_BANDWIDTH:F2}",
             $"\"NW_MULT\":{NW_MULT:F2}",
             $"\"NW_STOP_LOSS_PCT\":{NW_STOP_LOSS_PCT:F4}",
+            $"\"NW_TAKE_PROFIT_PCT\":{NW_TAKE_PROFIT_PCT:F4}",
             $"\"NW_MAX_TRADES_PER_HOUR\":{NW_MAX_TRADES_PER_HOUR}",
             $"\"NW_MAX_TRADES_PER_DAY\":{NW_MAX_TRADES_PER_DAY}",
             $"\"EARLY_PATTERN_ENTRY\":{(EARLY_PATTERN_ENTRY_ENABLED ? "true" : "false")}",
@@ -6149,6 +6138,11 @@ public partial class SimulatedBroker
                     double GetF(string k, double fb) => Get<double>(k, fb);
                     bool GetB(string k, bool fb) { if (!root.TryGetProperty(k, out var el)) return fb; return el.GetBoolean(); }
 
+                    // Validate before entering the mutation block so a bad value
+                    // cannot leave the live configuration only partially applied.
+                    decimal requestedNwTakeProfitPct = ValidateNwTakeProfitPct(
+                        GetD("NW_TAKE_PROFIT_PCT", NW_TAKE_PROFIT_PCT));
+
                     bool orbChanged;
                     bool nwHistoryReloadNeeded;
                     bool nwEnvelopeChanged;
@@ -6211,6 +6205,7 @@ public partial class SimulatedBroker
                         NW_BANDWIDTH = GetD("NW_BANDWIDTH", NW_BANDWIDTH);
                         NW_MULT = GetD("NW_MULT", NW_MULT);
                         NW_STOP_LOSS_PCT = GetD("NW_STOP_LOSS_PCT", NW_STOP_LOSS_PCT);
+                        NW_TAKE_PROFIT_PCT = requestedNwTakeProfitPct;
                         NW_MAX_TRADES_PER_HOUR = Math.Max(0, GetI("NW_MAX_TRADES_PER_HOUR", NW_MAX_TRADES_PER_HOUR));
                         NW_MAX_TRADES_PER_DAY = Math.Max(0, GetI("NW_MAX_TRADES_PER_DAY", NW_MAX_TRADES_PER_DAY));
                         EARLY_PATTERN_ENTRY_ENABLED = GetB("EARLY_PATTERN_ENTRY", EARLY_PATTERN_ENTRY_ENABLED);
