@@ -276,6 +276,9 @@ public partial class SimulatedBroker
     // at least $10 to make the trade worthwhile after slippage and market impact.
     private static readonly decimal MIN_GROSS_TARGET_TO_COMMISSION_MULT = 3.0m;
     private bool ALLOW_BULLISH_CANDLE_PATTERNS = true;
+    // Master kill switch.  Individual scalp-family flags are retained for future
+    // use, but no SCALP_* entry may reach the broker while this is false.
+    private bool SCALPING_ENABLED = false;
     private bool ALLOW_SCALP_BREAKOUT_LONGS = true;
     private bool ALLOW_SCALP_BREAKOUT_SHORTS = true;
     private bool ALLOW_SCALP_ORB_LONGS = true;
@@ -1612,13 +1615,13 @@ public partial class SimulatedBroker
             // days without ever getting a chance to fire, regardless of their flags.
             var nonNwStrategySlots = new (string Name, Func<bool> Run)[]
             {
-                ("CANDLE_PATTERNS", () => STRATEGY_CANDLE_PATTERNS_ENABLED && minutesSinceOpen >= 10
+                ("CANDLE_PATTERNS", () => SCALPING_ENABLED && STRATEGY_CANDLE_PATTERNS_ENABLED && minutesSinceOpen >= 10
                     && TryCandlestickPatternStrategy(symbol, candles, intrabar: false)),
-                ("MICRO_PULLBACK", () => STRATEGY_MICRO_PULLBACK_ENABLED && minutesSinceOpen >= 6
+                ("MICRO_PULLBACK", () => SCALPING_ENABLED && STRATEGY_MICRO_PULLBACK_ENABLED && minutesSinceOpen >= 6
                     && TryMicroPullbackStrategy(symbol, candles)),
                 ("OUTSIDE_CANDLE", () => STRATEGY_OUTSIDE_CANDLE_ENABLED && minutesSinceOpen >= 10
                     && TryOutsideCandleStrategy(symbol, candles)),
-                ("SCALP_BREAKOUT", () => minutesSinceOpen >= 6
+                ("SCALP_BREAKOUT", () => SCALPING_ENABLED && minutesSinceOpen >= 6
                     && TryScalpBreakoutStrategy(symbol, candles)),
                 ("ORB", () => STRATEGY_ORB_ENABLED && minutesSinceOpen >= ORB_MINUTES
                     && TryOrbStrategy(symbol, candles, nowEt)),
@@ -2221,7 +2224,19 @@ public partial class SimulatedBroker
         bool volExp = ind.VolExpansion;
 
         if (close > 0 && atr / close < MIN_ATR_PCT) return false;
-        if (gapPct > 0 && rsi > RSI_LONG_MIN && _marketRegime != "SELL-OFF" && !_spyOpenBearish)
+        _vwap.TryGetValue(symbol, out decimal gapVwap);
+
+        // A gap is not, by itself, a good entry after price has already run far
+        // from intraday fair value.  The real-trade log showed every GAP_GO long
+        // losing after entries with RSI around 64-71 and prices several ATR above
+        // VWAP.  Require continuation to still be close enough to VWAP to avoid
+        // buying the exhaustion leg (and apply the symmetric rule to shorts).
+        bool longNotExtended = rsi <= 68
+                            && (gapVwap <= 0 || close <= gapVwap + atr * 1.50m);
+        bool shortNotExtended = rsi >= 32
+                             && (gapVwap <= 0 || close >= gapVwap - atr * 1.50m);
+        if (gapPct > 0 && rsi > RSI_LONG_MIN && longNotExtended
+            && _marketRegime != "SELL-OFF" && !_spyOpenBearish)
         {
             decimal sma200 = GetDailySma200(symbol);
             if (sma200 > 0 && close < sma200 * 0.97m) return false;
@@ -2233,7 +2248,7 @@ public partial class SimulatedBroker
             return OpenPosition(symbol, qty, close, TradeSide.Buy, false, "GAP_GO_LONG");
         }
 
-        if (gapPct < 0 && rsi < RSI_SHORT_MAX && _allowShorts)
+        if (gapPct < 0 && rsi < RSI_SHORT_MAX && shortNotExtended && _allowShorts)
         {
             decimal sma200 = GetDailySma200(symbol);
             if (sma200 > 0 && close > sma200 && _marketRegime != "SELL-OFF") return false;
@@ -2668,7 +2683,7 @@ public partial class SimulatedBroker
 
     private void TryEarlyPatternEntry(string symbol, Candle current)
     {
-        if (!STRATEGY_CANDLE_PATTERNS_ENABLED || !EARLY_PATTERN_ENTRY_ENABLED) return;
+        if (!SCALPING_ENABLED || !STRATEGY_CANDLE_PATTERNS_ENABLED || !EARLY_PATTERN_ENTRY_ENABLED) return;
         if (current == null) return;
 
         var nowEt = GetEasternTime();
@@ -3418,6 +3433,14 @@ public partial class SimulatedBroker
     private bool OpenPosition(string symbol, int qty, decimal price,
                               TradeSide side, bool isShort, string strategyTag)
     {
+        // Defense in depth: scanners, intrabar callbacks, config reloads and any
+        // future strategy path all converge here.  A disabled master switch must
+        // make it impossible to submit a scalp order.
+        if (!SCALPING_ENABLED && IsScalpStrategy(strategyTag))
+        {
+            RecordBlock(symbol, "SCALPING_DISABLED", strategyTag);
+            return false;
+        }
         if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(strategyTag)) return false;
         bool isNwBand = strategyTag.StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase);
 
@@ -5667,6 +5690,7 @@ public partial class SimulatedBroker
             SWING_TARGET_R_MULT = GetD("SWING_TARGET_R_MULT", SWING_TARGET_R_MULT);
             SWING_REQUIRE_CONTRACTION = GetB("SWING_REQUIRE_CONTRACTION", SWING_REQUIRE_CONTRACTION);
             ALLOW_BULLISH_CANDLE_PATTERNS = GetB("ALLOW_BULLISH_CANDLE_PATTERNS", ALLOW_BULLISH_CANDLE_PATTERNS);
+            SCALPING_ENABLED = GetB("SCALPING_ENABLED", SCALPING_ENABLED);
             ALLOW_SCALP_BREAKOUT_LONGS = GetB("ALLOW_SCALP_BREAKOUT_LONGS", ALLOW_SCALP_BREAKOUT_LONGS);
             ALLOW_SCALP_BREAKOUT_SHORTS = GetB("ALLOW_SCALP_BREAKOUT_SHORTS", ALLOW_SCALP_BREAKOUT_SHORTS);
             ALLOW_SCALP_ORB_LONGS = GetB("ALLOW_SCALP_ORB_LONGS", ALLOW_SCALP_ORB_LONGS);
@@ -5766,17 +5790,17 @@ public partial class SimulatedBroker
             BreakEvenTriggerR = 1.0m,
             MinBreakoutBodyRatio = 0.55m,
             MinGrossTargetToCommissionMult = MIN_GROSS_TARGET_TO_COMMISSION_MULT,
-            EnableCandlePatterns = STRATEGY_CANDLE_PATTERNS_ENABLED,
+            EnableCandlePatterns = SCALPING_ENABLED && STRATEGY_CANDLE_PATTERNS_ENABLED,
             EnableOrb = STRATEGY_ORB_ENABLED,
             EnableGapGo = STRATEGY_GAP_GO_ENABLED,
             EnableVwap = STRATEGY_VWAP_ENABLED,
             EnableMomentum = STRATEGY_MOMENTUM_ENABLED,
             PatternMinScore = PATTERN_MIN_SCORE,
-            AllowBullishPatternEntries = STRATEGY_CANDLE_PATTERNS_ENABLED && ALLOW_BULLISH_CANDLE_PATTERNS,
-            AllowMicroPullback = STRATEGY_MICRO_PULLBACK_ENABLED,
-            AllowScalpBreakoutLongs = ALLOW_SCALP_BREAKOUT_LONGS,
-            AllowScalpBreakoutShorts = ALLOW_SCALP_BREAKOUT_SHORTS,
-            AllowScalpOrbLongs = ALLOW_SCALP_ORB_LONGS,
+            AllowBullishPatternEntries = SCALPING_ENABLED && STRATEGY_CANDLE_PATTERNS_ENABLED && ALLOW_BULLISH_CANDLE_PATTERNS,
+            AllowMicroPullback = SCALPING_ENABLED && STRATEGY_MICRO_PULLBACK_ENABLED,
+            AllowScalpBreakoutLongs = SCALPING_ENABLED && ALLOW_SCALP_BREAKOUT_LONGS,
+            AllowScalpBreakoutShorts = SCALPING_ENABLED && ALLOW_SCALP_BREAKOUT_SHORTS,
+            AllowScalpOrbLongs = SCALPING_ENABLED && ALLOW_SCALP_ORB_LONGS,
             AllowShorts = _allowShorts,
             IsHistoricalMode = isHistorical,
             HistoricalPeriodLabel = periodLabel,
@@ -5871,6 +5895,7 @@ public partial class SimulatedBroker
             $"\"SWING_TARGET_R_MULT\":{SWING_TARGET_R_MULT}",
             $"\"SWING_REQUIRE_CONTRACTION\":{(SWING_REQUIRE_CONTRACTION ? "true" : "false")}",
             $"\"ALLOW_BULLISH_CANDLE_PATTERNS\":{(ALLOW_BULLISH_CANDLE_PATTERNS ? "true" : "false")}",
+            $"\"SCALPING_ENABLED\":{(SCALPING_ENABLED ? "true" : "false")}",
             $"\"ALLOW_SCALP_BREAKOUT_LONGS\":{(ALLOW_SCALP_BREAKOUT_LONGS ? "true" : "false")}",
             $"\"ALLOW_SCALP_BREAKOUT_SHORTS\":{(ALLOW_SCALP_BREAKOUT_SHORTS ? "true" : "false")}",
             $"\"ALLOW_SCALP_ORB_LONGS\":{(ALLOW_SCALP_ORB_LONGS ? "true" : "false")}",
@@ -6212,6 +6237,7 @@ public partial class SimulatedBroker
                         SWING_TARGET_R_MULT = GetD("SWING_TARGET_R_MULT", SWING_TARGET_R_MULT);
                         SWING_REQUIRE_CONTRACTION = GetB("SWING_REQUIRE_CONTRACTION", SWING_REQUIRE_CONTRACTION);
                         ALLOW_BULLISH_CANDLE_PATTERNS = GetB("ALLOW_BULLISH_CANDLE_PATTERNS", ALLOW_BULLISH_CANDLE_PATTERNS);
+                        SCALPING_ENABLED = GetB("SCALPING_ENABLED", SCALPING_ENABLED);
                         ALLOW_SCALP_BREAKOUT_LONGS = GetB("ALLOW_SCALP_BREAKOUT_LONGS", ALLOW_SCALP_BREAKOUT_LONGS);
                         ALLOW_SCALP_BREAKOUT_SHORTS = GetB("ALLOW_SCALP_BREAKOUT_SHORTS", ALLOW_SCALP_BREAKOUT_SHORTS);
                         ALLOW_SCALP_ORB_LONGS = GetB("ALLOW_SCALP_ORB_LONGS", ALLOW_SCALP_ORB_LONGS);

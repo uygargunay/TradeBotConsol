@@ -164,17 +164,20 @@ public class BacktestConfig
     public int MinEntryMinutesAfterOpen { get; set; } = 15;
     public int MinEntryQty { get; set; } = 5;
     public decimal MinGrossTargetToCommissionMult { get; set; } = 3.0m;
-    public bool EnableCandlePatterns { get; set; } = true;
-    public bool EnableOrb { get; set; } = true;
+    public bool EnableCandlePatterns { get; set; } = false;
+    public bool ScalpingEnabled { get; set; } = false;
+    public bool EnableOrb { get; set; } = false;
     public bool EnableGapGo { get; set; } = true;
-    public bool EnableVwap { get; set; } = true;
+    public bool EnableVwap { get; set; } = false;
     public bool EnableMomentum { get; set; } = true;
+    public decimal GapGoMinPct { get; set; } = 0.012m;
+    public decimal GapGoRelVol { get; set; } = 1.30m;
     public int PatternMinScore { get; set; } = 68;
-    public bool AllowBullishPatternEntries { get; set; } = true;
-    public bool AllowMicroPullback { get; set; } = true;
-    public bool AllowScalpBreakoutLongs { get; set; } = true;
-    public bool AllowScalpBreakoutShorts { get; set; } = true;
-    public bool AllowScalpOrbLongs { get; set; } = true;
+    public bool AllowBullishPatternEntries { get; set; } = false;
+    public bool AllowMicroPullback { get; set; } = false;
+    public bool AllowScalpBreakoutLongs { get; set; } = false;
+    public bool AllowScalpBreakoutShorts { get; set; } = false;
+    public bool AllowScalpOrbLongs { get; set; } = false;
     public bool AllowShorts { get; set; } = true;
     public bool SwingMode { get; set; } = false;
     public bool EodLiquidate { get; set; } = true;
@@ -891,6 +894,12 @@ public static class BacktestEngine
     // Runs simplified strategy logic on available 1-min candles.
     // Uses the same entry families as SimulatedBroker. Stops and targets stored
     // on each simulated position are authoritative, matching live bracket intent.
+    private static bool IsRegularSessionTime(DateTime time)
+    {
+        int minutes = time.Hour * 60 + time.Minute;
+        return minutes >= 9 * 60 + 30 && minutes < 16 * 60;
+    }
+
     private static List<BtTrade> RunSimulation(
         System.Collections.Concurrent.ConcurrentDictionary<string, List<Candle>> allCandles,
         BacktestConfig cfg)
@@ -911,11 +920,29 @@ public static class BacktestEngine
 
         if (!allEvents.Any()) return trades;
 
+        // Resolve each replay day's prior regular-session close up front.  The
+        // rolling window may end in after-hours bars, which are not yesterday's
+        // official close and must not be used to decide whether a stock gapped.
+        var previousRegularCloseBySession = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in allCandles)
+        {
+            var sessions = kv.Value
+                .Where(c => IsRegularSessionTime(c.Time))
+                .OrderBy(c => c.Time)
+                .GroupBy(c => c.Time.Date)
+                .OrderBy(g => g.Key)
+                .Select(g => (Date: g.Key, Close: g.Last().Close))
+                .ToList();
+            for (int i = 1; i < sessions.Count; i++)
+                previousRegularCloseBySession[$"{kv.Key}|{sessions[i].Date:yyyy-MM-dd}"] = sessions[i - 1].Close;
+        }
+
         // Per-symbol rolling window (last 100 candles) for indicators
         var windows = new Dictionary<string, List<Candle>>();
         var vwapAccum = new Dictionary<string, (decimal sumPV, long sumVol)>();
         var orbRanges = new Dictionary<string, (decimal High, decimal Low, bool IsSet, int MinuteCount)>();
         var prevClose = new Dictionary<string, decimal>();
+        var sessionOpen = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
         var lastDate = new Dictionary<string, DateTime>();
         var tradesPerDay = new Dictionary<DateTime, int>();
         var symbolTradesToday = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -932,10 +959,14 @@ public static class BacktestEngine
             // Reset daily structures at each new trading day
             if (!lastDate.TryGetValue(symbol, out var prev) || prev.Date != etTime.Date)
             {
-                if (windows.TryGetValue(symbol, out var w) && w.Any())
-                    prevClose[symbol] = w.Last().Close;
+                string replaySessionKey = $"{symbol}|{etTime:yyyy-MM-dd}";
+                if (previousRegularCloseBySession.TryGetValue(replaySessionKey, out decimal priorRegularClose))
+                    prevClose[symbol] = priorRegularClose;
+                else
+                    prevClose.Remove(symbol);
                 vwapAccum[symbol] = (sumPV: 0m, sumVol: 0L);
-                orbRanges[symbol] = (candle.High, candle.Low, false, 0);
+                orbRanges[symbol] = (0m, 0m, false, 0);
+                sessionOpen.Remove(symbol);
                 lastDate[symbol] = etTime;
                 if (!tradesPerDay.ContainsKey(etTime.Date)) tradesPerDay[etTime.Date] = 0;
             }
@@ -946,8 +977,12 @@ public static class BacktestEngine
             if (windows[symbol].Count > 120) windows[symbol].RemoveAt(0);
             var win = windows[symbol];
 
-            // Update VWAP
-            if (candle.Volume > 0)
+            int minsSinceOpen = (etTime.Hour - 9) * 60 + etTime.Minute - 30;
+            bool isRegularSession = IsRegularSessionTime(etTime);
+
+            // Update regular-session VWAP only. IBKR replay data also contains
+            // premarket/after-hours bars when useRTH=0.
+            if (isRegularSession && candle.Volume > 0)
             {
                 var va = vwapAccum.GetValueOrDefault(symbol, (sumPV: 0m, sumVol: 0L));
                 vwapAccum[symbol] = (sumPV: va.sumPV + candle.Close * candle.Volume,
@@ -957,10 +992,14 @@ public static class BacktestEngine
                 ? vv.sumPV / vv.sumVol : 0m;
 
             // Update ORB
-            int minsSinceOpen = (etTime.Hour - 9) * 60 + etTime.Minute - 30;
-            if (orbRanges.TryGetValue(symbol, out var orb) && minsSinceOpen >= 0 && minsSinceOpen <= cfg.OrbMinutes)
+            if (isRegularSession && !sessionOpen.ContainsKey(symbol))
+                sessionOpen[symbol] = candle.Open;
+            if (orbRanges.TryGetValue(symbol, out var orb)
+                && isRegularSession && minsSinceOpen <= cfg.OrbMinutes)
             {
-                orb = (Math.Max(orb.High, candle.High), Math.Min(orb.Low, candle.Low),
+                decimal orbHigh = orb.High <= 0 ? candle.High : Math.Max(orb.High, candle.High);
+                decimal orbLow = orb.Low <= 0 ? candle.Low : Math.Min(orb.Low, candle.Low);
+                orb = (orbHigh, orbLow,
                        minsSinceOpen >= cfg.OrbMinutes, minsSinceOpen);
                 orbRanges[symbol] = orb;
             }
@@ -983,7 +1022,7 @@ public static class BacktestEngine
                 decimal exitPrice = candle.Close;
 
                 // EOD exit
-                if (etTime.Hour == 15 && etTime.Minute >= 25)
+                if (cfg.EodLiquidate && etTime.Hour == 15 && etTime.Minute >= 25)
                 { exit = true; reason = "EOD"; }
 
                 bool isScalp = (pos.Strategy ?? "").StartsWith("SCALP_", StringComparison.OrdinalIgnoreCase);
@@ -1092,7 +1131,9 @@ public static class BacktestEngine
             decimal close = candle.Close;
             decimal atr = BtCalc.CalcATR(win, 14);
             if (atr <= 0 || close <= 0) continue;
-            var todayWin = win.Where(c => c.Time.Date == etTime.Date).ToList();
+            var todayWin = win
+                .Where(c => c.Time.Date == etTime.Date && IsRegularSessionTime(c.Time))
+                .ToList();
             decimal todayDollarVolume = todayWin.Sum(c => c.Close * c.Volume);
             decimal requiredDollarVolume = Math.Max(
                 500_000m,
@@ -1108,7 +1149,7 @@ public static class BacktestEngine
             BtPosition newPos = null;
 
             // ── Candlestick pattern entry (runs FIRST — early signals) ──
-            if (newPos == null && cfg.EnableCandlePatterns && win.Count >= 6)
+            if (newPos == null && cfg.ScalpingEnabled && cfg.EnableCandlePatterns && win.Count >= 6)
             {
                 var patternResult = DetectBtPattern(win, atr);
                 if (patternResult.score >= cfg.PatternMinScore)
@@ -1129,7 +1170,7 @@ public static class BacktestEngine
             }
 
             // ── Micro pullback (catches entry after impulse + shallow retrace) ──
-            if (newPos == null && cfg.AllowMicroPullback && win.Count >= 8 && !blockLongs)
+            if (newPos == null && cfg.ScalpingEnabled && cfg.AllowMicroPullback && win.Count >= 8 && !blockLongs)
             {
                 bool foundImpulse = false;
                 decimal pullbackLow = decimal.MaxValue;
@@ -1169,7 +1210,8 @@ public static class BacktestEngine
             }
 
             // ── Dedicated breakout scalper ───────────────────────────────
-            if (newPos == null && win.Count >= 25 && (regime == "TRENDING" || regime == "NORMAL"))
+            if (newPos == null && cfg.ScalpingEnabled && win.Count >= 25
+                && (regime == "TRENDING" || regime == "NORMAL"))
             {
                 var priorFive = win.Skip(Math.Max(0, win.Count - 6)).Take(5).ToList();
                 if (priorFive.Count == 5)
@@ -1213,7 +1255,8 @@ public static class BacktestEngine
             }
 
             // ── ORB strategy ─────────────────────────────────────────────
-            if (newPos == null && cfg.EnableOrb && orbRanges.TryGetValue(symbol, out orb) && orb.IsSet && regime != "CHOPPY")
+            if (newPos == null && cfg.ScalpingEnabled && cfg.EnableOrb
+                && orbRanges.TryGetValue(symbol, out orb) && orb.IsSet && regime != "CHOPPY")
             {
                 int holdBars = regime == "NORMAL" ? 3 : 2;
                 decimal orbBuffer = Math.Max(atr * 0.15m, close * 0.0008m);
@@ -1268,17 +1311,52 @@ public static class BacktestEngine
             }
 
             // ── Gap and Go ─────────────────────────────────────────────────
-            if (newPos == null && cfg.EnableGapGo && prevClose.TryGetValue(symbol, out var pdClose) && pdClose > 0)
+            int gapGoEnd = regime == "TRENDING" ? 150 : 120;
+            if (newPos == null && cfg.EnableGapGo
+                && minsSinceOpen >= 20 && minsSinceOpen <= gapGoEnd
+                && prevClose.TryGetValue(symbol, out var pdClose) && pdClose > 0
+                && sessionOpen.TryGetValue(symbol, out var dayOpen) && dayOpen > 0
+                && todayWin.Count >= 3)
             {
-                decimal gapPct = (close - pdClose) / pdClose;
+                decimal openingGapPct = (dayOpen - pdClose) / pdClose;
                 decimal relVol = avgVol10 > 0 ? candle.Volume / (decimal)avgVol10 : 0m;
-                if (gapPct >= 0.02m && relVol >= 1.8m && !blockLongs && rsi > cfg.RsiLongMin && volOk && close > vwap)
+                var previousCandle = todayWin[^2];
+                decimal gapRange = candle.High - candle.Low;
+                decimal gapClosePos = gapRange > 0 ? (close - candle.Low) / gapRange : 0.5m;
+                decimal gapBuffer = Math.Max(atr * 0.10m, close * 0.0005m);
+                decimal ema9 = (decimal)BtCalc.CalcEMA(win, 9);
+                bool gapVolumeExpansion = relVol >= cfg.GapGoRelVol;
+
+                bool longContinuation = openingGapPct >= cfg.GapGoMinPct
+                                     && !blockLongs
+                                     && close > pdClose && close > dayOpen
+                                     && vwap > 0 && close > vwap
+                                     && candle.Close > candle.Open
+                                     && gapClosePos >= 0.65m
+                                     && close > previousCandle.High + gapBuffer
+                                     && gapVolumeExpansion
+                                     && rsi > cfg.RsiLongMin && rsi <= 70
+                                     && ema9 > 0 && close - ema9 <= atr * 1.50m
+                                     && close - vwap <= atr * 3.00m;
+                bool shortContinuation = openingGapPct <= -cfg.GapGoMinPct
+                                      && cfg.AllowShorts
+                                      && close < pdClose && close < dayOpen
+                                      && vwap > 0 && close < vwap
+                                      && candle.Close < candle.Open
+                                      && gapClosePos <= 0.35m
+                                      && close < previousCandle.Low - gapBuffer
+                                      && gapVolumeExpansion
+                                      && rsi < cfg.RsiShortMax && rsi >= 30
+                                      && ema9 > 0 && ema9 - close <= atr * 1.50m
+                                      && vwap - close <= atr * 3.00m;
+
+                if (longContinuation)
                 {
                     int qty = CalcQty(close, atr * cfg.HardStopAtrMult, cfg);
                     if (qty > 0)
                         newPos = new BtPosition { Symbol = symbol, IsShort = false, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "GAP_GO_LONG", Regime = regime, HardStop = close - atr * cfg.HardStopAtrMult, Target = close + atr * cfg.TargetAtrMult, AtrAtEntry = atr, WorstPrice = close };
                 }
-                else if (cfg.AllowShorts && gapPct <= -0.02m && relVol >= 1.8m && rsi < cfg.RsiShortMax && close < vwap)
+                else if (shortContinuation)
                 {
                     int qty = CalcQty(close, atr * cfg.HardStopAtrMult, cfg);
                     if (qty > 0)
@@ -1287,7 +1365,8 @@ public static class BacktestEngine
             }
 
             // ── VWAP Reclaim (blocked in SELL-OFF and bearish open) ───────
-            if (newPos == null && cfg.EnableVwap && vwap > 0 && volExp && !blockLongs && HasStrongBodyClose(candle, true, cfg))
+            if (newPos == null && cfg.ScalpingEnabled && cfg.EnableVwap
+                && vwap > 0 && volExp && !blockLongs && HasStrongBodyClose(candle, true, cfg))
             {
                 bool reclaim = win.Count >= 3 && win[^1].Close > vwap && win[^2].Close > vwap && win[^3].Close <= vwap;
                 if (reclaim && rsi > cfg.RsiLongMin)
@@ -1299,7 +1378,8 @@ public static class BacktestEngine
             }
 
             // ── VWAP Reject Short ──────────────────────────────────────────
-            if (newPos == null && cfg.EnableVwap && cfg.AllowShorts && vwap > 0 && volExp && HasStrongBodyClose(candle, false, cfg))
+            if (newPos == null && cfg.ScalpingEnabled && cfg.EnableVwap && cfg.AllowShorts
+                && vwap > 0 && volExp && HasStrongBodyClose(candle, false, cfg))
             {
                 bool reject = win.Count >= 3 && win[^1].Close < vwap && win[^2].Close < vwap && win[^3].Close >= vwap;
                 if (reject && rsi < cfg.RsiShortMax)
@@ -1362,6 +1442,12 @@ public static class BacktestEngine
                         newPos = new BtPosition { Symbol = symbol, IsShort = true, EntryPrice = close, Qty = qty, EntryTime = etTime, HighWater = close, LowWater = close, Strategy = "MOMENTUM_SHORT", Regime = regime, HardStop = close + atr * cfg.HardStopAtrMult, Target = close - atr * cfg.TargetAtrMult, AtrAtEntry = atr, WorstPrice = close };
                 }
             }
+
+            // Final simulation-side invariant: no future SCALP_* family can
+            // accidentally bypass its local router guard while the master is off.
+            if (newPos != null && !cfg.ScalpingEnabled
+                && (newPos.Strategy ?? "").StartsWith("SCALP_", StringComparison.OrdinalIgnoreCase))
+                newPos = null;
 
             if (newPos != null)
             {
@@ -1623,7 +1709,9 @@ public static class BacktestEngine
         qty = Math.Min(qty, maxBySlot);
         if (qty <= 0 || qty > 500 || qty < cfg.MinEntryQty) return 0;
 
-        decimal roundTripCommission = cfg.Commission * 2m;
+        // cfg.Commission is already the round-trip amount (BuildBacktestConfig
+        // supplies COMMISSION_PER_SIDE * 2). Do not double it a second time.
+        decimal roundTripCommission = cfg.Commission;
         decimal grossTargetPnL = stopDistance * cfg.TargetAtrMult * qty;
         decimal minGrossTargetPnL = roundTripCommission * cfg.MinGrossTargetToCommissionMult;
         if (grossTargetPnL < minGrossTargetPnL) return 0;
