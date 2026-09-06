@@ -42,10 +42,23 @@ public interface IBroker
     bool SubmitBracketOrder(string symbol, int qty, decimal entryPrice, TradeSide side,
                             decimal stopPrice, decimal stopLimit, decimal targetPrice,
                             bool useStopMarket = false,
-                            bool overridePercentageConstraints = false);
+                            bool overridePercentageConstraints = false,
+                            bool goodTillCanceledStop = false);
 }
 
 public enum TradeSide { Buy, Sell }
+
+public sealed class NwEntryAudit
+{
+    public decimal SignalPrice { get; set; }
+    public decimal Mid { get; set; }
+    public decimal Upper { get; set; }
+    public decimal Lower { get; set; }
+    public int Bars { get; set; }
+    public int TimeframeMinutes { get; set; }
+    public DateTime BandAsOfEt { get; set; } = DateTime.MinValue;
+    public DateTime SignalTimeUtc { get; set; } = DateTime.MinValue;
+}
 
 public class SimPosition
 {
@@ -70,6 +83,7 @@ public class SimPosition
     public int EntrySetupScore { get; set; } = 0;
     public int BracketStopId { get; set; } = 0;
     public int BracketTargetId { get; set; } = 0;
+    public NwEntryAudit? NwEntryAudit { get; set; }
     public decimal UnrealizedPnL(decimal price) =>
         IsShort ? Quantity * (AvgPrice - price) : Quantity * (price - AvgPrice);
 }
@@ -126,6 +140,7 @@ public class TradeRecord
     public decimal EntryAtr { get; set; }
     public decimal EntryVwap { get; set; }
     public int EntrySetupScore { get; set; }
+    public NwEntryAudit? NwEntryAudit { get; set; }
 }
 
 public class LifetimeEquityPoint
@@ -313,7 +328,7 @@ public partial class SimulatedBroker
     private decimal NW_BANDWIDTH = 6m;      // Gaussian kernel bandwidth — larger = smoother centerline
     private decimal NW_MULT = 2.5m;         // band width = kernel MAE * this multiplier
     private decimal NW_STOP_LOSS_PCT = 0.03m;  // flat % stop-loss for NW_BAND_ trades (not ATR-based)
-    private decimal NW_TAKE_PROFIT_PCT = 0.03m; // close the full NW position at this gain from average fill
+    private decimal NW_TAKE_PROFIT_PCT = 0.05m; // close the full NW position at this gain from average fill
     private bool EARLY_PATTERN_ENTRY_ENABLED = true;
     private int PATTERN_MIN_SCORE = 68;
     private int INTRABAR_SIGNAL_COOLDOWN_SECONDS = 30;
@@ -375,6 +390,11 @@ public partial class SimulatedBroker
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _lastNwTouchDecisionBySymbol =
         new(StringComparer.OrdinalIgnoreCase);
+    // A symbol must first be observed above a fixed, completed-bar envelope and
+    // then cross through it. This prevents a delayed history load (or a restart)
+    // from buying a stock that was already far below the band before NW was ready.
+    private readonly ConcurrentDictionary<string, (decimal lower, DateTime bandAsOfEt, bool armed)> _nwTouchState =
+        new(StringComparer.OrdinalIgnoreCase);
 
     private readonly ConcurrentDictionary<string, decimal> _prevDayHighLevel = new();
     private readonly ConcurrentDictionary<string, decimal> _prevDayLowLevel = new();
@@ -432,6 +452,8 @@ public partial class SimulatedBroker
 
     private ConcurrentDictionary<string, string> _pendingStrategyTag = new();
     private ConcurrentDictionary<string, decimal> _pendingInitialRisk = new();
+    private readonly ConcurrentDictionary<string, NwEntryAudit> _pendingNwEntryAudit =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _pendingExitReasonBySymbol = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<int, string> _bracketExitReasonByOrderId = new();
 
@@ -717,7 +739,7 @@ public partial class SimulatedBroker
             CheckBreakevenStop(symbol, price);
             CheckExits(symbol, price);
 
-            // NW is a price-touch strategy, so evaluate it on the live LAST tick,
+            // NW is a live-cross strategy, so evaluate it on the live LAST tick,
             // not only when a 1-minute candle closes. OpenPosition() still enforces
             // every portfolio/risk/cooldown gate before an order can be submitted.
             if (STRATEGY_NADARAYA_WATSON_ENABLED)
@@ -1118,7 +1140,7 @@ public partial class SimulatedBroker
 
         if (isNw)
         {
-            string decision = $"TOUCH blocked: {codeText}; {label}";
+            string decision = $"CROSS blocked: {codeText}; {label}";
             _lastNwDecisionBySymbol[symbol] = decision;
             _lastNwTouchDecisionBySymbol[symbol] =
                 $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
@@ -1240,6 +1262,7 @@ public partial class SimulatedBroker
         _pendingEntryCreatedUtc.TryRemove(symbol, out DateTime submittedUtc);
         _pendingStrategyTag?.TryRemove(symbol, out _);
         _pendingInitialRisk.TryRemove(symbol, out _);
+        _pendingNwEntryAudit.TryRemove(symbol, out _);
         if (_pendingBracketChildren.TryRemove(symbol, out var bracketIds))
         {
             if (bracketIds.stopId > 0)
@@ -1283,6 +1306,7 @@ public partial class SimulatedBroker
             {
                 _pendingEntryCreatedUtc.TryRemove(symbol, out _);
                 _pendingEntrySymbols.TryRemove(symbol, out _);
+                _pendingNwEntryAudit.TryRemove(symbol, out _);
                 continue;
             }
 
@@ -1605,7 +1629,7 @@ public partial class SimulatedBroker
             // later strategies from being tried.
             //
             // Nadaraya-Watson is deliberately absent here. UpdateLiveTick() owns
-            // its independent live lower-band touch path, so NW never needs another
+            // its independent fresh lower-band cross path, so NW never needs another
             // strategy to confirm it and never participates in this router's order.
             //
             // Why: a per-strategy cap can still let the earliest strategy families
@@ -1760,7 +1784,7 @@ public partial class SimulatedBroker
         if (value <= 0m || value > 1m)
             throw new ArgumentOutOfRangeException(
                 nameof(value),
-                "NW_TAKE_PROFIT_PCT must be greater than 0 and no more than 1 (0.03 = 3%).");
+                "NW_TAKE_PROFIT_PCT must be greater than 0 and no more than 1 (0.05 = 5%).");
 
         return value;
     }
@@ -1898,12 +1922,12 @@ public partial class SimulatedBroker
         return (mid, upper, lower);
     }
 
-    private (decimal mid, decimal upper, decimal lower, int bars) GetNadarayaWatson1HourEnvelope(string symbol)
+    private (decimal mid, decimal upper, decimal lower, int bars, DateTime bandAsOfEt) GetNadarayaWatson1HourEnvelope(string symbol)
     {
         var bars = GetCompletedNwHourlyCandles(symbol);
-        if (bars.Count < NW_LOOKBACK) return (0m, 0m, 0m, bars.Count);
+        DateTime lastBarTime = bars.Count > 0 ? bars[^1].Time : DateTime.MinValue;
+        if (bars.Count < NW_LOOKBACK) return (0m, 0m, 0m, bars.Count, lastBarTime);
 
-        DateTime lastBarTime = bars[^1].Time;
         if (_nwEnvelopeCache.TryGetValue(symbol, out var cached)
             && cached.bars == bars.Count
             && cached.lastBarTime == lastBarTime
@@ -1911,27 +1935,29 @@ public partial class SimulatedBroker
             && cached.bandwidth == NW_BANDWIDTH
             && cached.mult == NW_MULT)
         {
-            return (cached.mid, cached.upper, cached.lower, cached.bars);
+            return (cached.mid, cached.upper, cached.lower, cached.bars, cached.lastBarTime);
         }
 
         var (mid, upper, lower) = ComputeNadarayaWatsonEnvelope(bars);
         _nwEnvelopeCache[symbol] = (mid, upper, lower, bars.Count, lastBarTime,
                                     NW_LOOKBACK, NW_BANDWIDTH, NW_MULT);
-        return (mid, upper, lower, bars.Count);
+        return (mid, upper, lower, bars.Count, lastBarTime);
     }
 
     private bool TryNadarayaWatsonStrategy(string symbol, List<Candle> candles, decimal triggerPrice = 0m)
     {
         if (!STRATEGY_NADARAYA_WATSON_ENABLED) return false;
 
-        var (mid, upper, lower, nwBars) = GetNadarayaWatson1HourEnvelope(symbol);
+        var (mid, upper, lower, nwBars, bandAsOfEt) = GetNadarayaWatson1HourEnvelope(symbol);
         if (nwBars < NW_LOOKBACK)
         {
+            _nwTouchState.TryRemove(symbol, out _);
             _lastNwDecisionBySymbol[symbol] = $"History {nwBars}/{NW_LOOKBACK}";
             return false;
         }
         if (mid <= 0 || upper <= lower)
         {
+            _nwTouchState.TryRemove(symbol, out _);
             _lastNwDecisionBySymbol[symbol] = "Bands invalid";
             return false;
         }
@@ -1947,17 +1973,47 @@ public partial class SimulatedBroker
             return false;
         }
 
-        // Entry is a live touch/cross of the completed lower envelope.
+        // Arm only after this exact completed-bar envelope has observed a live
+        // LAST price above its lower band. A first tick that is already below the
+        // band is not a fresh touch and must not create a delayed falling-knife
+        // entry after startup/history loading or after an ineligible early cross.
+        bool envelopeChanged = !_nwTouchState.TryGetValue(symbol, out var touchState)
+            || touchState.bandAsOfEt != bandAsOfEt
+            || touchState.lower != lower;
+        if (envelopeChanged)
+        {
+            touchState = (lower, bandAsOfEt, price > lower);
+            _nwTouchState[symbol] = touchState;
+        }
+
         if (price > lower)
         {
+            _nwTouchState[symbol] = (lower, bandAsOfEt, true);
             decimal distancePct = lower > 0 ? (price - lower) / lower * 100m : 0m;
             _lastNwDecisionBySymbol[symbol] = $"Waiting: {distancePct:F2}% above NW Low";
             _lastNwTouchDecisionBySymbol.TryRemove(symbol, out _);
             return false;
         }
+
+        if (!touchState.armed)
+        {
+            decimal belowPct = lower > 0 ? (lower - price) / lower * 100m : 0m;
+            string decision = $"Below NW Low by {belowPct:F2}% without a fresh cross; waiting to re-arm above {lower:F2}";
+            _lastNwDecisionBySymbol[symbol] = decision;
+            _lastNwTouchDecisionBySymbol[symbol] = $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
+            return false;
+        }
+
+        // Consume this crossing before applying the remaining gates. If the
+        // crossing is too early or otherwise blocked, staying below the band
+        // cannot turn it into a late entry; price must move above and cross again.
+        _nwTouchState[symbol] = (lower, bandAsOfEt, false);
+        LogMessage($"[NW {NW_TIMEFRAME_MINUTES}M CROSS] {symbol} price={price:F2} <= lower={lower:F2} | " +
+                   $"mid={mid:F2} upper={upper:F2} bars={nwBars} bandAsOf={bandAsOfEt:yyyy-MM-dd HH:mm} ET");
+
         if (!PassesEntryGates(symbol, out _, nwTouchMode: true))
         {
-            string decision = $"TOUCH blocked: {GetWatchlistReadiness(symbol, nwTouchMode: true)}";
+            string decision = $"CROSS blocked: {GetWatchlistReadiness(symbol, nwTouchMode: true)}";
             _lastNwDecisionBySymbol[symbol] = decision;
             _lastNwTouchDecisionBySymbol[symbol] = $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
             return false;
@@ -1974,9 +2030,22 @@ public partial class SimulatedBroker
             return false;
         }
 
-        LogMessage($"[NW {NW_TIMEFRAME_MINUTES}M TOUCH] {symbol} price={price:F2} <= lower={lower:F2} | mid={mid:F2} upper={upper:F2} bars={nwBars}");
+        var nwEntryAudit = new NwEntryAudit
+        {
+            SignalPrice = price,
+            Mid = mid,
+            Upper = upper,
+            Lower = lower,
+            Bars = nwBars,
+            TimeframeMinutes = NW_TIMEFRAME_MINUTES,
+            BandAsOfEt = bandAsOfEt,
+            SignalTimeUtc = DateTime.UtcNow
+        };
+
+        LogMessage($"[NW {NW_TIMEFRAME_MINUTES}M ENTRY SIGNAL] {symbol} price={price:F2} <= lower={lower:F2} | " +
+                   $"mid={mid:F2} upper={upper:F2} bars={nwBars} bandAsOf={bandAsOfEt:yyyy-MM-dd HH:mm} ET");
         _lastBlockedReasonBySymbol.TryRemove(symbol, out _);
-        bool opened = OpenPosition(symbol, qty, price, TradeSide.Buy, false, "NW_BAND_LONG");
+        bool opened = OpenPosition(symbol, qty, price, TradeSide.Buy, false, "NW_BAND_LONG", nwEntryAudit);
         if (opened)
         {
             string decision = $"ENTRY submitted at {price:F2}";
@@ -3443,7 +3512,8 @@ public partial class SimulatedBroker
     // ══════════════════════════════════════════════════════════
 
     private bool OpenPosition(string symbol, int qty, decimal price,
-                              TradeSide side, bool isShort, string strategyTag)
+                              TradeSide side, bool isShort, string strategyTag,
+                              NwEntryAudit? nwEntryAudit = null)
     {
         // Defense in depth: scanners, intrabar callbacks, config reloads and any
         // future strategy path all converge here.  A disabled master switch must
@@ -3722,6 +3792,10 @@ public partial class SimulatedBroker
             _pendingStrategyTag = new ConcurrentDictionary<string, string>();
         _pendingStrategyTag[symbol] = strategyTag;
         _pendingInitialRisk[symbol] = stopDist;
+        if (isNwBand && nwEntryAudit != null)
+            _pendingNwEntryAudit[symbol] = nwEntryAudit;
+        else
+            _pendingNwEntryAudit.TryRemove(symbol, out _);
 
         DateTime entryAttemptUtc = DateTime.UtcNow;
         _pendingEntrySymbols[symbol] = true;
@@ -3794,7 +3868,8 @@ public partial class SimulatedBroker
                 tickRound(stopTrigger), isNwBand ? 0m : tickRound(stopLimitPrice),
                 tickRound(targetPrice),
                 useStopMarket: isNwBand,
-                overridePercentageConstraints: isNwBand);
+                overridePercentageConstraints: isNwBand,
+                goodTillCanceledStop: isNwBand);
 
             if (!bracketSubmitted)
             {
@@ -4273,6 +4348,7 @@ public partial class SimulatedBroker
                 decimal initialRisk = 0m;
                 _pendingStrategyTag?.TryRemove(order.Symbol, out tag);
                 _pendingInitialRisk?.TryRemove(order.Symbol, out initialRisk);
+                _pendingNwEntryAudit.TryRemove(order.Symbol, out var nwEntryAudit);
                 string resolvedTag = tag ?? "";
                 _indicatorCache.TryGetValue(order.Symbol, out var entryIndicators);
                 _vwap.TryGetValue(order.Symbol, out decimal entryVwap);
@@ -4294,7 +4370,10 @@ public partial class SimulatedBroker
                     EntryRsi = entryIndicators?.Rsi14 ?? 0d,
                     EntryAtr = entryIndicators?.Atr14 ?? 0m,
                     EntryVwap = entryVwap,
-                    EntrySetupScore = ScoreSetup(order.Symbol, entryCandles)
+                    EntrySetupScore = ScoreSetup(order.Symbol, entryCandles),
+                    NwEntryAudit = resolvedTag.StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase)
+                        ? nwEntryAudit
+                        : null
                 };
 
                 if (_pendingBracketChildren.TryRemove(order.Symbol, out var bracketIds))
@@ -4373,7 +4452,8 @@ public partial class SimulatedBroker
                     EntryRsi = pos.EntryRsi,
                     EntryAtr = pos.EntryAtr,
                     EntryVwap = pos.EntryVwap,
-                    EntrySetupScore = pos.EntrySetupScore
+                    EntrySetupScore = pos.EntrySetupScore,
+                    NwEntryAudit = pos.NwEntryAudit
                 });
                 if (_completedTrades.Count > 200) _completedTrades.RemoveAt(0);
 
@@ -4396,7 +4476,8 @@ public partial class SimulatedBroker
                     EntryRsi = pos.EntryRsi,
                     EntryAtr = pos.EntryAtr,
                     EntryVwap = pos.EntryVwap,
-                    EntrySetupScore = pos.EntrySetupScore
+                    EntrySetupScore = pos.EntrySetupScore,
+                    NwEntryAudit = pos.NwEntryAudit
                 };
                 lock (_allTrades)
                 {
@@ -4497,11 +4578,13 @@ public partial class SimulatedBroker
         _strategyTradeCount.Clear();
         _lastNwDecisionBySymbol.Clear();
         _lastNwTouchDecisionBySymbol.Clear();
+        _nwTouchState.Clear();
         _pendingEntrySymbols.Clear();
         _pendingEntryCreatedUtc.Clear();
         _entryOrderRejectionCooldownUntilUtc.Clear();
         _pendingStrategyTag?.Clear();
         _pendingInitialRisk.Clear();
+        _pendingNwEntryAudit.Clear();
         _pendingBracketChildren.Clear();
         _pendingEntryCount = 0;
         _completedTrades.Clear();
@@ -4536,15 +4619,34 @@ public partial class SimulatedBroker
 
             SnapshotLifetimeEquity();
 
+            List<SimPosition> positionsAtEod;
+            lock (_lock)
+                positionsAtEod = _positions.Values.ToList();
+
+            int nwHeldOvernight = positionsAtEod.Count(p =>
+                (p.StrategyTag ?? "").StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase));
+            int eodExitCount = 0;
+
             if (EOD_LIQUIDATE_ENABLED)
             {
-                foreach (var p in _positions.Values.ToList())
+                foreach (var p in positionsAtEod)
                 {
+                    // NW is explicitly a multi-day hold: only its configured
+                    // percentage target, its protective loss stop, or a manual
+                    // dashboard action may close it. The global intraday EOD
+                    // switch continues to flatten every other strategy.
+                    if ((p.StrategyTag ?? "").StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
                     CancelBracketChildren(p);  // FIX: prevent orphaned bracket fills creating ghost entries overnight
                     TradeSide exitSide = p.IsShort ? TradeSide.Buy : TradeSide.Sell;
                     SubmitOrder(p.Symbol, p.Quantity, 0, exitSide, "EOD_LIQUIDATE", "MKT");
+                    eodExitCount++;
                 }
             }
+
+            if (nwHeldOvernight > 0)
+                LogMessage($"[EOD] Holding {nwHeldOvernight} NW position(s) overnight; +{NW_TAKE_PROFIT_PCT * 100m:F2}% target and -{NW_STOP_LOSS_PCT * 100m:F2}% protective stop remain active.");
 
             int total = _winCount + _lossCount;
             double winRate = total > 0 ? (double)_winCount / total * 100 : 0;
@@ -4552,7 +4654,9 @@ public partial class SimulatedBroker
                 $"EOD PnL   : {_totalRealizedPnL:C2}\n" +
                 $"Trades    : {_tradesToday}\n" +
                 $"Win Rate  : {winRate:F1}% ({_winCount}W / {_lossCount}L)\n" +
-                $"Overnight : {(EOD_LIQUIDATE_ENABLED ? "disabled" : $"{_positions.Count} position(s) may remain open")}\n\n" +
+                $"Overnight : {(EOD_LIQUIDATE_ENABLED
+                    ? $"{nwHeldOvernight} NW held; {eodExitCount} non-NW exit(s) submitted"
+                    : $"{positionsAtEod.Count} position(s) may remain open")}\n\n" +
                 $"Trade Log:\n{string.Join("\n", _tradeHistoryLog)}";
             _ = SendEmail("📊 EOD PERFORMANCE REPORT", report);
         }
@@ -5718,6 +5822,7 @@ public partial class SimulatedBroker
             Console.WriteLine($"[CONFIG] Loaded from {CONFIG_FILE}");
             Console.WriteLine($"[CONFIG] Effective: budget={TOTAL_BUDGET:F0}, position={POSITION_SIZE:F0}, " +
                               $"NW={NW_TIMEFRAME_MINUTES}m/{NW_LOOKBACK}/{NW_BANDWIDTH:F1}/{NW_MULT:F1}, " +
+                              $"NW-exit=+{NW_TAKE_PROFIT_PCT * 100m:F2}%/-{NW_STOP_LOSS_PCT * 100m:F2}% (multi-day), " +
                               $"day/OR-hour/NW-hour/NW-day/strategyCap={MAX_TRADES_PER_DAY}/{MAX_TRADES_PER_HOUR}/{NW_MAX_TRADES_PER_HOUR}/{NW_MAX_TRADES_PER_DAY}/{MAX_TRADES_PER_STRATEGY}, " +
                               $"consecutiveLossCap={MAX_CONSECUTIVE_LOSSES}, firstEntry={MIN_ENTRY_MINUTES_AFTER_OPEN}m");
             if (string.IsNullOrWhiteSpace(EffectiveConfigPassword()))
@@ -6240,6 +6345,7 @@ public partial class SimulatedBroker
                         nwHistoryReloadNeeded = NW_TIMEFRAME_MINUTES != oldNwTimeframe
                             || (!oldNwEnabled && STRATEGY_NADARAYA_WATSON_ENABLED);
                         nwEnvelopeChanged = nwHistoryReloadNeeded
+                            || oldNwEnabled != STRATEGY_NADARAYA_WATSON_ENABLED
                             || NW_LOOKBACK != oldNwLookback
                             || NW_BANDWIDTH != oldNwBandwidth
                             || NW_MULT != oldNwMult;
@@ -6285,6 +6391,7 @@ public partial class SimulatedBroker
                         _nwEnvelopeCache.Clear();
                         _lastNwDecisionBySymbol.Clear();
                         _lastNwTouchDecisionBySymbol.Clear();
+                        _nwTouchState.Clear();
                     }
                     if (nwHistoryReloadNeeded)
                     {
@@ -6505,8 +6612,23 @@ public partial class SimulatedBroker
                 decimal pnlPt = p.AvgPrice > 0
                     ? (px - p.AvgPrice) / p.AvgPrice * (p.IsShort ? -1 : 1) * 100 : 0;
                 double heldMin = (DateTime.UtcNow - p.EntryTime).TotalMinutes;
+                bool isNwPosition = (p.StrategyTag ?? "").StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase);
+                decimal nwTarget = isNwPosition && p.AvgPrice > 0
+                    ? p.AvgPrice * (p.IsShort ? 1m - NW_TAKE_PROFIT_PCT : 1m + NW_TAKE_PROFIT_PCT)
+                    : 0m;
+                decimal nwStopPct = isNwPosition ? NW_STOP_LOSS_PCT * 100m : 0m;
+                var nwAudit = p.NwEntryAudit;
+                decimal nwSignalPrice = nwAudit?.SignalPrice ?? 0m;
+                decimal nwEntryMid = nwAudit?.Mid ?? 0m;
+                decimal nwEntryUpper = nwAudit?.Upper ?? 0m;
+                decimal nwEntryLower = nwAudit?.Lower ?? 0m;
+                int nwEntryBars = nwAudit?.Bars ?? 0;
+                int nwEntryTimeframe = nwAudit?.TimeframeMinutes ?? 0;
+                string nwBandAsOf = nwAudit != null && nwAudit.BandAsOfEt != DateTime.MinValue
+                    ? nwAudit.BandAsOfEt.ToString("yyyy-MM-dd HH:mm")
+                    : "";
                 if (!first) posArr.Append(",");
-                posArr.Append($@"{{""sym"":""{p.Symbol}"",""qty"":{p.Quantity},""side"":""{(p.IsShort ? "SHORT" : "LONG")}"",""avg"":{p.AvgPrice:F2},""cur"":{px:F2},""unrl"":{unrl:F2},""pct"":{pnlPt:F2},""min"":{heldMin:F1},""strat"":""{p.StrategyTag}"",""exitPending"":{(p.ExitSubmitted ? "true" : "false")}}}");
+                posArr.Append($@"{{""sym"":""{p.Symbol}"",""qty"":{p.Quantity},""side"":""{(p.IsShort ? "SHORT" : "LONG")}"",""avg"":{p.AvgPrice:F2},""cur"":{px:F2},""unrl"":{unrl:F2},""pct"":{pnlPt:F2},""min"":{heldMin:F1},""strat"":""{p.StrategyTag}"",""exitPending"":{(p.ExitSubmitted ? "true" : "false")},""nwTarget"":{nwTarget:F2},""nwStopPct"":{nwStopPct:F2},""nwSignalPrice"":{nwSignalPrice:F2},""nwEntryMid"":{nwEntryMid:F2},""nwEntryUpper"":{nwEntryUpper:F2},""nwEntryLower"":{nwEntryLower:F2},""nwEntryBars"":{nwEntryBars},""nwEntryTimeframe"":{nwEntryTimeframe},""nwBandAsOf"":""{nwBandAsOf}""}}");
                 first = false;
             }
             posArr.Append("]");
@@ -6588,7 +6710,7 @@ public partial class SimulatedBroker
                 // columns from raw 1-minute candles, while the strategy used
                 // 15-minute candles, so the displayed levels were unrelated.
                 decimal nwHi = 0m, nwLo = 0m;
-                var (_, nwUpRow, nwLoRow, nwBarsRow) = GetNadarayaWatson1HourEnvelope(sym);
+                var (_, nwUpRow, nwLoRow, nwBarsRow, _) = GetNadarayaWatson1HourEnvelope(sym);
                 if (nwBarsRow >= NW_LOOKBACK)
                 {
                     nwHi = nwUpRow;

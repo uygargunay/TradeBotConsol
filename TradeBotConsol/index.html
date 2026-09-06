@@ -2750,6 +2750,16 @@
                     const btnCls = pending ? 'pc-sell-btn exit-pending' : 'pc-sell-btn';
                     const btnLabel = pending ? '⏳ Pending' : '✕ Sell';
                     const btnTitle = pending ? `Exit pending for ${p.sym} — click to force new MKT order` : `Market sell ${p.sym}`;
+                    const isNw = typeof p.strat === 'string' && p.strat.startsWith('NW_BAND_');
+                    const nwTargetPct = isNw && p.avg > 0 && p.nwTarget > 0
+                        ? Math.abs((p.nwTarget - p.avg) / p.avg * 100)
+                        : 0;
+                    const nwTargetLine = isNw && p.nwTarget > 0
+                        ? `<div class="pcm" style="color:var(--green)">Hold target $${p.nwTarget.toFixed(2)} (+${nwTargetPct.toFixed(2)}%) · −${Number(p.nwStopPct || 0).toFixed(2)}% protective stop</div>`
+                        : '';
+                    const nwEntryLine = isNw && p.nwEntryLower > 0
+                        ? `<div class="pcm" title="Entry-time NW envelope: mid $${p.nwEntryMid.toFixed(2)}, upper $${p.nwEntryUpper.toFixed(2)}, ${p.nwEntryBars} completed bars">Signal $${p.nwSignalPrice.toFixed(2)} ≤ NW Low $${p.nwEntryLower.toFixed(2)} · ${p.nwEntryTimeframe}m band as of ${p.nwBandAsOf} ET</div>`
+                        : '';
                     return `<div class="pc">
                                                                                                                                             <div class="pct">
                                                                                                                                                 <span class="pcsym">${p.sym}</span>
@@ -2759,6 +2769,8 @@
                                                                                                                                             <div class="pcrow"><span class="m">Qty <b style="color:var(--text)">${p.qty}</b></span><span class="pcpnl ${pc}">${fmtS(p.unrl)}</span></div>
                                                                                                                                             <div class="pcrow"><span class="m">$${p.avg.toFixed(2)} → $${p.cur.toFixed(2)}</span><span class="ppill" style="background:${pbg};color:${pfg}">${pp}</span></div>
                                                                                                                                             <div class="pcm">${strategyLabel(p.strat)} · ${p.min.toFixed(0)}m held</div>
+                                                                                                                                            ${nwTargetLine}
+                                                                                                                                            ${nwEntryLine}
                                                                                                                                           </div>`;
                 }).join('');
             }
@@ -2993,7 +3005,7 @@
             NW_BANDWIDTH: 6.0,
             NW_MULT: 2.5,
             NW_STOP_LOSS_PCT: 0.03,
-            NW_TAKE_PROFIT_PCT: 0.03,
+            NW_TAKE_PROFIT_PCT: 0.05,
             NW_MAX_TRADES_PER_HOUR: 2,
             NW_MAX_TRADES_PER_DAY: 2,
             EARLY_PATTERN_ENTRY: true,
@@ -3178,7 +3190,7 @@
                                                                                                                                                 <div class="sm-toggle-row">
                                                                                                                                                     <div>
                                                                                                                                                         <div class="sm-toggle-lbl">Liquidate at EOD</div>
-                                                                                                                                                        <div class="sm-toggle-sub">Turn this on only if you want to force the swing bot flat every day.</div>
+                                                                                                                                                        <div class="sm-toggle-sub">Flattens non-NW positions at 3:30 PM ET. NW positions always remain eligible to hold across sessions.</div>
                                                                                                                                                     </div>
                                                                                                                                                     <label class="toggle-switch">
                                                                                                                                                         <input type="checkbox" id="cfg-EOD_LIQUIDATE_ENABLED" ${CFG.EOD_LIQUIDATE_ENABLED ? 'checked' : ''}>
@@ -3232,9 +3244,9 @@
                                                                                                                                         <div class="sm-section">
                                                                                                                                             <div class="sm-section-title">Independent Nadaraya-Watson Strategy</div>
                                                                                                                                             <div style="background:rgba(188,140,255,.08);border:1px solid rgba(188,140,255,.28);border-radius:5px;padding:8px 10px;margin-bottom:10px;font-size:10px;color:var(--muted);line-height:1.6">
-                                                                                                                                                NW is evaluated separately on every fresh live LAST tick. A lower-band touch can submit its own long without confirmation from—or consuming the rolling-hour allowance of—the OR strategies. NW has its own hourly cap; account-level day, position, cash, spread and loss limits still apply.
+                                                                                                                                                NW is evaluated separately on every fresh live LAST tick. It must first arm above a fixed completed-bar lower band and then cross it; starting or becoming eligible while already below the band cannot trigger a delayed entry. NW positions hold across sessions for the configured target, while the protective stop remains active.
                                                                                                                                             </div>
-                                                                                                                                            ${toggleField('STRATEGY_NADARAYA_WATSON', 'Nadaraya-Watson Bands', 'Buys a fresh live LAST-price touch of the lower configured-timeframe band and exits the full position at the configured profit percentage.')}
+                                                                                                                                            ${toggleField('STRATEGY_NADARAYA_WATSON', 'Nadaraya-Watson Bands', 'Buys only a fresh live cross from above the lower configured-timeframe band, then holds across days until the configured full-position profit target or protective stop.')}
                                                                                                                                             <div class="sm-grid" style="margin-top:10px">
                                                                                                                                                 ${selectField('NW_TIMEFRAME_MINUTES', 'NW Timeframe', [
                 { value: 15, label: '15 min' },
@@ -3245,7 +3257,7 @@
                                                                                                                                                 ${field('NW_BANDWIDTH', 'NW Bandwidth', 'number', CFG.NW_BANDWIDTH, 'Gaussian kernel bandwidth — larger = smoother centerline, fewer signals')}
                                                                                                                                                 ${field('NW_MULT', 'NW Band Multiplier', 'number', CFG.NW_MULT, 'Band width = kernel MAE x this multiplier — larger = wider bands, fewer signals')}
                                                                                                                                                 ${field('NW_STOP_LOSS_PCT', 'NW Stop Loss (decimal)', 'number', CFG.NW_STOP_LOSS_PCT, 'Flat NW protective stop as a decimal. 0.03 = 3%.')}
-                                                                                                                                                ${percentField('NW_TAKE_PROFIT_PCT', 'NW Take Profit (%)', CFG.NW_TAKE_PROFIT_PCT, 'Closes the entire NW position when this gain is reached from the actual average fill. Enter 3 for 3%.')}
+                                                                                                                                                ${percentField('NW_TAKE_PROFIT_PCT', 'NW Take Profit (%)', CFG.NW_TAKE_PROFIT_PCT, 'Closes the entire NW position when this gain is reached from the actual average fill. Enter 5 for 5%.')}
                                                                                                                                                 ${field('NW_MAX_TRADES_PER_HOUR', 'NW Trades / Rolling Hour', 'number', CFG.NW_MAX_TRADES_PER_HOUR, 'Dedicated NW entry cap. Ordinary strategy trades do not consume it; 0 disables this NW-specific cap.')}
                                                                                                                                                 ${field('NW_MAX_TRADES_PER_DAY', 'NW Trades / Day', 'number', CFG.NW_MAX_TRADES_PER_DAY, 'Dedicated NW strategy-family cap. Account-wide Max Trades / Day still applies; 0 disables only this NW-specific cap.')}
                                                                                                                                             </div>
