@@ -152,7 +152,8 @@ public class IbClient : EWrapper, IBroker
     public bool SubmitBracketOrder(string symbol, int qty, decimal entryPrice, TradeSide side,
                                    decimal stopPrice, decimal stopLimit, decimal targetPrice,
                                    bool useStopMarket = false,
-                                   bool overridePercentageConstraints = false)
+                                   bool overridePercentageConstraints = false,
+                                   bool goodTillCanceledStop = false)
     {
         if (!_isReady)
         {
@@ -242,7 +243,10 @@ public class IbClient : EWrapper, IBroker
             ParentId = parentId,
             OcaGroup = hasProfitTarget ? ocaGroup : "",
             OcaType = hasProfitTarget ? 1 : 0,
-            Tif = "DAY",
+            // Multi-day strategies such as NW keep their protective stop at
+            // IBKR after the entry session. Ordinary intraday brackets retain
+            // their existing DAY behavior.
+            Tif = goodTillCanceledStop ? "GTC" : "DAY",
             Transmit = !hasProfitTarget,
             OverridePercentageConstraints = overridePercentageConstraints
         };
@@ -324,7 +328,7 @@ public class IbClient : EWrapper, IBroker
             : $"{stopPrice:F2}/{stopLimit:F2}";
         Console.WriteLine($"[BRACKET] {symbol} x{qty} entry={entryAction}@{entryPrice:F2} " +
                           $"(signal={ActionString(side)} reversed={ReverseSignals}) " +
-                          $"stop={stopText} target={targetText} " +
+                          $"stop={stopText}/{stopOrder.Tif} target={targetText} " +
                           $"overridePct={overridePercentageConstraints} " +
                           $"parentId={parentId} stopId={stopId} targetId={targetId}");
         return true;

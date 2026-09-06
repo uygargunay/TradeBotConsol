@@ -131,10 +131,10 @@
     "BLK",
     "V"
   ],
-  "notes": "Safety profile: non-NW strategies use OR routing; NW runs independently on live lower-band touches; conservative entry and loss limits.",
+  "notes": "Safety profile: non-NW strategies use OR routing; NW requires a fresh live cross from above the lower band and holds across sessions for its configured target; conservative entry and loss limits.",
   "USE_SMA100": true,
   "MinGrossTargetToCommissionMult": 3.0,
   "NW_STOP_LOSS_PCT": 0.03,
-  "NW_TAKE_PROFIT_PCT": 0.03,
+  "NW_TAKE_PROFIT_PCT": 0.05,
   "NW_TIMEFRAME_MINUTES": 30
 }
