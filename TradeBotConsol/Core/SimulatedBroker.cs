@@ -56,6 +56,7 @@ public sealed class NwEntryAudit
     public decimal Lower { get; set; }
     public int Bars { get; set; }
     public int TimeframeMinutes { get; set; }
+    public int[] ConfirmingTimeframesMinutes { get; set; } = Array.Empty<int>();
     public DateTime BandAsOfEt { get; set; } = DateTime.MinValue;
     public DateTime SignalTimeUtc { get; set; } = DateTime.MinValue;
 }
@@ -310,33 +311,41 @@ public partial class SimulatedBroker
     private decimal SWING_TARGET_R_MULT = 3.20m;
     private bool SWING_REQUIRE_CONTRACTION = true;
 
-    private bool STRATEGY_ORB_ENABLED = true;
-    private bool STRATEGY_GAP_GO_ENABLED = true;
-    private bool STRATEGY_VWAP_ENABLED = true;
-    private bool STRATEGY_MEAN_REV_ENABLED = true;
-    private bool STRATEGY_BB_MR_ENABLED = true;
-    private bool STRATEGY_MOMENTUM_ENABLED = true;
-    private bool STRATEGY_EMA_POCKET_ENABLED = true;
-    private bool STRATEGY_OUTSIDE_CANDLE_ENABLED = true;
-    private bool STRATEGY_CANDLE_PATTERNS_ENABLED = true;
-    private bool STRATEGY_MICRO_PULLBACK_ENABLED = true;
+    // Fail-closed master mode: while enabled, OpenPosition rejects every
+    // non-NW tag even if an old config or future scanner accidentally enables it.
+    private bool NW_ONLY_MODE = true;
+    private bool STRATEGY_ORB_ENABLED = false;
+    private bool STRATEGY_GAP_GO_ENABLED = false;
+    private bool STRATEGY_VWAP_ENABLED = false;
+    private bool STRATEGY_MEAN_REV_ENABLED = false;
+    private bool STRATEGY_BB_MR_ENABLED = false;
+    private bool STRATEGY_MOMENTUM_ENABLED = false;
+    private bool STRATEGY_EMA_POCKET_ENABLED = false;
+    private bool STRATEGY_OUTSIDE_CANDLE_ENABLED = false;
+    private bool STRATEGY_CANDLE_PATTERNS_ENABLED = false;
+    private bool STRATEGY_MICRO_PULLBACK_ENABLED = false;
     private bool STRATEGY_NADARAYA_WATSON_ENABLED = true;
     // Keep these fallbacks aligned with bot-config.json. They matter whenever the
     // runtime config file is missing from bin/Release or bin/Debug.
-    private int NW_TIMEFRAME_MINUTES = 30;  // NW bar size: 15, 30, or 60 minutes
-    private int NW_LOOKBACK = 250;          // completed regular-session bars at NW_TIMEFRAME_MINUTES
+    private static readonly int[] SUPPORTED_NW_TIMEFRAMES_MINUTES = { 15, 30, 60, 240 };
+    // 15m remains available in Settings, but is not enabled by default because
+    // the available real-trade sample contains no evidence that the noisier
+    // interval improves the 30m profile. Each selected timeframe is monitored
+    // independently from completed RTH bars.
+    private int[] NW_TIMEFRAMES_MINUTES = { 30, 60, 240 };
+    private int NW_LOOKBACK = 250;          // completed regular-session bars per selected timeframe
     private decimal NW_BANDWIDTH = 6m;      // Gaussian kernel bandwidth — larger = smoother centerline
     private decimal NW_MULT = 2.5m;         // band width = kernel MAE * this multiplier
     private decimal NW_STOP_LOSS_PCT = 0.03m;  // flat % stop-loss for NW_BAND_ trades (not ATR-based)
     private decimal NW_TAKE_PROFIT_PCT = 0.05m; // close the full NW position at this gain from average fill
-    private bool EARLY_PATTERN_ENTRY_ENABLED = true;
+    private bool EARLY_PATTERN_ENTRY_ENABLED = false;
     private int PATTERN_MIN_SCORE = 68;
     private int INTRABAR_SIGNAL_COOLDOWN_SECONDS = 30;
     private decimal FAST_VOL_MULT = 1.30m;
     private int DATA_LINES_PER_SYMBOL = 1;
     private int MAX_MARKET_DATA_LINES = 120;
 
-    private bool _allowShorts = true;
+    private bool _allowShorts = false;
 
     // Entry inversion switch:
     // When true, the signal/gate logic remains unchanged, but the actual entry
@@ -374,8 +383,8 @@ public partial class SimulatedBroker
     private readonly ConcurrentDictionary<string, OpeningRange> _orbRanges = new();
     private readonly ConcurrentDictionary<string, decimal> _dailyGapPct = new();
     private readonly ConcurrentDictionary<string, List<Candle>> _dailyCandles = new();
-    // Dedicated regular-session timeframe bars for the Nadaraya-Watson envelope.
-    // Loaded directly from IBKR at startup and updated from finalized live 1-min bars.
+    // Dedicated regular-session bars for each symbol/timeframe pair. Composite
+    // keys prevent 15m/30m/1h/4h histories from overwriting one another.
     private readonly ConcurrentDictionary<string, List<Candle>> _hourlyCandles = new();
 
     // NW bands are based only on completed timeframe bars, so they change at most
@@ -500,8 +509,8 @@ public partial class SimulatedBroker
     private int _tradesThisHour = 0;
     private int _nwTradesThisHour = 0;
     private int MAX_TRADES_PER_HOUR = 2;
-    private int NW_MAX_TRADES_PER_HOUR = 2;
-    private int NW_MAX_TRADES_PER_DAY = 2;
+    private int NW_MAX_TRADES_PER_HOUR = 4;
+    private int NW_MAX_TRADES_PER_DAY = 4;
     private DateTime _currentTradeHour = DateTime.MinValue;
     // Separate rolling entry lanes: ordinary strategies cannot consume NW's
     // allowance, and NW attempts cannot consume the ordinary-strategy allowance.
@@ -1603,6 +1612,11 @@ public partial class SimulatedBroker
     {
         CheckDailyReset();
 
+        // NW uses its own live-tick path. In NW-only mode there is no reason to
+        // run (or accidentally re-enable) the ordinary closed-bar router.
+        if (NW_ONLY_MODE)
+            return;
+
         if (!PassesEntryGates(symbol, out int minutesSinceOpen))
             return;
 
@@ -1752,31 +1766,106 @@ public partial class SimulatedBroker
     //  the current 1-minute price was also moving the band it was trying to touch.
     // ══════════════════════════════════════════════════════════
 
-    // NOTE: name says "Hour" but this now buckets by NW_TIMEFRAME_MINUTES
-    // (15, 30, or 60) — kept the original name to avoid touching every
-    // caller across two files; the 60-minute default keeps existing
-    // behavior unchanged unless NW_TIMEFRAME_MINUTES is set otherwise.
-    private DateTime? GetRegularSessionHourBucket(DateTime time)
+    private static string GetNwSeriesKey(string symbol, int timeframeMinutes)
+        => $"{symbol.Trim().ToUpperInvariant()}|{timeframeMinutes}";
+
+    private static string FormatNwTimeframeLabel(int timeframeMinutes)
+        => timeframeMinutes >= 60 && timeframeMinutes % 60 == 0
+            ? $"{timeframeMinutes / 60}h"
+            : $"{timeframeMinutes}m";
+
+    private static string FormatNwTimeframeTag(int timeframeMinutes)
+        => timeframeMinutes >= 60 && timeframeMinutes % 60 == 0
+            ? $"{timeframeMinutes / 60}H"
+            : $"{timeframeMinutes}M";
+
+    private static string GetNwStrategyTag(int timeframeMinutes)
+        => $"NW_BAND_{FormatNwTimeframeTag(timeframeMinutes)}_LONG";
+
+    private int GetPrimaryNwTimeframe()
+        => NW_TIMEFRAMES_MINUTES.Contains(30)
+            ? 30
+            : NW_TIMEFRAMES_MINUTES.FirstOrDefault(30);
+
+    private DateTime? GetRegularSessionNwBucket(DateTime time, int timeframeMinutes)
     {
         DateTime open = new DateTime(time.Year, time.Month, time.Day, 9, 30, 0);
         DateTime close = new DateTime(time.Year, time.Month, time.Day, 16, 0, 0);
         if (time < open || time >= close) return null;
 
-        int tf = (NW_TIMEFRAME_MINUTES == 15 || NW_TIMEFRAME_MINUTES == 30 || NW_TIMEFRAME_MINUTES == 60)
-            ? NW_TIMEFRAME_MINUTES : 60;
+        int tf = ValidateNwTimeframe(timeframeMinutes);
         int minutesFromOpen = (int)(time - open).TotalMinutes;
         return open.AddMinutes((minutesFromOpen / tf) * tf);
     }
 
-    // Snaps any config value to the nearest of the three supported NW bar
-    // sizes. IBKR's historical-data duration limits are much shorter for
-    // sub-hour bars than for 1-hour bars (see IbClient.RequestHourlyHistoricalData),
-    // so only these three are supported rather than an arbitrary integer.
-    private int ValidateNwTimeframe(int minutes)
+    private static int ValidateNwTimeframe(int minutes)
     {
-        if (minutes <= 20) return 15;
-        if (minutes <= 45) return 30;
-        return 60;
+        return SUPPORTED_NW_TIMEFRAMES_MINUTES
+            .OrderBy(tf => Math.Abs(tf - minutes))
+            .First();
+    }
+
+    private static int[] ValidateNwTimeframes(IEnumerable<int>? timeframes)
+    {
+        var selected = (timeframes ?? Array.Empty<int>())
+            .Select(ValidateNwTimeframe)
+            .Distinct()
+            .OrderBy(tf => tf)
+            .ToArray();
+        return selected.Length > 0 ? selected : new[] { 30 };
+    }
+
+    private static int[] ReadNwTimeframes(JsonElement root, int[] fallback)
+    {
+        if (root.TryGetProperty("NW_TIMEFRAMES_MINUTES", out var arrayElement)
+            && arrayElement.ValueKind == JsonValueKind.Array)
+        {
+            var requested = new List<int>();
+            foreach (var item in arrayElement.EnumerateArray())
+            {
+                if (item.TryGetInt32(out int timeframeMinutes))
+                    requested.Add(timeframeMinutes);
+            }
+            return ValidateNwTimeframes(requested);
+        }
+
+        // Backward compatibility for configurations saved before multiselect.
+        if (root.TryGetProperty("NW_TIMEFRAME_MINUTES", out var legacyElement)
+            && legacyElement.TryGetInt32(out int legacyTimeframe))
+        {
+            // The merged pre-multiselect profile was 30m. This release's explicit
+            // migration for that profile enables the recommended 30m/1h/4h set;
+            // non-30m legacy choices remain single selections.
+            if (legacyTimeframe == 30 && fallback.Length > 1)
+                return ValidateNwTimeframes(fallback);
+            return ValidateNwTimeframes(new[] { legacyTimeframe });
+        }
+
+        return ValidateNwTimeframes(fallback);
+    }
+
+    private void EnforceNwOnlyStrategyFlags()
+    {
+        if (!NW_ONLY_MODE) return;
+
+        STRATEGY_ORB_ENABLED = false;
+        STRATEGY_GAP_GO_ENABLED = false;
+        STRATEGY_VWAP_ENABLED = false;
+        STRATEGY_MEAN_REV_ENABLED = false;
+        STRATEGY_BB_MR_ENABLED = false;
+        STRATEGY_MOMENTUM_ENABLED = false;
+        STRATEGY_EMA_POCKET_ENABLED = false;
+        STRATEGY_OUTSIDE_CANDLE_ENABLED = false;
+        STRATEGY_CANDLE_PATTERNS_ENABLED = false;
+        STRATEGY_MICRO_PULLBACK_ENABLED = false;
+        SCALPING_ENABLED = false;
+        ALLOW_SCALP_BREAKOUT_LONGS = false;
+        ALLOW_SCALP_BREAKOUT_SHORTS = false;
+        ALLOW_SCALP_ORB_LONGS = false;
+        ALLOW_BULLISH_CANDLE_PATTERNS = false;
+        EARLY_PATTERN_ENTRY_ENABLED = false;
+        SWING_MODE_ENABLED = false;
+        _allowShorts = false;
     }
 
     private static decimal ValidateNwTakeProfitPct(decimal value)
@@ -1789,14 +1878,31 @@ public partial class SimulatedBroker
         return value;
     }
 
+    private static decimal ValidateNwStopLossPct(decimal value)
+    {
+        if (value <= 0m || value > 1m)
+            throw new ArgumentOutOfRangeException(
+                nameof(value),
+                "NW_STOP_LOSS_PCT must be greater than 0 and no more than 1 (0.03 = 3%).");
+
+        return value;
+    }
+
     private void UpdateHourlyFromMinute(string symbol, Candle minuteBar)
     {
         if (minuteBar == null) return;
-        DateTime? bucketMaybe = GetRegularSessionHourBucket(minuteBar.Time);
+        foreach (int timeframeMinutes in NW_TIMEFRAMES_MINUTES.ToArray())
+            UpdateNwTimeframeFromMinute(symbol, timeframeMinutes, minuteBar);
+    }
+
+    private void UpdateNwTimeframeFromMinute(string symbol, int timeframeMinutes, Candle minuteBar)
+    {
+        DateTime? bucketMaybe = GetRegularSessionNwBucket(minuteBar.Time, timeframeMinutes);
         if (!bucketMaybe.HasValue) return;
 
         DateTime bucket = bucketMaybe.Value;
-        var list = _hourlyCandles.GetOrAdd(symbol, _ => new List<Candle>());
+        string seriesKey = GetNwSeriesKey(symbol, timeframeMinutes);
+        var list = _hourlyCandles.GetOrAdd(seriesKey, _ => new List<Candle>());
 
         lock (list)
         {
@@ -1829,9 +1935,10 @@ public partial class SimulatedBroker
         }
     }
 
-    private List<Candle> GetCompletedNwHourlyCandles(string symbol)
+    private List<Candle> GetCompletedNwCandles(string symbol, int timeframeMinutes)
     {
-        if (!_hourlyCandles.TryGetValue(symbol, out var source) || source == null)
+        string seriesKey = GetNwSeriesKey(symbol, timeframeMinutes);
+        if (!_hourlyCandles.TryGetValue(seriesKey, out var source) || source == null)
             return new List<Candle>();
 
         List<Candle> snapshot;
@@ -1839,7 +1946,7 @@ public partial class SimulatedBroker
             snapshot = source.OrderBy(c => c.Time).ToList();
 
         DateTime nowEt = GetEasternTime();
-        DateTime? activeBucket = GetRegularSessionHourBucket(nowEt);
+        DateTime? activeBucket = GetRegularSessionNwBucket(nowEt, timeframeMinutes);
 
         // During RTH, exclude the current still-forming timeframe bar.
         if (activeBucket.HasValue)
@@ -1922,13 +2029,15 @@ public partial class SimulatedBroker
         return (mid, upper, lower);
     }
 
-    private (decimal mid, decimal upper, decimal lower, int bars, DateTime bandAsOfEt) GetNadarayaWatson1HourEnvelope(string symbol)
+    private (decimal mid, decimal upper, decimal lower, int bars, DateTime bandAsOfEt)
+        GetNadarayaWatsonEnvelope(string symbol, int timeframeMinutes)
     {
-        var bars = GetCompletedNwHourlyCandles(symbol);
+        string seriesKey = GetNwSeriesKey(symbol, timeframeMinutes);
+        var bars = GetCompletedNwCandles(symbol, timeframeMinutes);
         DateTime lastBarTime = bars.Count > 0 ? bars[^1].Time : DateTime.MinValue;
         if (bars.Count < NW_LOOKBACK) return (0m, 0m, 0m, bars.Count, lastBarTime);
 
-        if (_nwEnvelopeCache.TryGetValue(symbol, out var cached)
+        if (_nwEnvelopeCache.TryGetValue(seriesKey, out var cached)
             && cached.bars == bars.Count
             && cached.lastBarTime == lastBarTime
             && cached.lookback == NW_LOOKBACK
@@ -1939,28 +2048,95 @@ public partial class SimulatedBroker
         }
 
         var (mid, upper, lower) = ComputeNadarayaWatsonEnvelope(bars);
-        _nwEnvelopeCache[symbol] = (mid, upper, lower, bars.Count, lastBarTime,
-                                    NW_LOOKBACK, NW_BANDWIDTH, NW_MULT);
+        _nwEnvelopeCache[seriesKey] = (mid, upper, lower, bars.Count, lastBarTime,
+                                       NW_LOOKBACK, NW_BANDWIDTH, NW_MULT);
         return (mid, upper, lower, bars.Count, lastBarTime);
     }
 
-    private bool TryNadarayaWatsonStrategy(string symbol, List<Candle> candles, decimal triggerPrice = 0m)
+    private sealed class NwSignalCandidate
     {
-        if (!STRATEGY_NADARAYA_WATSON_ENABLED) return false;
+        public int TimeframeMinutes { get; init; }
+        public decimal Mid { get; init; }
+        public decimal Upper { get; init; }
+        public decimal Lower { get; init; }
+        public int Bars { get; init; }
+        public DateTime BandAsOfEt { get; init; }
+    }
 
-        var (mid, upper, lower, nwBars, bandAsOfEt) = GetNadarayaWatson1HourEnvelope(symbol);
+    private NwSignalCandidate? GetFreshNwCrossCandidate(
+        string symbol, int timeframeMinutes, decimal price)
+    {
+        string seriesKey = GetNwSeriesKey(symbol, timeframeMinutes);
+        string tfLabel = FormatNwTimeframeLabel(timeframeMinutes);
+        var (mid, upper, lower, nwBars, bandAsOfEt) =
+            GetNadarayaWatsonEnvelope(symbol, timeframeMinutes);
+
         if (nwBars < NW_LOOKBACK)
         {
-            _nwTouchState.TryRemove(symbol, out _);
-            _lastNwDecisionBySymbol[symbol] = $"History {nwBars}/{NW_LOOKBACK}";
-            return false;
+            _nwTouchState.TryRemove(seriesKey, out _);
+            _lastNwDecisionBySymbol[seriesKey] = $"{tfLabel}: history {nwBars}/{NW_LOOKBACK}";
+            return null;
         }
         if (mid <= 0 || upper <= lower)
         {
-            _nwTouchState.TryRemove(symbol, out _);
-            _lastNwDecisionBySymbol[symbol] = "Bands invalid";
-            return false;
+            _nwTouchState.TryRemove(seriesKey, out _);
+            _lastNwDecisionBySymbol[seriesKey] = $"{tfLabel}: bands invalid";
+            return null;
         }
+
+        // Each timeframe arms independently. A series must observe a live LAST
+        // above its own fixed lower band before a downward cross can be consumed.
+        bool envelopeChanged = !_nwTouchState.TryGetValue(seriesKey, out var touchState)
+            || touchState.bandAsOfEt != bandAsOfEt
+            || touchState.lower != lower;
+        if (envelopeChanged)
+        {
+            touchState = (lower, bandAsOfEt, price > lower);
+            _nwTouchState[seriesKey] = touchState;
+        }
+
+        if (price > lower)
+        {
+            _nwTouchState[seriesKey] = (lower, bandAsOfEt, true);
+            decimal distancePct = (price - lower) / lower * 100m;
+            _lastNwDecisionBySymbol[seriesKey] =
+                $"{tfLabel}: waiting {distancePct:F2}% above NW Low";
+            _lastNwTouchDecisionBySymbol.TryRemove(seriesKey, out _);
+            return null;
+        }
+
+        if (!touchState.armed)
+        {
+            decimal belowPct = (lower - price) / lower * 100m;
+            string decision =
+                $"{tfLabel}: below NW Low by {belowPct:F2}% without a fresh cross; waiting to re-arm";
+            _lastNwDecisionBySymbol[seriesKey] = decision;
+            _lastNwTouchDecisionBySymbol[seriesKey] =
+                $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
+            return null;
+        }
+
+        // Consume before portfolio gates. If the attempt is blocked, remaining
+        // below the band cannot create a delayed entry; that timeframe must re-arm.
+        _nwTouchState[seriesKey] = (lower, bandAsOfEt, false);
+        LogMessage($"[NW {tfLabel} CROSS] {symbol} price={price:F2} <= lower={lower:F2} | " +
+                   $"mid={mid:F2} upper={upper:F2} bars={nwBars} " +
+                   $"bandAsOf={bandAsOfEt:yyyy-MM-dd HH:mm} ET");
+
+        return new NwSignalCandidate
+        {
+            TimeframeMinutes = timeframeMinutes,
+            Mid = mid,
+            Upper = upper,
+            Lower = lower,
+            Bars = nwBars,
+            BandAsOfEt = bandAsOfEt
+        };
+    }
+
+    private bool TryNadarayaWatsonStrategy(string symbol, List<Candle>? candles, decimal triggerPrice = 0m)
+    {
+        if (!STRATEGY_NADARAYA_WATSON_ENABLED) return false;
 
         decimal price = triggerPrice;
         if (price <= 0 && _latestTick.TryGetValue(symbol, out decimal livePrice))
@@ -1973,93 +2149,83 @@ public partial class SimulatedBroker
             return false;
         }
 
-        // Arm only after this exact completed-bar envelope has observed a live
-        // LAST price above its lower band. A first tick that is already below the
-        // band is not a fresh touch and must not create a delayed falling-knife
-        // entry after startup/history loading or after an ineligible early cross.
-        bool envelopeChanged = !_nwTouchState.TryGetValue(symbol, out var touchState)
-            || touchState.bandAsOfEt != bandAsOfEt
-            || touchState.lower != lower;
-        if (envelopeChanged)
-        {
-            touchState = (lower, bandAsOfEt, price > lower);
-            _nwTouchState[symbol] = touchState;
-        }
+        // Evaluate every selected interval on the same LAST tick. If several
+        // cross together, prefer the longest (least noisy) signal and retain all
+        // confirming intervals in the audit record.
+        var candidates = NW_TIMEFRAMES_MINUTES
+            .OrderByDescending(tf => tf)
+            .Select(tf => GetFreshNwCrossCandidate(symbol, tf, price))
+            .Where(candidate => candidate != null)
+            .Cast<NwSignalCandidate>()
+            .ToList();
+        if (candidates.Count == 0) return false;
 
-        if (price > lower)
-        {
-            _nwTouchState[symbol] = (lower, bandAsOfEt, true);
-            decimal distancePct = lower > 0 ? (price - lower) / lower * 100m : 0m;
-            _lastNwDecisionBySymbol[symbol] = $"Waiting: {distancePct:F2}% above NW Low";
-            _lastNwTouchDecisionBySymbol.TryRemove(symbol, out _);
-            return false;
-        }
-
-        if (!touchState.armed)
-        {
-            decimal belowPct = lower > 0 ? (lower - price) / lower * 100m : 0m;
-            string decision = $"Below NW Low by {belowPct:F2}% without a fresh cross; waiting to re-arm above {lower:F2}";
-            _lastNwDecisionBySymbol[symbol] = decision;
-            _lastNwTouchDecisionBySymbol[symbol] = $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
-            return false;
-        }
-
-        // Consume this crossing before applying the remaining gates. If the
-        // crossing is too early or otherwise blocked, staying below the band
-        // cannot turn it into a late entry; price must move above and cross again.
-        _nwTouchState[symbol] = (lower, bandAsOfEt, false);
-        LogMessage($"[NW {NW_TIMEFRAME_MINUTES}M CROSS] {symbol} price={price:F2} <= lower={lower:F2} | " +
-                   $"mid={mid:F2} upper={upper:F2} bars={nwBars} bandAsOf={bandAsOfEt:yyyy-MM-dd HH:mm} ET");
+        NwSignalCandidate chosen = candidates[0];
+        int[] confirmingTimeframes = candidates
+            .Select(candidate => candidate.TimeframeMinutes)
+            .OrderByDescending(tf => tf)
+            .ToArray();
+        string confirmationLabel = string.Join(", ", confirmingTimeframes.Select(FormatNwTimeframeLabel));
 
         if (!PassesEntryGates(symbol, out _, nwTouchMode: true))
         {
-            string decision = $"CROSS blocked: {GetWatchlistReadiness(symbol, nwTouchMode: true)}";
+            string decision = $"CROSS blocked ({confirmationLabel}): " +
+                              GetWatchlistReadiness(symbol, nwTouchMode: true);
             _lastNwDecisionBySymbol[symbol] = decision;
-            _lastNwTouchDecisionBySymbol[symbol] = $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
+            _lastNwTouchDecisionBySymbol[symbol] =
+                $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
             return false;
         }
 
+        string strategyTag = GetNwStrategyTag(chosen.TimeframeMinutes);
         decimal atrForSizing = candles != null ? SafeATR(candles, 14) : MIN_STOP_DISTANCE;
-        decimal stopDistance = GetStopDistanceForStrategy("NW_BAND_LONG", atrForSizing, price);
+        decimal stopDistance = GetStopDistanceForStrategy(strategyTag, atrForSizing, price);
         int qty = CalcQtyV2(price, stopDistance);
         if (qty <= 0)
         {
-            const string decision = "TOUCH blocked: size is zero";
+            string decision = $"TOUCH blocked ({confirmationLabel}): size is zero";
             _lastNwDecisionBySymbol[symbol] = decision;
-            _lastNwTouchDecisionBySymbol[symbol] = $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
+            _lastNwTouchDecisionBySymbol[symbol] =
+                $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
             return false;
         }
 
         var nwEntryAudit = new NwEntryAudit
         {
             SignalPrice = price,
-            Mid = mid,
-            Upper = upper,
-            Lower = lower,
-            Bars = nwBars,
-            TimeframeMinutes = NW_TIMEFRAME_MINUTES,
-            BandAsOfEt = bandAsOfEt,
+            Mid = chosen.Mid,
+            Upper = chosen.Upper,
+            Lower = chosen.Lower,
+            Bars = chosen.Bars,
+            TimeframeMinutes = chosen.TimeframeMinutes,
+            ConfirmingTimeframesMinutes = confirmingTimeframes,
+            BandAsOfEt = chosen.BandAsOfEt,
             SignalTimeUtc = DateTime.UtcNow
         };
 
-        LogMessage($"[NW {NW_TIMEFRAME_MINUTES}M ENTRY SIGNAL] {symbol} price={price:F2} <= lower={lower:F2} | " +
-                   $"mid={mid:F2} upper={upper:F2} bars={nwBars} bandAsOf={bandAsOfEt:yyyy-MM-dd HH:mm} ET");
+        string chosenLabel = FormatNwTimeframeLabel(chosen.TimeframeMinutes);
+        LogMessage($"[NW {chosenLabel} ENTRY SIGNAL] {symbol} price={price:F2} <= lower={chosen.Lower:F2} | " +
+                   $"mid={chosen.Mid:F2} upper={chosen.Upper:F2} bars={chosen.Bars} " +
+                   $"bandAsOf={chosen.BandAsOfEt:yyyy-MM-dd HH:mm} ET confirmed={confirmationLabel}");
         _lastBlockedReasonBySymbol.TryRemove(symbol, out _);
-        bool opened = OpenPosition(symbol, qty, price, TradeSide.Buy, false, "NW_BAND_LONG", nwEntryAudit);
+        bool opened = OpenPosition(symbol, qty, price, TradeSide.Buy, false,
+                                   strategyTag, nwEntryAudit);
         if (opened)
         {
-            string decision = $"ENTRY submitted at {price:F2}";
+            string decision = $"ENTRY submitted at {price:F2} on {chosenLabel}";
             _lastNwDecisionBySymbol[symbol] = decision;
-            _lastNwTouchDecisionBySymbol[symbol] = $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
+            _lastNwTouchDecisionBySymbol[symbol] =
+                $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
         }
         else
         {
             string reason = _lastBlockedReasonBySymbol.TryGetValue(symbol, out var blocked)
                 ? blocked
                 : "order rejected";
-            string decision = $"TOUCH blocked: {reason}";
+            string decision = $"TOUCH blocked ({chosenLabel}): {reason}";
             _lastNwDecisionBySymbol[symbol] = decision;
-            _lastNwTouchDecisionBySymbol[symbol] = $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
+            _lastNwTouchDecisionBySymbol[symbol] =
+                $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
         }
         return opened;
     }
@@ -2764,7 +2930,7 @@ public partial class SimulatedBroker
 
     private void TryEarlyPatternEntry(string symbol, Candle current)
     {
-        if (!SCALPING_ENABLED || !STRATEGY_CANDLE_PATTERNS_ENABLED || !EARLY_PATTERN_ENTRY_ENABLED) return;
+        if (NW_ONLY_MODE || !SCALPING_ENABLED || !STRATEGY_CANDLE_PATTERNS_ENABLED || !EARLY_PATTERN_ENTRY_ENABLED) return;
         if (current == null) return;
 
         var nowEt = GetEasternTime();
@@ -3515,6 +3681,19 @@ public partial class SimulatedBroker
                               TradeSide side, bool isShort, string strategyTag,
                               NwEntryAudit? nwEntryAudit = null)
     {
+        if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(strategyTag)) return false;
+        bool isNwBand = strategyTag.StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase);
+
+        // Final order-boundary guard. This is intentionally independent from
+        // scanner flags so an old saved config or a future code path cannot leak
+        // a non-NW order while NW-only mode is active.
+        if (NW_ONLY_MODE && !isNwBand)
+        {
+            RecordBlock(symbol, "NW_ONLY_MODE", strategyTag);
+            LogMessage($"[NW ONLY] {strategyTag} {symbol} blocked — only NW entries are enabled");
+            return false;
+        }
+
         // Defense in depth: scanners, intrabar callbacks, config reloads and any
         // future strategy path all converge here.  A disabled master switch must
         // make it impossible to submit a scalp order.
@@ -3523,8 +3702,6 @@ public partial class SimulatedBroker
             RecordBlock(symbol, "SCALPING_DISABLED", strategyTag);
             return false;
         }
-        if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(strategyTag)) return false;
-        bool isNwBand = strategyTag.StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase);
 
         // ── BUG FIX: validate side/isShort/tag consistency ──
         // The trade log showed LONG trades tagged as GAP_GO_SHORT etc.
@@ -5190,10 +5367,11 @@ public partial class SimulatedBroker
     public int ConfiguredDataLinesPerSymbol => Math.Max(1, DATA_LINES_PER_SYMBOL);
     public int ConfiguredSubscriptionSlots => GetSubscriptionSlots();
     public int NadarayaWatsonLookback => NW_LOOKBACK;
-    public int NadarayaWatsonTimeframeMinutes => NW_TIMEFRAME_MINUTES;
+    public IReadOnlyList<int> NadarayaWatsonTimeframesMinutes
+        => NW_TIMEFRAMES_MINUTES.ToArray();
 
-    public int GetNadarayaWatson1HourBarCount(string symbol)
-        => GetCompletedNwHourlyCandles(symbol).Count;
+    public int GetNadarayaWatsonBarCount(string symbol, int timeframeMinutes)
+        => GetCompletedNwCandles(symbol, ValidateNwTimeframe(timeframeMinutes)).Count;
 
     private IEnumerable<string> GetPrioritizedWatchlist()
     {
@@ -5227,12 +5405,16 @@ public partial class SimulatedBroker
 
         if (STRATEGY_NADARAYA_WATSON_ENABLED)
         {
-            LogMessage($"[HIST] Requesting dedicated {NW_TIMEFRAME_MINUTES}-min RTH bars for {toSubscribe.Count} symbols (NW)...");
+            string tfList = string.Join(", ", NW_TIMEFRAMES_MINUTES.Select(FormatNwTimeframeLabel));
+            LogMessage($"[HIST] Requesting dedicated RTH bars ({tfList}) for {toSubscribe.Count} symbols (NW)...");
             foreach (var symbol in toSubscribe)
             {
-                LogMessage($"[HIST] Requesting {NW_TIMEFRAME_MINUTES}-min NW history: {symbol}...");
-                RealBroker.RequestHourlyHistoricalData(symbol, NW_TIMEFRAME_MINUTES);
-                await Task.Delay(750);
+                foreach (int timeframeMinutes in NW_TIMEFRAMES_MINUTES)
+                {
+                    LogMessage($"[HIST] Requesting {FormatNwTimeframeLabel(timeframeMinutes)} NW history: {symbol}...");
+                    RealBroker.RequestHourlyHistoricalData(symbol, timeframeMinutes);
+                    await Task.Delay(750);
+                }
             }
         }
 
@@ -5314,7 +5496,13 @@ public partial class SimulatedBroker
             LogMessage($"[WATCHLIST] Subscribing target symbol: {sym}");
             RealBroker.RequestHistoricalData(sym);
             if (STRATEGY_NADARAYA_WATSON_ENABLED && requestNwForNewSymbols)
-                RealBroker.RequestHourlyHistoricalData(sym, NW_TIMEFRAME_MINUTES);
+            {
+                foreach (int timeframeMinutes in NW_TIMEFRAMES_MINUTES)
+                {
+                    RealBroker.RequestHourlyHistoricalData(sym, timeframeMinutes);
+                    await Task.Delay(750);
+                }
+            }
             _subscribedSymbols.Add(sym);
             await Task.Delay(1500);
         }
@@ -5331,11 +5519,15 @@ public partial class SimulatedBroker
             return;
 
         var active = GetPrioritizedWatchlist().Take(GetSubscriptionSlots()).ToArray();
-        LogMessage($"[NW CONFIG] Reloading {NW_TIMEFRAME_MINUTES}-min history for {active.Length} active symbols...");
+        string tfList = string.Join(", ", NW_TIMEFRAMES_MINUTES.Select(FormatNwTimeframeLabel));
+        LogMessage($"[NW CONFIG] Reloading {tfList} history for {active.Length} active symbols...");
         foreach (var sym in active)
         {
-            RealBroker.RequestHourlyHistoricalData(sym, NW_TIMEFRAME_MINUTES);
-            await Task.Delay(750);
+            foreach (int timeframeMinutes in NW_TIMEFRAMES_MINUTES)
+            {
+                RealBroker.RequestHourlyHistoricalData(sym, timeframeMinutes);
+                await Task.Delay(750);
+            }
         }
     }
 
@@ -5385,14 +5577,16 @@ public partial class SimulatedBroker
         }
     }
 
-    public void AddHourlyCandle(string symbol, DateTime time,
+    public void AddHourlyCandle(string symbol, int timeframeMinutes, DateTime time,
         decimal open, decimal high, decimal low, decimal close, long vol)
     {
-        DateTime? bucketMaybe = GetRegularSessionHourBucket(time);
+        timeframeMinutes = ValidateNwTimeframe(timeframeMinutes);
+        DateTime? bucketMaybe = GetRegularSessionNwBucket(time, timeframeMinutes);
         if (!bucketMaybe.HasValue) return;
 
         DateTime bucket = bucketMaybe.Value;
-        var list = _hourlyCandles.GetOrAdd(symbol, _ => new List<Candle>());
+        string seriesKey = GetNwSeriesKey(symbol, timeframeMinutes);
+        var list = _hourlyCandles.GetOrAdd(seriesKey, _ => new List<Candle>());
 
         lock (list)
         {
@@ -5685,13 +5879,15 @@ public partial class SimulatedBroker
         {
             if (!File.Exists(CONFIG_FILE))
             {
+                string defaultTimeframes = string.Join(",", NW_TIMEFRAMES_MINUTES.Select(FormatNwTimeframeLabel));
                 Console.WriteLine($"[CONFIG] Missing {CONFIG_FILE}; using built-in settings. " +
-                                  $"NW={NW_TIMEFRAME_MINUTES}m/{NW_LOOKBACK}/{NW_BANDWIDTH:F1}/{NW_MULT:F1}");
+                                  $"NW-only={NW_ONLY_MODE}, NW={defaultTimeframes}/{NW_LOOKBACK}/{NW_BANDWIDTH:F1}/{NW_MULT:F1}");
                 return;
             }
             var text = File.ReadAllText(CONFIG_FILE);
             using var doc = System.Text.Json.JsonDocument.Parse(text);
             var root = doc.RootElement;
+            bool hasExplicitNwOnlyMode = root.TryGetProperty("NW_ONLY_MODE", out _);
 
             T Get<T>(string key, T fallback)
             {
@@ -5739,6 +5935,7 @@ public partial class SimulatedBroker
             SHORT_TAPE_STRICTNESS = GetI("SHORT_TAPE_STRICTNESS", SHORT_TAPE_STRICTNESS);
             ALLOW_PARTIAL_ON_WEAK_SIGNAL = GetB("ALLOW_PARTIAL_ON_WEAK_SIGNAL", ALLOW_PARTIAL_ON_WEAK_SIGNAL);
             MAX_CONSECUTIVE_LOSSES = GetI("MAX_CONSECUTIVE_LOSSES", MAX_CONSECUTIVE_LOSSES);
+            NW_ONLY_MODE = GetB("NW_ONLY_MODE", NW_ONLY_MODE);
             STRATEGY_ORB_ENABLED = GetB("STRATEGY_ORB", STRATEGY_ORB_ENABLED);
             STRATEGY_GAP_GO_ENABLED = GetB("STRATEGY_GAP_GO", STRATEGY_GAP_GO_ENABLED);
             STRATEGY_VWAP_ENABLED = GetB("STRATEGY_VWAP", STRATEGY_VWAP_ENABLED);
@@ -5750,14 +5947,21 @@ public partial class SimulatedBroker
             STRATEGY_CANDLE_PATTERNS_ENABLED = GetB("STRATEGY_CANDLE_PATTERNS", STRATEGY_CANDLE_PATTERNS_ENABLED);
             STRATEGY_MICRO_PULLBACK_ENABLED = GetB("STRATEGY_MICRO_PULLBACK", STRATEGY_MICRO_PULLBACK_ENABLED);
             STRATEGY_NADARAYA_WATSON_ENABLED = GetB("STRATEGY_NADARAYA_WATSON", STRATEGY_NADARAYA_WATSON_ENABLED);
-            NW_TIMEFRAME_MINUTES = ValidateNwTimeframe(GetI("NW_TIMEFRAME_MINUTES", NW_TIMEFRAME_MINUTES));
+            NW_TIMEFRAMES_MINUTES = ReadNwTimeframes(root, NW_TIMEFRAMES_MINUTES);
             NW_LOOKBACK = GetI("NW_LOOKBACK", NW_LOOKBACK);
             NW_BANDWIDTH = GetD("NW_BANDWIDTH", NW_BANDWIDTH);
             NW_MULT = GetD("NW_MULT", NW_MULT);
-            NW_STOP_LOSS_PCT = GetD("NW_STOP_LOSS_PCT", NW_STOP_LOSS_PCT);
+            NW_STOP_LOSS_PCT = ValidateNwStopLossPct(GetD("NW_STOP_LOSS_PCT", NW_STOP_LOSS_PCT));
             NW_TAKE_PROFIT_PCT = ValidateNwTakeProfitPct(GetD("NW_TAKE_PROFIT_PCT", NW_TAKE_PROFIT_PCT));
             NW_MAX_TRADES_PER_HOUR = Math.Max(0, GetI("NW_MAX_TRADES_PER_HOUR", NW_MAX_TRADES_PER_HOUR));
             NW_MAX_TRADES_PER_DAY = Math.Max(0, GetI("NW_MAX_TRADES_PER_DAY", NW_MAX_TRADES_PER_DAY));
+            if (NW_ONLY_MODE && !hasExplicitNwOnlyMode)
+            {
+                // One-time in-memory migration from the merged pre-NW-only
+                // profile, whose 2/2 limits would defeat four-way parallelism.
+                NW_MAX_TRADES_PER_HOUR = Math.Max(4, NW_MAX_TRADES_PER_HOUR);
+                NW_MAX_TRADES_PER_DAY = Math.Max(4, NW_MAX_TRADES_PER_DAY);
+            }
             EARLY_PATTERN_ENTRY_ENABLED = GetB("EARLY_PATTERN_ENTRY", EARLY_PATTERN_ENTRY_ENABLED);
             PATTERN_MIN_SCORE = GetI("PATTERN_MIN_SCORE", PATTERN_MIN_SCORE);
             INTRABAR_SIGNAL_COOLDOWN_SECONDS = GetI("INTRABAR_SIGNAL_COOLDOWN_SECONDS", INTRABAR_SIGNAL_COOLDOWN_SECONDS);
@@ -5786,6 +5990,7 @@ public partial class SimulatedBroker
             ALLOW_SCALP_BREAKOUT_LONGS = GetB("ALLOW_SCALP_BREAKOUT_LONGS", ALLOW_SCALP_BREAKOUT_LONGS);
             ALLOW_SCALP_BREAKOUT_SHORTS = GetB("ALLOW_SCALP_BREAKOUT_SHORTS", ALLOW_SCALP_BREAKOUT_SHORTS);
             ALLOW_SCALP_ORB_LONGS = GetB("ALLOW_SCALP_ORB_LONGS", ALLOW_SCALP_ORB_LONGS);
+            EnforceNwOnlyStrategyFlags();
 
             // Backwards-compatible: if USE_SMA100 present, set REQUIRE_SMA_ALIGNMENT loosely
             if (root.TryGetProperty("USE_SMA100", out var useSma100El) && useSma100El.ValueKind == System.Text.Json.JsonValueKind.True)
@@ -5819,9 +6024,10 @@ public partial class SimulatedBroker
             }
 
             SyncBrokerDataLineBudget();
+            string timeframeList = string.Join(",", NW_TIMEFRAMES_MINUTES.Select(FormatNwTimeframeLabel));
             Console.WriteLine($"[CONFIG] Loaded from {CONFIG_FILE}");
             Console.WriteLine($"[CONFIG] Effective: budget={TOTAL_BUDGET:F0}, position={POSITION_SIZE:F0}, " +
-                              $"NW={NW_TIMEFRAME_MINUTES}m/{NW_LOOKBACK}/{NW_BANDWIDTH:F1}/{NW_MULT:F1}, " +
+                              $"mode={(NW_ONLY_MODE ? "NW-ONLY" : "MIXED")}, NW={timeframeList}/{NW_LOOKBACK}/{NW_BANDWIDTH:F1}/{NW_MULT:F1}, " +
                               $"NW-exit=+{NW_TAKE_PROFIT_PCT * 100m:F2}%/-{NW_STOP_LOSS_PCT * 100m:F2}% (multi-day), " +
                               $"day/OR-hour/NW-hour/NW-day/strategyCap={MAX_TRADES_PER_DAY}/{MAX_TRADES_PER_HOUR}/{NW_MAX_TRADES_PER_HOUR}/{NW_MAX_TRADES_PER_DAY}/{MAX_TRADES_PER_STRATEGY}, " +
                               $"consecutiveLossCap={MAX_CONSECUTIVE_LOSSES}, firstEntry={MIN_ENTRY_MINUTES_AFTER_OPEN}m");
@@ -5883,17 +6089,17 @@ public partial class SimulatedBroker
             BreakEvenTriggerR = 1.0m,
             MinBreakoutBodyRatio = 0.55m,
             MinGrossTargetToCommissionMult = MIN_GROSS_TARGET_TO_COMMISSION_MULT,
-            EnableCandlePatterns = SCALPING_ENABLED && STRATEGY_CANDLE_PATTERNS_ENABLED,
-            EnableOrb = STRATEGY_ORB_ENABLED,
-            EnableGapGo = STRATEGY_GAP_GO_ENABLED,
-            EnableVwap = STRATEGY_VWAP_ENABLED,
-            EnableMomentum = STRATEGY_MOMENTUM_ENABLED,
+            EnableCandlePatterns = !NW_ONLY_MODE && SCALPING_ENABLED && STRATEGY_CANDLE_PATTERNS_ENABLED,
+            EnableOrb = !NW_ONLY_MODE && STRATEGY_ORB_ENABLED,
+            EnableGapGo = !NW_ONLY_MODE && STRATEGY_GAP_GO_ENABLED,
+            EnableVwap = !NW_ONLY_MODE && STRATEGY_VWAP_ENABLED,
+            EnableMomentum = !NW_ONLY_MODE && STRATEGY_MOMENTUM_ENABLED,
             PatternMinScore = PATTERN_MIN_SCORE,
-            AllowBullishPatternEntries = SCALPING_ENABLED && STRATEGY_CANDLE_PATTERNS_ENABLED && ALLOW_BULLISH_CANDLE_PATTERNS,
-            AllowMicroPullback = SCALPING_ENABLED && STRATEGY_MICRO_PULLBACK_ENABLED,
-            AllowScalpBreakoutLongs = SCALPING_ENABLED && ALLOW_SCALP_BREAKOUT_LONGS,
-            AllowScalpBreakoutShorts = SCALPING_ENABLED && ALLOW_SCALP_BREAKOUT_SHORTS,
-            AllowScalpOrbLongs = SCALPING_ENABLED && ALLOW_SCALP_ORB_LONGS,
+            AllowBullishPatternEntries = !NW_ONLY_MODE && SCALPING_ENABLED && STRATEGY_CANDLE_PATTERNS_ENABLED && ALLOW_BULLISH_CANDLE_PATTERNS,
+            AllowMicroPullback = !NW_ONLY_MODE && SCALPING_ENABLED && STRATEGY_MICRO_PULLBACK_ENABLED,
+            AllowScalpBreakoutLongs = !NW_ONLY_MODE && SCALPING_ENABLED && ALLOW_SCALP_BREAKOUT_LONGS,
+            AllowScalpBreakoutShorts = !NW_ONLY_MODE && SCALPING_ENABLED && ALLOW_SCALP_BREAKOUT_SHORTS,
+            AllowScalpOrbLongs = !NW_ONLY_MODE && SCALPING_ENABLED && ALLOW_SCALP_ORB_LONGS,
             AllowShorts = _allowShorts,
             IsHistoricalMode = isHistorical,
             HistoricalPeriodLabel = periodLabel,
@@ -5904,6 +6110,7 @@ public partial class SimulatedBroker
     private string BuildConfigJson(bool pretty = false)
     {
         var wlJson = "[" + string.Join(",", _watchlist.Select(s => $"\"{s}\"")) + "]";
+        var nwTimeframesJson = "[" + string.Join(",", NW_TIMEFRAMES_MINUTES) + "]";
         var indent = pretty ? "\n  " : "";
         var nl = pretty ? "\n" : "";
         var sep = pretty ? ",\n  " : ",";
@@ -5945,6 +6152,7 @@ public partial class SimulatedBroker
             $"\"SHORT_TAPE_STRICTNESS\":{SHORT_TAPE_STRICTNESS}",
             $"\"ALLOW_PARTIAL_ON_WEAK_SIGNAL\":{(ALLOW_PARTIAL_ON_WEAK_SIGNAL ? "true" : "false")}",
             $"\"MAX_CONSECUTIVE_LOSSES\":{MAX_CONSECUTIVE_LOSSES}",
+            $"\"NW_ONLY_MODE\":{(NW_ONLY_MODE ? "true" : "false")}",
             $"\"STRATEGY_ORB\":{(STRATEGY_ORB_ENABLED ? "true" : "false")}",
             $"\"STRATEGY_GAP_GO\":{(STRATEGY_GAP_GO_ENABLED ? "true" : "false")}",
             $"\"STRATEGY_VWAP\":{(STRATEGY_VWAP_ENABLED ? "true" : "false")}",
@@ -5957,7 +6165,10 @@ public partial class SimulatedBroker
             $"\"USE_SMA100\":{(/* USE_SMA100 present in config file; default true for backwards compat */ true ? "true" : "false")}",
             $"\"STRATEGY_MICRO_PULLBACK\":{(STRATEGY_MICRO_PULLBACK_ENABLED ? "true" : "false")}",
             $"\"STRATEGY_NADARAYA_WATSON\":{(STRATEGY_NADARAYA_WATSON_ENABLED ? "true" : "false")}",
-            $"\"NW_TIMEFRAME_MINUTES\":{NW_TIMEFRAME_MINUTES}",
+            $"\"NW_TIMEFRAMES_MINUTES\":{nwTimeframesJson}",
+            // Keep the legacy scalar for older binaries/config tooling. New code
+            // always prefers NW_TIMEFRAMES_MINUTES when both are present.
+            $"\"NW_TIMEFRAME_MINUTES\":{GetPrimaryNwTimeframe()}",
             $"\"NW_LOOKBACK\":{NW_LOOKBACK}",
             $"\"NW_BANDWIDTH\":{NW_BANDWIDTH:F2}",
             $"\"NW_MULT\":{NW_MULT:F2}",
@@ -6247,6 +6458,9 @@ public partial class SimulatedBroker
                     // cannot leave the live configuration only partially applied.
                     decimal requestedNwTakeProfitPct = ValidateNwTakeProfitPct(
                         GetD("NW_TAKE_PROFIT_PCT", NW_TAKE_PROFIT_PCT));
+                    decimal requestedNwStopLossPct = ValidateNwStopLossPct(
+                        GetD("NW_STOP_LOSS_PCT", NW_STOP_LOSS_PCT));
+                    int[] requestedNwTimeframes = ReadNwTimeframes(root, NW_TIMEFRAMES_MINUTES);
 
                     bool orbChanged;
                     bool nwHistoryReloadNeeded;
@@ -6256,7 +6470,7 @@ public partial class SimulatedBroker
                     {
                         int oldOrbMinutes = ORB_MINUTES;
                         bool oldNwEnabled = STRATEGY_NADARAYA_WATSON_ENABLED;
-                        int oldNwTimeframe = NW_TIMEFRAME_MINUTES;
+                        int[] oldNwTimeframes = NW_TIMEFRAMES_MINUTES.ToArray();
                         int oldNwLookback = NW_LOOKBACK;
                         decimal oldNwBandwidth = NW_BANDWIDTH;
                         decimal oldNwMult = NW_MULT;
@@ -6294,6 +6508,7 @@ public partial class SimulatedBroker
                         INVERT_ENTRY_DIRECTION = GetB("INVERT_ENTRY_DIRECTION", INVERT_ENTRY_DIRECTION);
                         MIDDAY_FILTER_ENABLED = GetB("MIDDAY_FILTER_ENABLED", MIDDAY_FILTER_ENABLED);
                         MAX_CONSECUTIVE_LOSSES = GetI("MAX_CONSECUTIVE_LOSSES", MAX_CONSECUTIVE_LOSSES);
+                        NW_ONLY_MODE = GetB("NW_ONLY_MODE", NW_ONLY_MODE);
                         STRATEGY_ORB_ENABLED = GetB("STRATEGY_ORB", STRATEGY_ORB_ENABLED);
                         STRATEGY_GAP_GO_ENABLED = GetB("STRATEGY_GAP_GO", STRATEGY_GAP_GO_ENABLED);
                         STRATEGY_VWAP_ENABLED = GetB("STRATEGY_VWAP", STRATEGY_VWAP_ENABLED);
@@ -6305,11 +6520,11 @@ public partial class SimulatedBroker
                         STRATEGY_CANDLE_PATTERNS_ENABLED = GetB("STRATEGY_CANDLE_PATTERNS", STRATEGY_CANDLE_PATTERNS_ENABLED);
                         STRATEGY_MICRO_PULLBACK_ENABLED = GetB("STRATEGY_MICRO_PULLBACK", STRATEGY_MICRO_PULLBACK_ENABLED);
                         STRATEGY_NADARAYA_WATSON_ENABLED = GetB("STRATEGY_NADARAYA_WATSON", STRATEGY_NADARAYA_WATSON_ENABLED);
-                        NW_TIMEFRAME_MINUTES = ValidateNwTimeframe(GetI("NW_TIMEFRAME_MINUTES", NW_TIMEFRAME_MINUTES));
+                        NW_TIMEFRAMES_MINUTES = requestedNwTimeframes;
                         NW_LOOKBACK = GetI("NW_LOOKBACK", NW_LOOKBACK);
                         NW_BANDWIDTH = GetD("NW_BANDWIDTH", NW_BANDWIDTH);
                         NW_MULT = GetD("NW_MULT", NW_MULT);
-                        NW_STOP_LOSS_PCT = GetD("NW_STOP_LOSS_PCT", NW_STOP_LOSS_PCT);
+                        NW_STOP_LOSS_PCT = requestedNwStopLossPct;
                         NW_TAKE_PROFIT_PCT = requestedNwTakeProfitPct;
                         NW_MAX_TRADES_PER_HOUR = Math.Max(0, GetI("NW_MAX_TRADES_PER_HOUR", NW_MAX_TRADES_PER_HOUR));
                         NW_MAX_TRADES_PER_DAY = Math.Max(0, GetI("NW_MAX_TRADES_PER_DAY", NW_MAX_TRADES_PER_DAY));
@@ -6341,8 +6556,9 @@ public partial class SimulatedBroker
                         ALLOW_SCALP_BREAKOUT_LONGS = GetB("ALLOW_SCALP_BREAKOUT_LONGS", ALLOW_SCALP_BREAKOUT_LONGS);
                         ALLOW_SCALP_BREAKOUT_SHORTS = GetB("ALLOW_SCALP_BREAKOUT_SHORTS", ALLOW_SCALP_BREAKOUT_SHORTS);
                         ALLOW_SCALP_ORB_LONGS = GetB("ALLOW_SCALP_ORB_LONGS", ALLOW_SCALP_ORB_LONGS);
+                        EnforceNwOnlyStrategyFlags();
 
-                        nwHistoryReloadNeeded = NW_TIMEFRAME_MINUTES != oldNwTimeframe
+                        nwHistoryReloadNeeded = !NW_TIMEFRAMES_MINUTES.SequenceEqual(oldNwTimeframes)
                             || (!oldNwEnabled && STRATEGY_NADARAYA_WATSON_ENABLED);
                         nwEnvelopeChanged = nwHistoryReloadNeeded
                             || oldNwEnabled != STRATEGY_NADARAYA_WATSON_ENABLED
@@ -6624,11 +6840,13 @@ public partial class SimulatedBroker
                 decimal nwEntryLower = nwAudit?.Lower ?? 0m;
                 int nwEntryBars = nwAudit?.Bars ?? 0;
                 int nwEntryTimeframe = nwAudit?.TimeframeMinutes ?? 0;
+                string nwConfirmingTimeframes = "[" + string.Join(",",
+                    nwAudit?.ConfirmingTimeframesMinutes ?? Array.Empty<int>()) + "]";
                 string nwBandAsOf = nwAudit != null && nwAudit.BandAsOfEt != DateTime.MinValue
                     ? nwAudit.BandAsOfEt.ToString("yyyy-MM-dd HH:mm")
                     : "";
                 if (!first) posArr.Append(",");
-                posArr.Append($@"{{""sym"":""{p.Symbol}"",""qty"":{p.Quantity},""side"":""{(p.IsShort ? "SHORT" : "LONG")}"",""avg"":{p.AvgPrice:F2},""cur"":{px:F2},""unrl"":{unrl:F2},""pct"":{pnlPt:F2},""min"":{heldMin:F1},""strat"":""{p.StrategyTag}"",""exitPending"":{(p.ExitSubmitted ? "true" : "false")},""nwTarget"":{nwTarget:F2},""nwStopPct"":{nwStopPct:F2},""nwSignalPrice"":{nwSignalPrice:F2},""nwEntryMid"":{nwEntryMid:F2},""nwEntryUpper"":{nwEntryUpper:F2},""nwEntryLower"":{nwEntryLower:F2},""nwEntryBars"":{nwEntryBars},""nwEntryTimeframe"":{nwEntryTimeframe},""nwBandAsOf"":""{nwBandAsOf}""}}");
+                posArr.Append($@"{{""sym"":""{p.Symbol}"",""qty"":{p.Quantity},""side"":""{(p.IsShort ? "SHORT" : "LONG")}"",""avg"":{p.AvgPrice:F2},""cur"":{px:F2},""unrl"":{unrl:F2},""pct"":{pnlPt:F2},""min"":{heldMin:F1},""strat"":""{p.StrategyTag}"",""exitPending"":{(p.ExitSubmitted ? "true" : "false")},""nwTarget"":{nwTarget:F2},""nwStopPct"":{nwStopPct:F2},""nwSignalPrice"":{nwSignalPrice:F2},""nwEntryMid"":{nwEntryMid:F2},""nwEntryUpper"":{nwEntryUpper:F2},""nwEntryLower"":{nwEntryLower:F2},""nwEntryBars"":{nwEntryBars},""nwEntryTimeframe"":{nwEntryTimeframe},""nwConfirmingTimeframes"":{nwConfirmingTimeframes},""nwBandAsOf"":""{nwBandAsOf}""}}");
                 first = false;
             }
             posArr.Append("]");
@@ -6705,66 +6923,90 @@ public partial class SimulatedBroker
                 decimal orbHi = orb?.High ?? 0m;
                 decimal orbLo = orb?.Low ?? 0m;
 
-                // Dashboard must show the exact same completed-1H NW envelope
-                // used by the trading engine. The old code calculated these
-                // columns from raw 1-minute candles, while the strategy used
-                // 15-minute candles, so the displayed levels were unrelated.
-                decimal nwHi = 0m, nwLo = 0m;
-                var (_, nwUpRow, nwLoRow, nwBarsRow, _) = GetNadarayaWatson1HourEnvelope(sym);
-                if (nwBarsRow >= NW_LOOKBACK)
+                // The table has one compact Hi/Lo pair, so display the primary
+                // selected interval (30m when selected). The tooltip contains
+                // readiness/decision details for every monitored timeframe.
+                var nwFrames = NW_TIMEFRAMES_MINUTES.Select(timeframeMinutes =>
                 {
-                    nwHi = nwUpRow;
-                    nwLo = nwLoRow;
-                }
+                    var (mid, upper, lower, bars, asOf) =
+                        GetNadarayaWatsonEnvelope(sym, timeframeMinutes);
+                    return (timeframeMinutes, mid, upper, lower, bars, asOf);
+                }).ToList();
+                int nwTfRow = GetPrimaryNwTimeframe();
+                var nwDisplay = nwFrames.FirstOrDefault(frame => frame.timeframeMinutes == nwTfRow);
+                int nwBarsRow = nwDisplay.bars;
+                decimal nwHi = nwBarsRow >= NW_LOOKBACK ? nwDisplay.upper : 0m;
+                decimal nwLo = nwBarsRow >= NW_LOOKBACK ? nwDisplay.lower : 0m;
                 string nwWhy;
                 if (!STRATEGY_NADARAYA_WATSON_ENABLED)
                     nwWhy = "Disabled";
-                else if (nwBarsRow < NW_LOOKBACK)
-                    nwWhy = $"History {nwBarsRow}/{NW_LOOKBACK}";
                 else if (_lastNwTouchDecisionBySymbol.TryGetValue(sym, out var lastNwTouch))
                     nwWhy = lastNwTouch;
                 else if (_lastNwDecisionBySymbol.TryGetValue(sym, out var nwDecision))
                     nwWhy = nwDecision;
-                else if (nwLo > 0 && quote.last > 0)
-                    nwWhy = quote.last <= nwLo
-                        ? "Live LAST touching NW Low"
-                        : $"Waiting: {(quote.last - nwLo) / nwLo * 100m:F2}% above NW Low";
                 else
-                    nwWhy = "Waiting for live LAST";
+                {
+                    var frameReasons = new List<string>();
+                    foreach (var frame in nwFrames.OrderBy(item => item.timeframeMinutes))
+                    {
+                        string frameKey = GetNwSeriesKey(sym, frame.timeframeMinutes);
+                        if (_lastNwTouchDecisionBySymbol.TryGetValue(frameKey, out var frameTouch))
+                            frameReasons.Add(frameTouch);
+                        else if (_lastNwDecisionBySymbol.TryGetValue(frameKey, out var frameDecision))
+                            frameReasons.Add(frameDecision);
+                        else if (frame.bars < NW_LOOKBACK)
+                            frameReasons.Add($"{FormatNwTimeframeLabel(frame.timeframeMinutes)}: history {frame.bars}/{NW_LOOKBACK}");
+                        else if (frame.lower > 0m && quote.last > 0m)
+                            frameReasons.Add(quote.last <= frame.lower
+                                ? $"{FormatNwTimeframeLabel(frame.timeframeMinutes)}: live LAST touching NW Low"
+                                : $"{FormatNwTimeframeLabel(frame.timeframeMinutes)}: {(quote.last - frame.lower) / frame.lower * 100m:F2}% above NW Low");
+                        else
+                            frameReasons.Add($"{FormatNwTimeframeLabel(frame.timeframeMinutes)}: waiting for live LAST");
+                    }
+                    nwWhy = string.Join(" | ", frameReasons);
+                }
 
                 string sig = "";
                 if (dataReady)
                 {
-                    if (orb != null && orb.IsSet)
+                    if (!NW_ONLY_MODE)
                     {
-                        if (price > orbHi) sig = "ORB↑";
-                        else if (price < orbLo) sig = "ORB↓";
+                        if (orb != null && orb.IsSet)
+                        {
+                            if (price > orbHi) sig = "ORB↑";
+                            else if (price < orbLo) sig = "ORB↓";
+                        }
+                        if (sig == "" && rsi < RSI_OVERSOLD && price > sma50) sig = "MR↑";
+                        if (sig == "" && rsi > RSI_OVERBOUGHT && price < sma50) sig = "MR↓";
+                        if (sig == "" && vwap > 0)
+                        {
+                            bool above = price > vwap;
+                            _prevBarAboveVwap.TryGetValue(sym, out bool wasAbove);
+                            if (!wasAbove && above) sig = "VWAP↑";
+                            else if (wasAbove && !above) sig = "VWAP↓";
+                        }
                     }
-                    if (sig == "" && rsi < RSI_OVERSOLD && price > sma50) sig = "MR↑";
-                    if (sig == "" && rsi > RSI_OVERBOUGHT && price < sma50) sig = "MR↓";
-                    if (sig == "" && vwap > 0)
-                    {
-                        bool above = price > vwap;
-                        _prevBarAboveVwap.TryGetValue(sym, out bool wasAbove);
-                        if (!wasAbove && above) sig = "VWAP↑";
-                        else if (wasAbove && !above) sig = "VWAP↓";
-                    }
+
                     // The trading engine triggers NW from an actual LAST trade tick.
                     // Do not show a touch merely because the fallback bid/ask midpoint
                     // crossed the band while LAST remained on the other side.
                     bool nwLiveLast = quote.source == "last" && quote.last > 0;
-                    if (sig == "" && nwLiveLast && nwLo > 0 && quote.last <= nwLo) sig = "NW↑";
-                    else if (sig == "" && nwLiveLast && nwHi > 0 && quote.last >= nwHi) sig = "NW↓";
+                    var touchingNwFrame = nwFrames
+                        .Where(frame => frame.bars >= NW_LOOKBACK && frame.lower > 0m && quote.last <= frame.lower)
+                        .OrderByDescending(frame => frame.timeframeMinutes)
+                        .FirstOrDefault();
+                    if (sig == "" && nwLiveLast && touchingNwFrame.timeframeMinutes > 0)
+                        sig = $"NW{FormatNwTimeframeLabel(touchingNwFrame.timeframeMinutes)}↑";
                 }
                 bool hot = dataReady && vwap > 0 && price > vwap && rsi > 55;
 
                 if (!wfirst) wlArr.Append(",");
                 wfirst = false; string pxSrc = quote.source;
                 string ageJson = double.IsFinite(quote.ageSec) ? quote.ageSec.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) : "9999";
-                string why = GetWatchlistReadiness(sym);
+                string why = GetWatchlistReadiness(sym, nwTouchMode: NW_ONLY_MODE);
                 string whyEsc = why.Replace("\\", "\\\\").Replace("\"", "\\\"");
                 string nwWhyEsc = nwWhy.Replace("\\", "\\\\").Replace("\"", "\\\"");
-                wlArr.Append($@"{{""s"":""{sym}"",""price"":{price:F2},""last"":{quote.last:F2},""bid"":{quote.bid:F2},""ask"":{quote.ask:F2},""pxSrc"":""{pxSrc}"",""ageSec"":{ageJson},""vwap"":{vwap:F2},""sma20"":{sma20:F2},""sma50"":{sma50:F2},""sma100"":{sma100:F2},""sma200"":{sma200:F2},""rsi"":{rsi:F1},""gap"":{gapPct:F2},""chg"":{chgPct:F2},""vol"":{volK},""atr"":{atrPct:F2},""orbHi"":{orbHi:F2},""orbLo"":{orbLo:F2},""nwHi"":{nwHi:F2},""nwLo"":{nwLo:F2},""nwBars"":{nwBarsRow},""nwWhy"":""{nwWhyEsc}"",""pdHi"":{pdHi:F2},""pdLo"":{pdLo:F2},""macd"":{macdDir},""trend"":""{trend}"",""sig"":""{sig}"",""why"":""{whyEsc}"",""hot"":{(hot ? "true" : "false")},""abvVwap"":{(abvVwap ? "true" : "false")}}}");
+                wlArr.Append($@"{{""s"":""{sym}"",""price"":{price:F2},""last"":{quote.last:F2},""bid"":{quote.bid:F2},""ask"":{quote.ask:F2},""pxSrc"":""{pxSrc}"",""ageSec"":{ageJson},""vwap"":{vwap:F2},""sma20"":{sma20:F2},""sma50"":{sma50:F2},""sma100"":{sma100:F2},""sma200"":{sma200:F2},""rsi"":{rsi:F1},""gap"":{gapPct:F2},""chg"":{chgPct:F2},""vol"":{volK},""atr"":{atrPct:F2},""orbHi"":{orbHi:F2},""orbLo"":{orbLo:F2},""nwHi"":{nwHi:F2},""nwLo"":{nwLo:F2},""nwBars"":{nwBarsRow},""nwTf"":{nwTfRow},""nwWhy"":""{nwWhyEsc}"",""pdHi"":{pdHi:F2},""pdLo"":{pdLo:F2},""macd"":{macdDir},""trend"":""{trend}"",""sig"":""{sig}"",""why"":""{whyEsc}"",""hot"":{(hot ? "true" : "false")},""abvVwap"":{(abvVwap ? "true" : "false")}}}");
             }
             wlArr.Append("]");
             // blocked reasons summary
@@ -6801,7 +7043,8 @@ public partial class SimulatedBroker
             {
                 var t = histList[i];
                 if (i < histList.Count - 1) histArr.Append(",");
-                histArr.Append($@"{{""sym"":""{t.Symbol}"",""side"":""{t.Side}"",""strat"":""{t.Strategy}"",""qty"":{t.Qty},""entry"":{t.Entry:F2},""exit"":{t.Exit:F2},""pnl"":{t.NetPnL:F2},""min"":{t.HoldMinutes:F0},""reason"":""{t.ExitReason}"",""time"":""{t.Time}""}}");
+                int nwTf = t.NwEntryAudit?.TimeframeMinutes ?? 0;
+                histArr.Append($@"{{""sym"":""{t.Symbol}"",""side"":""{t.Side}"",""strat"":""{t.Strategy}"",""nwTf"":{nwTf},""qty"":{t.Qty},""entry"":{t.Entry:F2},""exit"":{t.Exit:F2},""pnl"":{t.NetPnL:F2},""min"":{t.HoldMinutes:F0},""reason"":""{t.ExitReason}"",""time"":""{t.Time}""}}");
             }
             histArr.Append("]");
 
@@ -6850,7 +7093,8 @@ public partial class SimulatedBroker
                     {
                         var t = all[i];
                         if (!firstAt) allArr.Append(",");
-                        allArr.Append($@"{{""sym"":""{t.Symbol}"",""side"":""{t.Side}"",""strat"":""{t.Strategy}"",""qty"":{t.Qty},""entry"":{t.Entry:F2},""exit"":{t.Exit:F2},""pnl"":{t.NetPnL:F2},""min"":{t.HoldMinutes:F0},""reason"":""{t.ExitReason}"",""time"":""{t.Time}"",""date"":""{t.Date}""}}");
+                        int nwTf = t.NwEntryAudit?.TimeframeMinutes ?? 0;
+                        allArr.Append($@"{{""sym"":""{t.Symbol}"",""side"":""{t.Side}"",""strat"":""{t.Strategy}"",""nwTf"":{nwTf},""qty"":{t.Qty},""entry"":{t.Entry:F2},""exit"":{t.Exit:F2},""pnl"":{t.NetPnL:F2},""min"":{t.HoldMinutes:F0},""reason"":""{t.ExitReason}"",""time"":""{t.Time}"",""date"":""{t.Date}""}}");
                         firstAt = false;
                     }
                     allArr.Append("]");
@@ -7104,7 +7348,8 @@ public partial class SimulatedBroker
                 $"MinHold:{MIN_HOLD_SECONDS / 60}min  Risk:{RISK_PCT * 100:F0}%/trade  " +
                 $"MaxLoss:{MAX_LOSS_PER_TRADE:C0}  ATRTrail:{ATR_TRAIL_MULT}x  " +
                 $"ORBWindow:{ORB_MINUTES}min  VolExp:{VOL_EXPAND_MULT}x  " +
-                $"Strategies: non-NW OR router | NW independent {NW_TIMEFRAME_MINUTES}m " +
+                $"Strategies: {(NW_ONLY_MODE ? "NW ONLY" : "mixed")} | NW " +
+                $"{string.Join(",", NW_TIMEFRAMES_MINUTES.Select(FormatNwTimeframeLabel))} " +
                 $"({NW_MAX_TRADES_PER_HOUR}/rolling-hour, {NW_MAX_TRADES_PER_DAY}/day)");
             sb.AppendLine(new string('─', W));
 

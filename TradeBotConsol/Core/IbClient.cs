@@ -28,7 +28,7 @@ public class IbClient : EWrapper, IBroker
     private readonly ConcurrentDictionary<string, int> _symToLiveReqId = new();
     private readonly ConcurrentDictionary<int, string> _histReqIdToSymbol = new();   // FIX #1
     private readonly ConcurrentDictionary<int, string> _dailyReqIdToSymbol = new();
-    private readonly ConcurrentDictionary<int, string> _hourlyReqIdToSymbol = new();
+    private readonly ConcurrentDictionary<int, (string Symbol, int TimeframeMinutes)> _hourlyReqIdToSeries = new();
     private readonly HashSet<string> _subscribedLive = new(StringComparer.OrdinalIgnoreCase);
 
     // Hard cap enforced inside Subscribe() — set this before calling Subscribe().
@@ -518,7 +518,7 @@ public class IbClient : EWrapper, IBroker
     public void RequestHourlyHistoricalData(string symbol, int timeframeMinutes)
     {
         int id = Interlocked.Increment(ref _hourlyReqId);
-        _hourlyReqIdToSymbol[id] = symbol;
+        _hourlyReqIdToSeries[id] = (symbol, timeframeMinutes);
 
         Contract contract = new Contract
         {
@@ -548,6 +548,10 @@ public class IbClient : EWrapper, IBroker
                 barSizeSetting = "30 mins";
                 durationStr = "1 M";
                 break;
+            case 240:
+                barSizeSetting = "4 hours";
+                durationStr = "1 Y";
+                break;
             default:
                 barSizeSetting = "1 hour";
                 durationStr = "1 Y";
@@ -560,9 +564,8 @@ public class IbClient : EWrapper, IBroker
         // otherwise the API can return bars in the TWS/login timezone and the
         // 09:30 ET bucket boundaries become wrong on machines outside Eastern time.
         // NOTE: with 15/30-min bars and a 1-month duration, NW_LOOKBACK values
-        // much above ~500 (15m) or ~270 (30m) may not have enough bars available
-        // — SimulatedBroker's GetNadarayaWatson1HourEnvelope() simply returns
-        // blank/zero until enough bars accumulate rather than erroring.
+        // much above ~500 (15m) or ~270 (30m) may not have enough bars available.
+        // The strategy stays unready until the selected series has enough bars.
         _client.reqHistoricalData(id, contract, "", durationStr, barSizeSetting, "TRADES", 1, 2, false, null);
     }
 
@@ -696,15 +699,15 @@ public class IbClient : EWrapper, IBroker
         //        hourly (40000+) → AddHourlyCandle
         //        1-min  (20000+) → AddHistoricalCandle
         bool isDaily = _dailyReqIdToSymbol.TryGetValue(reqId, out var dailySymbol);
-        string hourlySymbol = null;
-        bool isHourly = !isDaily && _hourlyReqIdToSymbol.TryGetValue(reqId, out hourlySymbol);
+        (string Symbol, int TimeframeMinutes) hourlySeries = default;
+        bool isHourly = !isDaily && _hourlyReqIdToSeries.TryGetValue(reqId, out hourlySeries);
         string histSymbol = null;                                                               // FIX #1
         bool is1Min = !isDaily && !isHourly && _histReqIdToSymbol.TryGetValue(reqId, out histSymbol);
 
         if (!isDaily && !isHourly && !is1Min) return;
 
         // FIX #5: guard against null/empty symbol before proceeding
-        string symbol = isDaily ? dailySymbol : isHourly ? hourlySymbol : histSymbol;
+        string symbol = isDaily ? dailySymbol : isHourly ? hourlySeries.Symbol : histSymbol;
         if (string.IsNullOrEmpty(symbol))
         {
             Console.WriteLine($"[WARN] historicalData: null/empty symbol for reqId={reqId} — skipping.");
@@ -746,7 +749,7 @@ public class IbClient : EWrapper, IBroker
         }
         else if (isHourly)
         {
-            _broker.AddHourlyCandle(symbol, time,
+            _broker.AddHourlyCandle(symbol, hourlySeries.TimeframeMinutes, time,
                 (decimal)bar.Open, (decimal)bar.High,
                 (decimal)bar.Low, (decimal)bar.Close, bar.Volume);
         }
@@ -761,11 +764,11 @@ public class IbClient : EWrapper, IBroker
     public void historicalDataEnd(int reqId, string start, string end)
     {
         // NW historical request complete — clean up, do NOT start live subscription.
-        if (_hourlyReqIdToSymbol.TryRemove(reqId, out string hourlySymbol))
+        if (_hourlyReqIdToSeries.TryRemove(reqId, out var hourlySeries))
         {
-            int bars = _broker.GetNadarayaWatson1HourBarCount(hourlySymbol);
-            int tf = _broker.NadarayaWatsonTimeframeMinutes;
-            Console.WriteLine($"[IBKR] {tf}-min NW history loaded for {hourlySymbol}: {bars} completed bars " +
+            int bars = _broker.GetNadarayaWatsonBarCount(
+                hourlySeries.Symbol, hourlySeries.TimeframeMinutes);
+            Console.WriteLine($"[IBKR] {hourlySeries.TimeframeMinutes}-min NW history loaded for {hourlySeries.Symbol}: {bars} completed bars " +
                               $"(need {_broker.NadarayaWatsonLookback} for NW).");
             return;
         }
@@ -820,7 +823,7 @@ public class IbClient : EWrapper, IBroker
 
         _symToLiveReqId.Clear();
         _reqIdToSymbol.Clear();
-        // Note: _histReqIdToSymbol, _dailyReqIdToSymbol and _hourlyReqIdToSymbol are intentionally NOT cleared
+        // Note: _histReqIdToSymbol, _dailyReqIdToSymbol and _hourlyReqIdToSeries are intentionally NOT cleared
         // here — in-flight historical responses that arrive after a brief drop-reconnect
         // can still be routed correctly if the reqId is still in the dictionary.
     }
