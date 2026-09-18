@@ -50,14 +50,13 @@ class Program
                 reconWaitMs += 200;
                 if (reconWaitMs >= 30_000) // 30s — TWS can take 15-25s after a restart before responding to reqPositions()
                 {
-                    Console.WriteLine("[STARTUP] WARNING: Reconciliation timed out after 10s — forcing reconcile so trading can start.");
-                    // Without this call, _reconciled stays false and ExecuteStrategy()
-                    // returns early on every tick for the entire session — bot never trades.
+                    Console.WriteLine("[STARTUP] Reconciliation incomplete after 30s; the dashboard will start, but new entries remain blocked.");
+                    // Request another snapshot while preserving the entry block.
                     broker.ForceReconcile();
                     break;
                 }
             }
-            Console.WriteLine($"[STARTUP] Reconciliation complete ({reconWaitMs}ms).");
+            Console.WriteLine($"[STARTUP] Reconciled={broker.IsReconciled} ({reconWaitMs}ms).");
 
             // ── 3. HISTORICAL DATA ───────────────────────────────────────────────
             await broker.RequestAllHistoricalSlow();
@@ -119,6 +118,9 @@ class Program
                             _ = broker.SendEmail("✅ Bot Reconnected", "IBKR socket restored.");
                             // Re-verify positions — IBKR state may have changed while disconnected
                             broker.RequestRereconcile();
+                            // connectionClosed clears live subscriptions and NW
+                            // history. Refill both before signals can re-arm.
+                            await broker.RequestAllHistoricalSlow();
                         }
                         else
                             Console.WriteLine("[WATCHDOG] Reconnect failed — will retry in 30s.");
