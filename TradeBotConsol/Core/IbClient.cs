@@ -37,8 +37,6 @@ public class IbClient : EWrapper, IBroker
     private readonly SimulatedBroker _broker;
     private readonly ConcurrentDictionary<string, long> _tickVolume = new();
 
-    // Track filled orderIds to prevent double-fire between orderStatus and execDetails
-    private readonly ConcurrentDictionary<int, bool> _filledOrders = new();
 
     // ── Bracket child order tracking ──────────────────────────────────────────
     private readonly ConcurrentDictionary<int, string> _bracketChildToSymbol = new();
@@ -47,6 +45,8 @@ public class IbClient : EWrapper, IBroker
     private readonly ConcurrentDictionary<int, bool> _activeOrderIds = new();
     private readonly ConcurrentDictionary<int, bool> _terminalOrderIds = new();
     private readonly ConcurrentDictionary<int, bool> _cancelRequestedOrderIds = new();
+    private readonly ConcurrentDictionary<int, (Contract Contract, Order Order)> _submittedOrders = new();
+    private readonly ConcurrentDictionary<int, decimal> _pendingStopUpdates = new();
 
     // A precautionary override is allowed only on a validated protective child.
     // This hard ceiling prevents a bad calculation from bypassing TWS safeguards.
@@ -126,14 +126,15 @@ public class IbClient : EWrapper, IBroker
 
         _broker.RegisterLiveOrder(orderId, symbol, effectiveSide, qty);
         _activeOrderIds[orderId] = true;
+        _submittedOrders[orderId] = (contract, order);
+        _broker.SaveState();
         try
         {
             _client.placeOrder(orderId, contract, order);
         }
         catch (Exception ex)
         {
-            _activeOrderIds.TryRemove(orderId, out _);
-            _broker.OnOrderRejected(orderId, 0, ex.Message);
+            _broker.OnOrderSubmissionUncertain(symbol, ex.Message);
             Console.WriteLine($"[IBKR] SubmitOrder failed for {symbol}: {ex.Message}");
             return;
         }
@@ -293,33 +294,30 @@ public class IbClient : EWrapper, IBroker
         }
         _broker.RegisterBracketChildren(symbol, stopId, targetId);
 
-        var placedOrderIds = new List<int>();
+        _submittedOrders[parentId] = (contract, parent);
+        _submittedOrders[stopId] = (contract, stopOrder);
+        if (targetOrder != null) _submittedOrders[targetId] = (contract, targetOrder);
+        _broker.SaveState();
         try
         {
             // Parent first, transmitting child last. When profit exit management
             // is local, the STP child is the final transmitter.
             _client.placeOrder(parentId, contract, parent);
-            placedOrderIds.Add(parentId);
             _client.placeOrder(stopId, contract, stopOrder);
-            placedOrderIds.Add(stopId);
             if (targetOrder != null)
             {
                 _client.placeOrder(targetId, contract, targetOrder);
-                placedOrderIds.Add(targetId);
             }
         }
         catch (Exception ex)
         {
-            CleanupBracketTracking(bracketIds);
-            foreach (int orderId in placedOrderIds)
-                TryCancelActiveOrder(orderId, "bracket submission exception");
             foreach (int orderId in bracketIds)
-            {
-                _activeOrderIds.TryRemove(orderId, out _);
-                _broker.RemoveLiveOrder(orderId);
-            }
+                TryCancelActiveOrder(orderId, "bracket submission exception");
+            _broker.OnOrderSubmissionUncertain(symbol, ex.Message);
             Console.WriteLine($"[IBKR] SubmitBracketOrder failed for {symbol}: {ex.Message}");
-            return false;
+            // A transport exception cannot prove the broker received nothing.
+            // Keep the caller's reservation until account snapshots resolve it.
+            return true;
         }
 
         string targetText = hasProfitTarget ? targetPrice.ToString("F2") : "LOCAL/NONE";
@@ -375,11 +373,10 @@ public class IbClient : EWrapper, IBroker
             return false;
         }
 
-        bool wasTrackedActive = _activeOrderIds.TryRemove(orderId, out _);
-        _terminalOrderIds[orderId] = true;
+        if (!_cancelRequestedOrderIds.TryAdd(orderId, true)) return false;
+        bool wasTrackedActive = _activeOrderIds.ContainsKey(orderId);
         try
         {
-            _cancelRequestedOrderIds[orderId] = true;
             _client.cancelOrder(orderId);
             Console.WriteLine($"[IBKR] cancelOrder({orderId}) — {reason}" +
                               (wasTrackedActive ? "" : " (reconciled/untracked order)"));
@@ -401,6 +398,56 @@ public class IbClient : EWrapper, IBroker
         TryCancelActiveOrder(orderId, "broker request");
     }
 
+    public int EnsureNwStop(string symbol, int orderId, int qty, TradeSide side, decimal stopPrice)
+    {
+        if (!_isReady || qty <= 0 || stopPrice <= 0m || _cancelRequestedOrderIds.ContainsKey(orderId)) return 0;
+        Contract contract;
+        Order stop;
+        if (orderId > 0)
+        {
+            if (!_submittedOrders.TryGetValue(orderId, out var existing)
+                || _terminalOrderIds.ContainsKey(orderId)) return 0;
+            if (existing.Order.OrderType != "STP" || existing.Contract.Symbol != symbol) return 0;
+            if ((decimal)existing.Order.AuxPrice == stopPrice && existing.Order.TotalQuantity == qty) return orderId;
+            contract = existing.Contract;
+            stop = new Order
+            {
+                Action = ActionString(side), OrderType = "STP", TotalQuantity = qty,
+                AuxPrice = (double)stopPrice, ParentId = existing.Order.ParentId,
+                Tif = "GTC", Transmit = true, OverridePercentageConstraints = true
+            };
+        }
+        else
+        {
+            orderId = Interlocked.Increment(ref _currentOrderId);
+            contract = new Contract { Symbol = symbol, SecType = "STK", Exchange = "SMART", Currency = "USD" };
+            stop = new Order
+            {
+                Action = ActionString(side), OrderType = "STP", TotalQuantity = qty,
+                AuxPrice = (double)stopPrice, Tif = "GTC", Transmit = true,
+                OverridePercentageConstraints = true
+            };
+            _activeOrderIds[orderId] = true;
+        }
+        _broker.RegisterProtectiveStop(orderId, symbol, side, qty);
+        _pendingStopUpdates[orderId] = stopPrice;
+        _submittedOrders[orderId] = (contract, stop);
+        try
+        {
+            _client.placeOrder(orderId, contract, stop);
+            _submittedOrders[orderId] = (contract, stop);
+            Console.WriteLine($"[NW STOP] {symbol} x{qty} {stopPrice:F2} GTC order={orderId}");
+            return orderId;
+        }
+        catch (Exception ex)
+        {
+            _pendingStopUpdates.TryRemove(orderId, out _);
+            _broker.OnProtectiveStopUpdateRejected(orderId, ex.Message);
+            // Retain the identity of a possibly accepted stop until reconciliation.
+            return orderId;
+        }
+    }
+
     // IBroker.RequestPositions
     public void RequestPositions()
     {
@@ -411,6 +458,7 @@ public class IbClient : EWrapper, IBroker
         }
         Console.WriteLine("[IBKR] Sending reqPositions()...");
         _client.reqPositions();
+        _client.reqOpenOrders();
     }
 
     // ── SUBSCRIBE TO LIVE DATA ────────────────────────────────────────────────
@@ -519,6 +567,7 @@ public class IbClient : EWrapper, IBroker
     {
         int id = Interlocked.Increment(ref _hourlyReqId);
         _hourlyReqIdToSeries[id] = (symbol, timeframeMinutes);
+        _broker.BeginNwHistory(symbol, timeframeMinutes, id);
 
         Contract contract = new Contract
         {
@@ -528,44 +577,22 @@ public class IbClient : EWrapper, IBroker
             Currency = "USD"
         };
 
-        // Bar size AND duration both depend on the configured NW timeframe.
-        // We've reliably pulled "1 Y" of 1-hour bars in practice, but IBKR's
-        // historical-data API generally caps sub-hour bar sizes to a much
-        // shorter duration per request (commonly documented around "1 M"
-        // for 15/30-min bars) before rejecting the request or throwing a
-        // pacing violation. If you see a historical-data error in the
-        // console right after switching to 15/30-min, shortening this
-        // duration further is the first thing to try.
-        string barSizeSetting;
-        string durationStr;
-        switch (timeframeMinutes)
-        {
-            case 15:
-                barSizeSetting = "15 mins";
-                durationStr = "1 M";
-                break;
-            case 30:
-                barSizeSetting = "30 mins";
-                durationStr = "1 M";
-                break;
-            case 240:
-                barSizeSetting = "4 hours";
-                durationStr = "1 Y";
-                break;
-            default:
-                barSizeSetting = "1 hour";
-                durationStr = "1 Y";
-                break;
-        }
+        // Native hourly bars use clock boundaries (09:30, 10:00, ...), not
+        // the bot's 09:30-anchored buckets. Aggregate aligned 30-minute bars
+        // for both 1h and 4h rather than relabeling native bars and losing data.
+        string barSizeSetting = timeframeMinutes == 15 ? "15 mins" : "30 mins";
+        int barsPerDay = (int)Math.Ceiling(390d / timeframeMinutes);
+        int calendarDays = (int)Math.Ceiling((_broker.NadarayaWatsonLookback + 100d) / barsPerDay * 7d / 5d) + 20;
+        string durationStr = $"{calendarDays} D";
 
         // useRTH=1: the NW levels are based on regular-session bars, not
         // overnight/after-hours prints. formatDate=2 forces Unix timestamps
         // for intraday bars so we can normalize them to US/Eastern explicitly;
         // otherwise the API can return bars in the TWS/login timezone and the
         // 09:30 ET bucket boundaries become wrong on machines outside Eastern time.
-        // NOTE: with 15/30-min bars and a 1-month duration, NW_LOOKBACK values
-        // much above ~500 (15m) or ~270 (30m) may not have enough bars available.
-        // The strategy stays unready until the selected series has enough bars.
+        // Request length includes warmup and calendar slack. Large responses
+        // remain subject to IBKR throttling; a series cannot trade before its
+        // complete response is published and enough completed bars exist.
         _client.reqHistoricalData(id, contract, "", durationStr, barSizeSetting, "TRADES", 1, 2, false, null);
     }
 
@@ -635,60 +662,38 @@ public class IbClient : EWrapper, IBroker
         double lastFillPrice, int clientId, string whyHeld, double mktCapPrice)
     {
         Console.WriteLine($"[ORDER STATUS] Id={orderId} Status={status} Filled={filled} Remaining={remaining}");
-
-        if (status == "PendingSubmit" || status == "PreSubmitted" || status == "Submitted" || status == "PendingCancel")
-        {
-            if (!_terminalOrderIds.ContainsKey(orderId))
-                _activeOrderIds[orderId] = true;
-        }
-        else if (status == "Filled" || status == "Cancelled" || status == "ApiCancelled")
+        if (filled > 0 && avgFillPrice > 0)
+            _broker.OnOrderFilled(orderId, (int)filled, (decimal)avgFillPrice, status == "Filled");
+        if (status is "Filled" or "Cancelled" or "ApiCancelled")
         {
             _activeOrderIds.TryRemove(orderId, out _);
             _terminalOrderIds[orderId] = true;
-            if (status == "Filled")
-                _cancelRequestedOrderIds.TryRemove(orderId, out _);
+            _cancelRequestedOrderIds.TryRemove(orderId, out _);
+            if (status != "Filled") _broker.OnOrderCancelled(orderId);
+            if (status == "Filled" && _bracketSiblings.TryRemove(orderId, out int siblingId))
+                TryCancelActiveOrder(siblingId, $"bracket sibling {orderId} filled");
+            _bracketChildToSymbol.TryRemove(orderId, out _);
+            _bracketGroupByOrderId.TryRemove(orderId, out _);
         }
-
-        if (status == "Filled")
-        {
-            if (_bracketChildToSymbol.TryRemove(orderId, out _))
-            {
-                if (_filledOrders.TryAdd(orderId, true))
-                {
-                    int[] bracketIds = _bracketGroupByOrderId.TryGetValue(orderId, out int[] trackedIds)
-                        ? trackedIds
-                        : new[] { orderId };
-                    if (_bracketSiblings.TryRemove(orderId, out int siblingId))
-                    {
-                        TryCancelActiveOrder(siblingId, $"bracket sibling {orderId} filled");
-                        _bracketChildToSymbol.TryRemove(siblingId, out _);
-                        _bracketSiblings.TryRemove(siblingId, out _);
-                        _broker.RemoveLiveOrder(siblingId);
-                    }
-                    _broker.OnOrderFilled(orderId, (int)filled, (decimal)avgFillPrice);
-                    CleanupBracketTracking(bracketIds);
-
-                    // FIX #3: consistent cleanup in both bracket and normal paths
-                    _filledOrders.TryRemove(orderId, out _);
-                }
-                return;
-            }
-
-            if (_filledOrders.TryAdd(orderId, true))
-            {
-                _broker.OnOrderFilled(orderId, (int)filled, (decimal)avgFillPrice);
-                // A filled bracket parent is no longer a valid rejection anchor;
-                // its protective children keep their own group mappings.
-                _bracketGroupByOrderId.TryRemove(orderId, out _);
-                _filledOrders.TryRemove(orderId, out _);
-            }
-        }
+        else if (!_terminalOrderIds.ContainsKey(orderId))
+            _activeOrderIds[orderId] = true;
     }
 
     public void execDetails(int reqId, Contract contract, Execution execution)
     {
-        Console.WriteLine($"[EXECUTION] OrderId={execution.OrderId} Shares={execution.Shares} Price={execution.Price}");
-        // Intentionally does NOT call OnOrderFilled — orderStatus is the authoritative callback.
+        // IBKR does not guarantee orderStatus for every execution. CumQty/AvgPrice
+        // share the same idempotent accumulator as orderStatus, including partials.
+        bool complete = _submittedOrders.TryGetValue(execution.OrderId, out var spec)
+            && execution.CumQty >= spec.Order.TotalQuantity;
+        _broker.OnOrderFilled(execution.OrderId, (int)execution.CumQty,
+                              (decimal)execution.AvgPrice, complete);
+        if (complete)
+        {
+            _terminalOrderIds[execution.OrderId] = true;
+            _activeOrderIds.TryRemove(execution.OrderId, out _);
+            if (_bracketSiblings.TryRemove(execution.OrderId, out int siblingId))
+                TryCancelActiveOrder(siblingId, "sibling execution completed");
+        }
     }
 
     // ── HISTORICAL DATA CALLBACKS ─────────────────────────────────────────────
@@ -749,7 +754,7 @@ public class IbClient : EWrapper, IBroker
         }
         else if (isHourly)
         {
-            _broker.AddHourlyCandle(symbol, hourlySeries.TimeframeMinutes, time,
+            _broker.AddNwHistoryBar(reqId, symbol, hourlySeries.TimeframeMinutes, time,
                 (decimal)bar.Open, (decimal)bar.High,
                 (decimal)bar.Low, (decimal)bar.Close, bar.Volume);
         }
@@ -766,6 +771,7 @@ public class IbClient : EWrapper, IBroker
         // NW historical request complete — clean up, do NOT start live subscription.
         if (_hourlyReqIdToSeries.TryRemove(reqId, out var hourlySeries))
         {
+            _broker.CompleteNwHistory(hourlySeries.Symbol, hourlySeries.TimeframeMinutes, reqId);
             int bars = _broker.GetNadarayaWatsonBarCount(
                 hourlySeries.Symbol, hourlySeries.TimeframeMinutes);
             Console.WriteLine($"[IBKR] {hourlySeries.TimeframeMinutes}-min NW history loaded for {hourlySeries.Symbol}: {bars} completed bars " +
@@ -802,7 +808,7 @@ public class IbClient : EWrapper, IBroker
         if (_broker.NeedsReconciliation)
         {
             Console.WriteLine("[IBKR] Requesting position snapshot for reconciliation...");
-            _client.reqPositions();
+            RequestPositions();
         }
     }
 
@@ -823,6 +829,7 @@ public class IbClient : EWrapper, IBroker
 
         _symToLiveReqId.Clear();
         _reqIdToSymbol.Clear();
+        _broker.OnBrokerDisconnected();
         // Note: _histReqIdToSymbol, _dailyReqIdToSymbol and _hourlyReqIdToSeries are intentionally NOT cleared
         // here — in-flight historical responses that arrive after a brief drop-reconnect
         // can still be routed correctly if the reqId is still in the dictionary.
@@ -856,7 +863,6 @@ public class IbClient : EWrapper, IBroker
             {
                 if (relatedId == id) continue;
                 TryCancelActiveOrder(relatedId, $"bracket rejected ({errorCode})");
-                _broker.RemoveLiveOrder(relatedId);
             }
         }
 
@@ -867,9 +873,23 @@ public class IbClient : EWrapper, IBroker
     {
         if (errorCode == 2104 || errorCode == 2106 || errorCode == 2158) return;
 
-        if (errorCode == 202 && _cancelRequestedOrderIds.TryRemove(id, out _))
+        if (errorCode == 202)
         {
-            Console.WriteLine($"[IBKR] cancel confirmed for order id={id}: {errorMsg}");
+            // Error 202 carries no cumulative filled quantity. Await the
+            // cancellation status before releasing a deferred exit; if it is
+            // missing, reconcile actual positions and working orders first.
+            Console.WriteLine($"[IBKR] cancellation notice for order id={id}: {errorMsg}");
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(5_000);
+                if (!_terminalOrderIds.ContainsKey(id)) _broker.RequestRereconcile();
+            });
+            return;
+        }
+
+        if (IsHardOrderRejection(errorCode) && _pendingStopUpdates.TryRemove(id, out _))
+        {
+            _broker.OnProtectiveStopUpdateRejected(id, errorMsg);
             return;
         }
 
@@ -879,6 +899,7 @@ public class IbClient : EWrapper, IBroker
         {
             _cancelRequestedOrderIds.TryRemove(id, out _);
             Console.WriteLine($"[IBKR] cancel ignored for terminal order id={id}: {errorMsg}");
+            if (!_terminalOrderIds.ContainsKey(id)) _broker.RequestRereconcile();
             return;
         }
 
@@ -905,8 +926,18 @@ public class IbClient : EWrapper, IBroker
     public void updatePortfolio(Contract contract, double position, double marketPrice, double marketValue, double averageCost, double unrealizedPNL, double realizedPNL, string accountName) { }
     public void updateAccountTime(string timestamp) { }
     public void accountDownloadEnd(string account) { }
-    public void openOrder(int orderId, Contract contract, Order order, OrderState orderState) { }
-    public void openOrderEnd() { }
+    public void openOrder(int orderId, Contract contract, Order order, OrderState orderState)
+    {
+        _submittedOrders[orderId] = (contract, order);
+        if (_pendingStopUpdates.TryGetValue(orderId, out decimal requested)
+            && (decimal)order.AuxPrice == requested) _pendingStopUpdates.TryRemove(orderId, out _);
+        if (orderState.Status is "Cancelled" or "Filled" or "ApiCancelled") return;
+        if (_terminalOrderIds.ContainsKey(orderId)) return;
+        _activeOrderIds[orderId] = true;
+        _broker.OnOpenOrderReceived(orderId, contract.Symbol, order.Action == "BUY" ? TradeSide.Buy : TradeSide.Sell,
+            (int)order.TotalQuantity, order.OrderType, order.ParentId);
+    }
+    public void openOrderEnd() => _broker.OnOpenOrderSnapshotComplete();
     public void contractDetails(int reqId, ContractDetails contractDetails) { }
     public void contractDetailsEnd(int reqId) { }
     public void execDetailsEnd(int reqId) { }
@@ -919,7 +950,6 @@ public class IbClient : EWrapper, IBroker
     public void updateNewsBulletin(int msgId, int msgType, string message, string origExchange) { }
     public void position(string account, Contract contract, double pos, double avgCost)
     {
-        if (pos == 0) return;
         Console.WriteLine($"[IBKR] position(): {contract.Symbol} x{(int)pos} @ {avgCost:F2}");
         _broker.OnPositionReceived(contract.Symbol, (int)pos, (decimal)avgCost);
     }

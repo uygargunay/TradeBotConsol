@@ -36,6 +36,7 @@ public interface IBroker
     void CancelOrder(int orderId);
     bool IsReady { get; }
     void RequestPositions();
+    int EnsureNwStop(string symbol, int orderId, int qty, TradeSide side, decimal stopPrice);
     void RequestDailyHistoricalData(string symbol);
     void RequestHourlyHistoricalData(string symbol, int timeframeMinutes);
     bool SupportsBrackets { get; }
@@ -84,6 +85,8 @@ public class SimPosition
     public int EntrySetupScore { get; set; } = 0;
     public int BracketStopId { get; set; } = 0;
     public int BracketTargetId { get; set; } = 0;
+    public int EntryOrderId { get; set; }
+    public decimal RealizedExitPnL { get; set; }
     public NwEntryAudit? NwEntryAudit { get; set; }
     public decimal UnrealizedPnL(decimal price) =>
         IsShort ? Quantity * (AvgPrice - price) : Quantity * (price - AvgPrice);
@@ -91,16 +94,22 @@ public class SimPosition
 
 public class TrackedOrder
 {
-    public int OrderId;
-    public string Symbol;
-    public TradeSide Side;
-    public int Qty;
-    public bool IsShortEntry;
+    public int OrderId { get; set; }
+    public string Symbol { get; set; } = "";
+    public TradeSide Side { get; set; }
+    public int Qty { get; set; }
+    public bool IsEntry { get; set; }
+    public int FilledQty { get; set; }
+    public decimal FilledNotional { get; set; }
+    public string ExitReason { get; set; } = "";
+    public string FillKey { get; set; } = Guid.NewGuid().ToString("N");
 }
 
 public class BotPersistData
 {
     public Dictionary<string, SimPosition> Positions { get; set; } = new();
+    public List<TrackedOrder> Orders { get; set; } = new();
+    public List<PendingEntryState> PendingEntries { get; set; } = new();
     public decimal TotalPnL { get; set; }
     public int WinCount { get; set; }
     public int LossCount { get; set; }
@@ -121,8 +130,20 @@ public class BotPersistData
     public DateTime LastVolumeResetDate { get; set; } = DateTime.MinValue;
 }
 
+public sealed class PendingEntryState
+{
+    public string Symbol { get; set; } = "";
+    public string Strategy { get; set; } = "";
+    public DateTime CreatedUtc { get; set; }
+    public decimal InitialRisk { get; set; }
+    public NwEntryAudit? Audit { get; set; }
+    public int StopId { get; set; }
+    public int TargetId { get; set; }
+}
+
 public class TradeRecord
 {
+    public string FillKey { get; set; } = "";
     public string Symbol { get; set; }
     public string Side { get; set; }
     public string Strategy { get; set; }
@@ -1304,29 +1325,18 @@ public partial class SimulatedBroker
 
     private void ExpireStalePendingEntries()
     {
-        if (_pendingEntryCreatedUtc.IsEmpty) return;
-
-        var now = DateTime.UtcNow;
-        foreach (var kv in _pendingEntryCreatedUtc.ToArray())
+        lock (_lock)
         {
-            string symbol = kv.Key;
-            if ((now - kv.Value).TotalSeconds < PENDING_ENTRY_TIMEOUT_SECONDS) continue;
-            if (_positions.ContainsKey(symbol))
+            foreach (var kv in _pendingEntryCreatedUtc.ToArray())
             {
-                _pendingEntryCreatedUtc.TryRemove(symbol, out _);
-                _pendingEntrySymbols.TryRemove(symbol, out _);
-                _pendingNwEntryAudit.TryRemove(symbol, out _);
-                continue;
+                if ((DateTime.UtcNow - kv.Value).TotalSeconds < PENDING_ENTRY_TIMEOUT_SECONDS) continue;
+                // A timeout requests cancellation; it does not prove there were
+                // no fills. Retain the reservation and cumulative fill state
+                // until the broker acknowledges cancellation, including partials.
+                foreach (var order in _ordersById.Values.Where(o => o.IsEntry
+                    && o.Symbol.Equals(kv.Key, StringComparison.OrdinalIgnoreCase)).ToList())
+                    RealBroker?.CancelOrder(order.OrderId);
             }
-
-            foreach (var order in _ordersById.Where(o => string.Equals(o.Value.Symbol, symbol, StringComparison.OrdinalIgnoreCase)).ToList())
-            {
-                try { RealBroker?.CancelOrder(order.Key); } catch { }
-                _ordersById.TryRemove(order.Key, out _);
-                _bracketExitReasonByOrderId.TryRemove(order.Key, out _);
-            }
-
-            ReleasePendingEntrySlot(symbol, $"entry order stale > {PENDING_ENTRY_TIMEOUT_SECONDS}s");
         }
     }
 
@@ -1800,9 +1810,9 @@ public partial class SimulatedBroker
 
     private static int ValidateNwTimeframe(int minutes)
     {
-        return SUPPORTED_NW_TIMEFRAMES_MINUTES
-            .OrderBy(tf => Math.Abs(tf - minutes))
-            .First();
+        if (!SUPPORTED_NW_TIMEFRAMES_MINUTES.Contains(minutes))
+            throw new ArgumentOutOfRangeException(nameof(minutes), "NW timeframes must be 15, 30, 60 or 240 minutes.");
+        return minutes;
     }
 
     private static int[] ValidateNwTimeframes(IEnumerable<int>? timeframes)
@@ -1812,7 +1822,9 @@ public partial class SimulatedBroker
             .Distinct()
             .OrderBy(tf => tf)
             .ToArray();
-        return selected.Length > 0 ? selected : new[] { 30 };
+        if (selected.Length == 0)
+            throw new ArgumentException("Select at least one NW timeframe, or disable NW using its strategy switch.");
+        return selected;
     }
 
     private static int[] ReadNwTimeframes(JsonElement root, int[] fallback)
@@ -1833,11 +1845,8 @@ public partial class SimulatedBroker
         if (root.TryGetProperty("NW_TIMEFRAME_MINUTES", out var legacyElement)
             && legacyElement.TryGetInt32(out int legacyTimeframe))
         {
-            // The merged pre-multiselect profile was 30m. This release's explicit
-            // migration for that profile enables the recommended 30m/1h/4h set;
-            // non-30m legacy choices remain single selections.
-            if (legacyTimeframe == 30 && fallback.Length > 1)
-                return ValidateNwTimeframes(fallback);
+            // Preserve the user's scalar choice; additional timeframes must be
+            // explicitly selected rather than silently enabled by migration.
             return ValidateNwTimeframes(new[] { legacyTimeframe });
         }
 
@@ -1880,12 +1889,22 @@ public partial class SimulatedBroker
 
     private static decimal ValidateNwStopLossPct(decimal value)
     {
-        if (value <= 0m || value > 1m)
+        if (value <= 0m || value > 0.04m)
             throw new ArgumentOutOfRangeException(
                 nameof(value),
-                "NW_STOP_LOSS_PCT must be greater than 0 and no more than 1 (0.03 = 3%).");
+                "NW stop loss must be greater than 0% and at most 4%, matching the guarded IBKR stop limit (0.03 = 3%).");
 
         return value;
+    }
+
+    private static void ValidateNwEnvelopeSettings(int lookback, decimal bandwidth, decimal multiplier)
+    {
+        if (lookback < 20 || lookback > 1000)
+            throw new ArgumentOutOfRangeException(nameof(lookback), "NW lookback must be between 20 and 1000 bars.");
+        if (bandwidth <= 0m || bandwidth > lookback)
+            throw new ArgumentOutOfRangeException(nameof(bandwidth), "NW bandwidth must be positive and no larger than lookback.");
+        if (multiplier <= 0m || multiplier > 20m)
+            throw new ArgumentOutOfRangeException(nameof(multiplier), "NW multiplier must be greater than 0 and at most 20.");
     }
 
     private void UpdateHourlyFromMinute(string symbol, Candle minuteBar)
@@ -1932,6 +1951,7 @@ public partial class SimulatedBroker
             int maxHourlyBars = Math.Max(NW_LOOKBACK + 100, 700);
             if (list.Count > maxHourlyBars)
                 list.RemoveRange(0, list.Count - maxHourlyBars);
+            _nwLiveThrough[seriesKey] = minuteBar.Time.AddMinutes(1);
         }
     }
 
@@ -2033,6 +2053,8 @@ public partial class SimulatedBroker
         GetNadarayaWatsonEnvelope(string symbol, int timeframeMinutes)
     {
         string seriesKey = GetNwSeriesKey(symbol, timeframeMinutes);
+        if (!_nwHistoryReady.ContainsKey(seriesKey))
+            return (0m, 0m, 0m, 0, DateTime.MinValue);
         var bars = GetCompletedNwCandles(symbol, timeframeMinutes);
         DateTime lastBarTime = bars.Count > 0 ? bars[^1].Time : DateTime.MinValue;
         if (bars.Count < NW_LOOKBACK) return (0m, 0m, 0m, bars.Count, lastBarTime);
@@ -2081,6 +2103,15 @@ public partial class SimulatedBroker
         {
             _nwTouchState.TryRemove(seriesKey, out _);
             _lastNwDecisionBySymbol[seriesKey] = $"{tfLabel}: bands invalid";
+            return null;
+        }
+
+        DateTime? activeBucket = GetRegularSessionNwBucket(GetEasternTime(), timeframeMinutes);
+        if (activeBucket.HasValue && activeBucket.Value.TimeOfDay > new TimeSpan(9, 30, 0)
+            && bandAsOfEt != activeBucket.Value.AddMinutes(-timeframeMinutes))
+        {
+            _nwTouchState.TryRemove(seriesKey, out _);
+            _lastNwDecisionBySymbol[seriesKey] = $"{tfLabel}: latest completed bar is missing; waiting for current history";
             return null;
         }
 
@@ -2150,7 +2181,7 @@ public partial class SimulatedBroker
         }
 
         // Evaluate every selected interval on the same LAST tick. If several
-        // cross together, prefer the longest (least noisy) signal and retain all
+        // cross together, use the longest interval as the attribution tie-breaker and retain all
         // confirming intervals in the audit record.
         var candidates = NW_TIMEFRAMES_MINUTES
             .OrderByDescending(tf => tf)
@@ -2180,7 +2211,9 @@ public partial class SimulatedBroker
         string strategyTag = GetNwStrategyTag(chosen.TimeframeMinutes);
         decimal atrForSizing = candles != null ? SafeATR(candles, 14) : MIN_STOP_DISTANCE;
         decimal stopDistance = GetStopDistanceForStrategy(strategyTag, atrForSizing, price);
-        int qty = CalcQtyV2(price, stopDistance);
+        // NW has too few completed trades to estimate a Kelly edge, and losses
+        // from disabled scalp/momentum strategies must not resize NW positions.
+        int qty = CalcQty(price, stopDistance);
         if (qty <= 0)
         {
             string decision = $"TOUCH blocked ({confirmationLabel}): size is zero";
@@ -3681,6 +3714,16 @@ public partial class SimulatedBroker
                               TradeSide side, bool isShort, string strategyTag,
                               NwEntryAudit? nwEntryAudit = null)
     {
+        // Eligibility, risk reservation and submission share one lock. Live ticks
+        // and Settings/reconnect callbacks must not reserve the same slot twice.
+        lock (_lock)
+            return OpenPositionLocked(symbol, qty, price, side, isShort, strategyTag, nwEntryAudit);
+    }
+
+    private bool OpenPositionLocked(string symbol, int qty, decimal price,
+                                   TradeSide side, bool isShort, string strategyTag,
+                                   NwEntryAudit? nwEntryAudit)
+    {
         if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(strategyTag)) return false;
         bool isNwBand = strategyTag.StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase);
 
@@ -3693,6 +3736,9 @@ public partial class SimulatedBroker
             LogMessage($"[NW ONLY] {strategyTag} {symbol} blocked — only NW entries are enabled");
             return false;
         }
+
+        if (RealBroker?.IsReady != true ||
+            !PassesEntryGates(symbol, out _, nwTouchMode: isNwBand)) return false;
 
         // Defense in depth: scanners, intrabar callbacks, config reloads and any
         // future strategy path all converge here.  A disabled master switch must
@@ -4015,7 +4061,7 @@ public partial class SimulatedBroker
             // then moved the parent, making the child >3% away before IBKR even checked
             // the additional STP-LMT offset.
             decimal bracketStopDistance = isNwBand
-                ? Math.Max(MIN_STOP_DISTANCE, entryAdj * NW_STOP_LOSS_PCT)
+                ? entryAdj * NW_STOP_LOSS_PCT
                 : stopDist;
             decimal stopBasePrice = isNwBand ? entryAdj : price;
             decimal stopTrigger = executionIsShort
@@ -4074,6 +4120,7 @@ public partial class SimulatedBroker
         }
 
         LogMessage($"[{strategyTag}] {symbol} x{qty} @ {price:F2} | execution={(executionIsShort ? "SHORT" : "LONG")} | regime={_marketRegime} | bracket={usedBracket}");
+        SaveState();
         return true;
     }
 
@@ -4084,18 +4131,18 @@ public partial class SimulatedBroker
     private void CancelBracketChildren(SimPosition pos)
     {
         if (RealBroker == null) return;
+        if (pos.EntryOrderId > 0 && _ordersById.ContainsKey(pos.EntryOrderId))
+            RealBroker.CancelOrder(pos.EntryOrderId);
         if (pos.BracketStopId > 0)
         {
             RealBroker.CancelOrder(pos.BracketStopId);
-            _ordersById.TryRemove(pos.BracketStopId, out _);
-            pos.BracketStopId = 0;
         }
         if (pos.BracketTargetId > 0)
         {
             RealBroker.CancelOrder(pos.BracketTargetId);
-            _ordersById.TryRemove(pos.BracketTargetId, out _);
-            pos.BracketTargetId = 0;
         }
+        // Cancellation is asynchronous. Keep IDs and fill tracking until the
+        // broker confirms cancellation; a protective child may fill meanwhile.
     }
 
     private void CheckHardStop(string symbol, decimal currentPrice)
@@ -4104,6 +4151,18 @@ public partial class SimulatedBroker
         {
             if (!_positions.TryGetValue(symbol, out var pos)) return;
             if (pos.ExitSubmitted) return;
+            if (IsNwPosition(pos))
+            {
+                if (pos.AvgPrice <= 0m) return;
+                decimal stop = GetNwStopPrice(pos);
+                bool hit = pos.IsShort ? currentPrice >= stop : currentPrice <= stop;
+                if (hit)
+                    SubmitOrder(symbol, pos.Quantity, currentPrice,
+                        pos.IsShort ? TradeSide.Buy : TradeSide.Sell, "NW_STOP_LOSS", "MKT");
+                else
+                    SyncNwProtectiveStop(pos);
+                return;
+            }
             if (!_marketData.TryGetValue(symbol, out var candles)) return;
 
             double secondsHeld = (DateTime.UtcNow - pos.EntryTime).TotalSeconds;
@@ -4156,7 +4215,6 @@ public partial class SimulatedBroker
         lock (_lock)
         {
             if (!_positions.TryGetValue(symbol, out var pos)) return;
-            if (!_marketData.TryGetValue(symbol, out var candles)) return;
             if (pos.ExitSubmitted) return;
 
             TradeSide exitSide = pos.IsShort ? TradeSide.Buy : TradeSide.Sell;
@@ -4195,6 +4253,8 @@ public partial class SimulatedBroker
                 }
                 return;
             }
+
+            if (!_marketData.TryGetValue(symbol, out var candles)) return;
 
             double secondsHeld = (DateTime.UtcNow - pos.EntryTime).TotalSeconds;
             if (secondsHeld < MIN_HOLD_SECONDS) return;
@@ -4397,7 +4457,14 @@ public partial class SimulatedBroker
     public void SubmitOrder(string symbol, int qty, decimal price,
                          TradeSide side, string note, string type = "LMT")
     {
-        if (RealBroker == null) return;
+        if (RealBroker?.IsReady != true)
+        {
+            lock (_lock)
+                if (_positions.TryGetValue(symbol, out var unavailablePosition))
+                    unavailablePosition.ExitSubmitted = false;
+            return;
+        }
+        if (DeferExitUntilProtectionCancelled(symbol, qty, price, side, note, type)) return;
 
         decimal adjusted = price;
         if (type == "LMT")
@@ -4431,8 +4498,20 @@ public partial class SimulatedBroker
 
     public void RegisterLiveOrder(int orderId, string symbol, TradeSide side, int qty)
     {
-        _ordersById[orderId] = new TrackedOrder
-        { OrderId = orderId, Symbol = symbol, Side = side, Qty = qty };
+        lock (_lock)
+        {
+            if (_ordersById.TryGetValue(orderId, out var existing))
+            {
+                existing.Qty = qty;
+                return;
+            }
+            bool entry = _positions.TryGetValue(symbol, out var pos)
+                ? side == (pos.IsShort ? TradeSide.Sell : TradeSide.Buy)
+                : _pendingStrategyTag.TryGetValue(symbol, out var tag)
+                  && side == (IsShortTag(tag) ? TradeSide.Sell : TradeSide.Buy);
+            _ordersById[orderId] = new TrackedOrder
+            { OrderId = orderId, Symbol = symbol, Side = side, Qty = qty, IsEntry = entry };
+        }
     }
 
     public void RemoveLiveOrder(int orderId)
@@ -4450,277 +4529,13 @@ public partial class SimulatedBroker
             _bracketExitReasonByOrderId[targetId] = "BRACKET_TARGET";
     }
 
-    public void OnOrderRejected(int orderId, int errorCode = 0, string errorMessage = "")
-    {
-        if (!_ordersById.TryRemove(orderId, out var order)) return;
-
-        string? pendingTag = "";
-        _pendingStrategyTag?.TryGetValue(order.Symbol, out pendingTag);
-        bool wasNwEntry = !string.IsNullOrWhiteSpace(pendingTag)
-            && pendingTag.StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase);
-        bool wasExit = false;
-        lock (_lock)
-        {
-            if (_positions.TryGetValue(order.Symbol, out var pos))
-            {
-                wasExit = (pos.IsShort && order.Side == TradeSide.Buy) || (!pos.IsShort && order.Side == TradeSide.Sell);
-                if (wasExit)
-                {
-                    // Let the next tick retry the protective exit. Otherwise one rejected
-                    // stop/market order can leave the position unmanaged forever.
-                    pos.ExitSubmitted = false;
-                    _pendingExitReasonBySymbol.TryRemove(order.Symbol, out _);
-                }
-            }
-        }
-
-        if (!wasExit)
-        {
-            StartEntryOrderRejectionCooldown(
-                order.Symbol, wasNwEntry, errorCode,
-                string.IsNullOrWhiteSpace(errorMessage) ? "Order rejected." : errorMessage);
-            ReleasePendingEntrySlot(order.Symbol, $"IBKR rejected orderId={orderId} code={errorCode}");
-        }
-
-        string codeText = errorCode > 0 ? $" code={errorCode}" : "";
-        LogMessage($"[REJECTED] orderId={orderId}{codeText} {order.Side} {order.Symbol} x{order.Qty} — " +
-                   $"{(wasExit ? "exit retry enabled" : $"entry slot freed; {ORDER_REJECTION_COOLDOWN_SECONDS / 60}m cooldown started")}.");
-        _ = SendEmail($"⚠️ Order Rejected: {order.Symbol}",
-            $"IBKR rejected orderId={orderId}{codeText} {order.Side} {order.Symbol} x{order.Qty}. " +
-            $"{errorMessage} Check errors.log.");
-    }
-
-    public void OnOrderFilled(int orderId, int fillQty, decimal fillPrice)
-    {
-        if (!_ordersById.TryGetValue(orderId, out var order)) return;
-        if (!_ordersById.TryRemove(orderId, out _)) return;
-
-        string subject = "", body = "";
-
-        lock (_lock)
-        {
-            bool isShortEntry = order.Side == TradeSide.Sell && !_positions.ContainsKey(order.Symbol);
-            bool isLongEntry = order.Side == TradeSide.Buy && !_positions.ContainsKey(order.Symbol);
-
-            // ── FIX: Phantom entry guard ──
-            // If this looks like an entry but there's no pending strategy tag, it's an
-            // orphaned bracket fill (stop/target that survived after manual sell or EOD).
-            // Reject it rather than creating a ghost position with empty StrategyTag.
-            if ((isLongEntry || isShortEntry) && !_pendingEntrySymbols.ContainsKey(order.Symbol))
-            {
-                // No OpenPosition() ever queued this symbol — it's a phantom.
-                LogMessage($"[PHANTOM GUARD] Rejected orphaned fill: {order.Side} {order.Symbol} x{fillQty} @ {fillPrice:F2} orderId={orderId} — no pending entry exists.");
-                _ = SendEmail($"⚠️ Phantom Fill Blocked: {order.Symbol}",
-                    $"Orphaned {order.Side} fill for {order.Symbol} x{fillQty} @ {fillPrice:C2} was blocked from creating a ghost position.");
-                return;
-            }
-
-            if (isLongEntry || isShortEntry)
-            {
-                Interlocked.Decrement(ref _pendingEntryCount);
-                _pendingEntrySymbols.TryRemove(order.Symbol, out _);
-                _pendingEntryCreatedUtc.TryRemove(order.Symbol, out _);
-
-                string tag = "";
-                decimal initialRisk = 0m;
-                _pendingStrategyTag?.TryRemove(order.Symbol, out tag);
-                _pendingInitialRisk?.TryRemove(order.Symbol, out initialRisk);
-                _pendingNwEntryAudit.TryRemove(order.Symbol, out var nwEntryAudit);
-                string resolvedTag = tag ?? "";
-                _indicatorCache.TryGetValue(order.Symbol, out var entryIndicators);
-                _vwap.TryGetValue(order.Symbol, out decimal entryVwap);
-                _marketData.TryGetValue(order.Symbol, out var entryCandles);
-
-                _positions[order.Symbol] = new SimPosition
-                {
-                    Symbol = order.Symbol,
-                    Quantity = fillQty,
-                    AvgPrice = fillPrice,
-                    HighWaterMark = fillPrice,
-                    CurrentPrice = fillPrice,
-                    EntryTime = DateTime.UtcNow,
-                    IsShort = isShortEntry,
-                    StrategyTag = resolvedTag,
-                    EntryRegime = _marketRegime,
-                    EntryCommission = COMMISSION_PER_SIDE,
-                    InitialRiskPerShare = initialRisk,
-                    EntryRsi = entryIndicators?.Rsi14 ?? 0d,
-                    EntryAtr = entryIndicators?.Atr14 ?? 0m,
-                    EntryVwap = entryVwap,
-                    EntrySetupScore = ScoreSetup(order.Symbol, entryCandles),
-                    NwEntryAudit = resolvedTag.StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase)
-                        ? nwEntryAudit
-                        : null
-                };
-
-                if (_pendingBracketChildren.TryRemove(order.Symbol, out var bracketIds))
-                {
-                    _positions[order.Symbol].BracketStopId = bracketIds.stopId;
-                    _positions[order.Symbol].BracketTargetId = bracketIds.targetId;
-                    LogMessage($"[BRACKET] {order.Symbol} entry filled — bracket live " +
-                               $"(stop={bracketIds.stopId} target={bracketIds.targetId})");
-                }
-
-                _tradesToday++;
-                _totalRealizedPnL -= COMMISSION_PER_SIDE;
-                IncrementStrategyCount(resolvedTag);
-
-                string dir = isShortEntry ? "SHORT" : "BUY";
-                subject = $"🚀 {dir}: {order.Symbol} x{fillQty} @ {fillPrice:C2}";
-                body = $"{dir} {fillQty} shares @ {fillPrice:C2}  (commission: -$1)";
-            }
-            else if (_positions.TryGetValue(order.Symbol, out var pos))
-            {
-                decimal grossPnl = pos.IsShort
-                    ? (pos.AvgPrice - fillPrice) * fillQty
-                    : (fillPrice - pos.AvgPrice) * fillQty;
-
-                decimal netPnl = grossPnl - COMMISSION_PER_SIDE;
-                decimal holdMinutes = (decimal)(DateTime.UtcNow - pos.EntryTime).TotalMinutes;
-
-                _totalRealizedPnL += netPnl;
-
-                pos.Quantity -= fillQty;
-                bool isFullClose = pos.Quantity <= 0;
-
-                string exitReason = isFullClose ? "EXIT" : "PARTIAL";
-                if (_bracketExitReasonByOrderId.TryRemove(orderId, out var bracketReason) && !string.IsNullOrWhiteSpace(bracketReason))
-                {
-                    exitReason = bracketReason;
-                }
-                else if (_pendingExitReasonBySymbol.TryRemove(order.Symbol, out var pendingReason) && !string.IsNullOrWhiteSpace(pendingReason))
-                {
-                    exitReason = pendingReason;
-                }
-                else
-                {
-                    foreach (var tag in new[]{ "ATR_TRAIL_EXIT","TIME_STOP","HARD_STOP",
-                                               "MAX_LOSS_STOP","PARTIAL_TP_1","PARTIAL_TP_2","TRAIL_BACK_TO_1R",
-                                               "SCALP_SCRATCH_EXIT","SCALP_STALE_EXIT","SCALP_TIME_STOP","EOD_LIQUIDATE" })
-                        if (_tradeHistoryLog.LastOrDefault()?.Contains(tag) == true)
-                        { exitReason = tag; break; }
-                }
-
-                decimal recordedNetPnl = isFullClose
-                    ? netPnl - pos.EntryCommission
-                    : netPnl;
-                DateTime exitUtc = DateTime.UtcNow;
-                DateTime entryEt = TimeZoneInfo.ConvertTimeFromUtc(
-                    pos.EntryTime.Kind == DateTimeKind.Utc ? pos.EntryTime : pos.EntryTime.ToUniversalTime(),
-                    Eastern);
-                DateTime exitEt = TimeZoneInfo.ConvertTimeFromUtc(exitUtc, Eastern);
-
-                _completedTrades.Add(new TradeRecord
-                {
-                    Symbol = order.Symbol,
-                    Side = pos.IsShort ? "SHORT" : "LONG",
-                    Strategy = pos.StrategyTag,
-                    Qty = fillQty,
-                    Entry = pos.AvgPrice,
-                    Exit = fillPrice,
-                    NetPnL = recordedNetPnl,
-                    HoldMinutes = holdMinutes,
-                    ExitReason = exitReason,
-                    Time = exitEt.ToString("HH:mm"),
-                    EntryTime = entryEt.ToString("HH:mm:ss"),
-                    ExitTime = exitEt.ToString("HH:mm:ss"),
-                    Date = exitEt.Date.ToString("yyyy-MM-dd"),
-                    Regime = string.IsNullOrWhiteSpace(pos.EntryRegime) ? _marketRegime : pos.EntryRegime,
-                    EntryRsi = pos.EntryRsi,
-                    EntryAtr = pos.EntryAtr,
-                    EntryVwap = pos.EntryVwap,
-                    EntrySetupScore = pos.EntrySetupScore,
-                    NwEntryAudit = pos.NwEntryAudit
-                });
-                if (_completedTrades.Count > 200) _completedTrades.RemoveAt(0);
-
-                var allTradeRecord = new TradeRecord
-                {
-                    Symbol = order.Symbol,
-                    Side = pos.IsShort ? "SHORT" : "LONG",
-                    Strategy = pos.StrategyTag,
-                    Qty = fillQty,
-                    Entry = pos.AvgPrice,
-                    Exit = fillPrice,
-                    NetPnL = recordedNetPnl,
-                    HoldMinutes = holdMinutes,
-                    ExitReason = exitReason,
-                    Time = exitEt.ToString("HH:mm"),
-                    EntryTime = entryEt.ToString("HH:mm:ss"),
-                    ExitTime = exitEt.ToString("HH:mm:ss"),
-                    Date = exitEt.Date.ToString("yyyy-MM-dd"),
-                    Regime = string.IsNullOrWhiteSpace(pos.EntryRegime) ? _marketRegime : pos.EntryRegime,
-                    EntryRsi = pos.EntryRsi,
-                    EntryAtr = pos.EntryAtr,
-                    EntryVwap = pos.EntryVwap,
-                    EntrySetupScore = pos.EntrySetupScore,
-                    NwEntryAudit = pos.NwEntryAudit
-                };
-                lock (_allTrades)
-                {
-                    _allTrades.Add(allTradeRecord);
-                    if (_allTrades.Count > 2000) _allTrades.RemoveAt(0);
-                }
-                Task.Run(() => SaveAllTrades());
-
-                if (isFullClose)
-                {
-                    if (recordedNetPnl > 0)
-                    {
-                        _winCount++;
-                        _consecutiveLosses = 0;
-                    }
-                    else
-                    {
-                        _lossCount++;
-                        _consecutiveLosses++;
-                        if (MAX_CONSECUTIVE_LOSSES > 0 && _consecutiveLosses >= MAX_CONSECUTIVE_LOSSES)
-                        {
-                            _haltTrading = true;
-                            _haltReason = "CONSECUTIVE_LOSSES";
-                            LogMessage($"[HALT] {_consecutiveLosses} consecutive losses — trading paused for the session.");
-                            _ = SendEmail($"🛑 {_consecutiveLosses} Consecutive Losses",
-                                          $"Bot halted after {_consecutiveLosses} losses in a row. Daily PnL: {_totalRealizedPnL:C2}");
-                        }
-                    }
-
-                    _marketData.TryGetValue(order.Symbol, out var exitCandles);
-                    LogTradeAnalytics(order.Symbol, pos.AvgPrice, fillPrice,
-                                      netPnl, holdMinutes,
-                                      SafeATR(exitCandles, 14), SafeRSI(exitCandles, 14),
-                                      pos.StrategyTag, pos.IsShort);
-
-                    _positions.Remove(order.Symbol);
-                    _lastTradeTime[order.Symbol] = DateTime.UtcNow;
-                    _lastTradeWasLoss[order.Symbol] = recordedNetPnl <= 0;
-                }
-
-                subject = $"💰 {(isFullClose ? "CLOSE" : "PARTIAL")}: {order.Symbol} x{fillQty} @ {fillPrice:C2} | Net: {recordedNetPnl:C2}";
-                body = $"{(isFullClose ? "Closed" : "Partial")} {fillQty} @ {fillPrice:C2}\nGross: {grossPnl:C2}  Commission: -{(isFullClose ? COMMISSION_PER_SIDE * 2 : COMMISSION_PER_SIDE):C0}  Net: {recordedNetPnl:C2}\nStrategy: {pos.StrategyTag}";
-            }
-
-            string arrow = order.Side == TradeSide.Buy ? "▲" : "▼";
-            string detail = string.IsNullOrWhiteSpace(subject) ? "" : $" | {subject}";
-            string logLine = $"[{DateTime.UtcNow:HH:mm:ss}] {arrow} {order.Side,-4} {order.Symbol,-5} x{fillQty,-4} @ {fillPrice:C2}{detail}";
-            _tradeHistoryLog.Add(logLine);
-            if (_tradeHistoryLog.Count > 50) _tradeHistoryLog.RemoveAt(0);
-
-            Task.Run(() => SendEmail(subject, body));
-        }
-
-        _equityCurve.Add((DateTime.UtcNow, _totalRealizedPnL));
-        SaveEquityCurve();
-        CheckDailyLimits();
-        SaveState();
-    }
-
     // ══════════════════════════════════════════════════════════
     //  DAILY CONTROLS
     // ══════════════════════════════════════════════════════════
 
     private void CheckDailyLimits()
     {
-        if (_manualResumeOverride) return;
+        if (_manualResumeOverride || HaltRequiresReview()) return;
 
         if (_totalRealizedPnL >= DAILY_PROFIT_GOAL || _totalRealizedPnL <= MAX_DAILY_LOSS)
         {
@@ -4756,19 +4571,15 @@ public partial class SimulatedBroker
         _lastNwDecisionBySymbol.Clear();
         _lastNwTouchDecisionBySymbol.Clear();
         _nwTouchState.Clear();
-        _pendingEntrySymbols.Clear();
-        _pendingEntryCreatedUtc.Clear();
+        // Working orders and their reservations survive the calendar boundary.
+        // Only a broker callback or reconciliation can release them.
         _entryOrderRejectionCooldownUntilUtc.Clear();
-        _pendingStrategyTag?.Clear();
-        _pendingInitialRisk.Clear();
-        _pendingNwEntryAudit.Clear();
-        _pendingBracketChildren.Clear();
-        _pendingEntryCount = 0;
         _completedTrades.Clear();
         _lastVolumeResetEt = nowEt.Date;
         _eodSent = false;
-        _haltTrading = false;
-        _haltReason = "";
+        bool requiresReview = HaltRequiresReview();
+        _haltTrading = requiresReview;
+        if (!requiresReview) _haltReason = "";
         _manualResumeOverride = false;
         _tradesToday = 0;
         _tradesThisHour = 0;
@@ -4791,7 +4602,7 @@ public partial class SimulatedBroker
         if (!_eodSent && now.Hour == 15 && now.Minute >= 30)
         {
             _haltTrading = true;
-            _haltReason = "EOD";
+            if (!HaltRequiresReview()) _haltReason = "EOD";
             _eodSent = true;
 
             SnapshotLifetimeEquity();
@@ -4872,6 +4683,12 @@ public partial class SimulatedBroker
 
     public void SaveState()
     {
+        lock (_lock)
+            SaveStateLocked();
+    }
+
+    private void SaveStateLocked()
+    {
         try
         {
             List<DateTime> recentEntryTimes;
@@ -4887,6 +4704,8 @@ public partial class SimulatedBroker
             var json = JsonSerializer.Serialize(new BotPersistData
             {
                 Positions = _positions,
+                Orders = _ordersById.Values.ToList(),
+                PendingEntries = CapturePendingEntries(),
                 TotalPnL = _totalRealizedPnL,
                 WinCount = _winCount,
                 LossCount = _lossCount,
@@ -4949,9 +4768,12 @@ public partial class SimulatedBroker
         try
         {
             var data = JsonSerializer.Deserialize<BotPersistData>(raw);
-            if (data == null) { _reconciled = true; return; }
+            if (data == null) throw new InvalidDataException("State file contains no bot state.");
 
             _positions = data.Positions;
+            foreach (var order in data.Orders ?? new List<TrackedOrder>())
+                _ordersById[order.OrderId] = order;
+            RestorePendingEntries(data.PendingEntries ?? new List<PendingEntryState>());
             _totalRealizedPnL = data.TotalPnL;
             _winCount = data.WinCount;
             _lossCount = data.LossCount;
@@ -5090,7 +4912,9 @@ public partial class SimulatedBroker
         catch (Exception ex)
         {
             LogError("LoadState", ex.Message);
-            _reconciled = true;
+            _reconciled = false;
+            _needsReconciliation = true;
+            if (RealBroker?.IsReady == true) RealBroker.RequestPositions();
         }
     }
 
@@ -5105,6 +4929,10 @@ public partial class SimulatedBroker
         lock (_lock)
         {
             _ibkrPositionSnapshot.Clear();
+            _openOrderSnapshotIds.Clear();
+            _openOrderSnapshotDetails.Clear();
+            _positionSnapshotComplete = false;
+            _openOrderSnapshotComplete = false;
             _needsReconciliation = true;
             _reconciled = false;
         }
@@ -5112,22 +4940,14 @@ public partial class SimulatedBroker
         if (RealBroker?.IsReady == true)
             RealBroker.RequestPositions();
 
-        // Safety net: Program.cs only guarded the STARTUP reconciliation with
-        // a 30s ForceReconcile timeout. This path — triggered by the
-        // connection watchdog after every reconnect — had no equivalent.
-        // If IBKR's positionEnd() callback never fires after this
-        // RequestPositions() call (missed/stale reqId, TWS still catching
-        // up post-reconnect, etc.), _reconciled stays false for the rest of
-        // the session and PassesEntryGates() silently blocks every entry —
-        // no error, no log, the bot just never trades again until the
-        // process is fully restarted. Mirror the startup timeout here so a
-        // stuck reconnect-reconciliation can't strand trading indefinitely.
+        // Retry an incomplete snapshot without treating a timeout as permission
+        // to trade against an unknown account state.
         _ = Task.Run(async () =>
         {
             await Task.Delay(30_000);
             if (!_reconciled)
             {
-                LogMessage("[WATCHDOG] Re-reconciliation timed out after 30s — forcing reconcile so trading can resume.");
+                LogMessage("[WATCHDOG] Reconciliation incomplete; entries remain blocked.");
                 ForceReconcile();
             }
         });
@@ -5137,64 +4957,37 @@ public partial class SimulatedBroker
 
     public void ForceReconcile()
     {
-        lock (_lock)
-        {
-            if (_reconciled) return;
-            _needsReconciliation = false;
-
-            if (_ibkrPositionSnapshot.Count > 0)
-            {
-                LogMessage($"[RECONCILE] Forced after timeout — processing {_ibkrPositionSnapshot.Count} partial position(s) received.");
-                foreach (var (sym, (ibkrQty, ibkrCost)) in _ibkrPositionSnapshot)
-                {
-                    if (!_positions.ContainsKey(sym))
-                    {
-                        LogMessage($"[RECONCILE] Force-injected: {sym} x{ibkrQty} @ {ibkrCost:F2}");
-                        _positions[sym] = new SimPosition
-                        {
-                            Symbol = sym,
-                            Quantity = ibkrQty,
-                            AvgPrice = ibkrCost,
-                            HighWaterMark = ibkrCost,
-                            CurrentPrice = ibkrCost,
-                            EntryTime = DateTime.UtcNow,
-                            IsShort = ibkrQty < 0,
-                            ExitSubmitted = false,
-                            StrategyTag = "UNKNOWN_RESUME"
-                        };
-                        _dailyEntryCount[sym] = 1;
-                        _lastTradeTime[sym] = DateTime.UtcNow;
-                    }
-                }
-            }
-            else
-            {
-                LogMessage("[RECONCILE] Forced — no IBKR position data received. Using saved state as-is.");
-            }
-
-            _reconciled = true;
-            LogMessage("[RECONCILE] Forced complete — trading unblocked. Verify positions manually.");
-        }
-        _ = SendEmail("⚠️ Reconciliation Forced",
-            $"positionEnd() not received in time. Partial snapshot had {_ibkrPositionSnapshot.Count} position(s). " +
-            "Verify open positions in TWS.");
+        // A timeout is not evidence that the account is flat. Keep new entries
+        // blocked; a late positionEnd/openOrderEnd can still finish the snapshot.
+        if (_reconciled) return;
+        LogMessage("[RECONCILE] Snapshot incomplete after 30s; entries remain blocked while requesting positions and open orders again.");
+        if (RealBroker?.IsReady == true) RealBroker.RequestPositions();
     }
 
     public void OnPositionReceived(string symbol, int qty, decimal avgCost)
     {
         if (string.IsNullOrEmpty(symbol)) return;
-        if (qty == 0) return;
         lock (_lock)
-            _ibkrPositionSnapshot[symbol] = (qty, avgCost);
+        {
+            if (qty == 0) _ibkrPositionSnapshot.Remove(symbol);
+            else _ibkrPositionSnapshot[symbol] = (qty, avgCost);
+        }
         Console.WriteLine($"[RECONCILE] ← {symbol} x{qty} @ {avgCost:F2}");
     }
 
     public void OnReconciliationComplete()
     {
+        lock (_lock) _positionSnapshotComplete = true;
+        CompleteReconciliationIfReady();
+    }
+
+    private void CompleteReconciliationIfReady()
+    {
         List<string> ghosts;
         lock (_lock)
         {
             if (!_needsReconciliation) return;
+            if (!_positionSnapshotComplete || !_openOrderSnapshotComplete) return;
 
             Console.WriteLine($"[RECONCILE] Snapshot received: {_ibkrPositionSnapshot.Count} position(s).");
 
@@ -5211,10 +5004,11 @@ public partial class SimulatedBroker
             {
                 if (_positions.TryGetValue(sym, out var existing))
                 {
-                    if (existing.Quantity != ibkrQty || existing.AvgPrice != ibkrCost)
+                    if (existing.Quantity != Math.Abs(ibkrQty) || existing.AvgPrice != ibkrCost || existing.IsShort != (ibkrQty < 0))
                     {
                         LogMessage($"[RECONCILE] Corrected {sym}: qty {existing.Quantity}→{ibkrQty}  cost {existing.AvgPrice:F2}→{ibkrCost:F2}");
-                        existing.Quantity = ibkrQty;
+                        existing.Quantity = Math.Abs(ibkrQty);
+                        existing.IsShort = ibkrQty < 0;
                         existing.AvgPrice = ibkrCost;
                         existing.HighWaterMark = ibkrCost;
                     }
@@ -5225,22 +5019,63 @@ public partial class SimulatedBroker
                     _positions[sym] = new SimPosition
                     {
                         Symbol = sym,
-                        Quantity = ibkrQty,
+                        Quantity = Math.Abs(ibkrQty),
                         AvgPrice = ibkrCost,
                         HighWaterMark = ibkrCost,
                         CurrentPrice = ibkrCost,
                         EntryTime = DateTime.UtcNow,
                         IsShort = ibkrQty < 0,
                         ExitSubmitted = false,
-                        StrategyTag = "UNKNOWN_RESUME"
+                        StrategyTag = _pendingStrategyTag.GetValueOrDefault(sym) ?? "UNKNOWN_RESUME",
+                        NwEntryAudit = _pendingNwEntryAudit.GetValueOrDefault(sym),
+                        InitialRiskPerShare = _pendingInitialRisk.GetValueOrDefault(sym),
+                        BracketStopId = _pendingBracketChildren.GetValueOrDefault(sym).stopId,
+                        BracketTargetId = _pendingBracketChildren.GetValueOrDefault(sym).targetId
                     };
                     _dailyEntryCount[sym] = 1;
                     _lastTradeTime[sym] = DateTime.UtcNow;
                 }
             }
 
+            foreach (var order in _ordersById.Values.ToList())
+                if (!_openOrderSnapshotIds.Contains(order.OrderId)) _ordersById.TryRemove(order.OrderId, out _);
+            foreach (var (id, detail) in _openOrderSnapshotDetails.ToList())
+            {
+                if (!_positions.ContainsKey(detail.Symbol) && !_pendingEntrySymbols.ContainsKey(detail.Symbol))
+                {
+                    _haltTrading = true;
+                    _haltReason = "UNMANAGED_ORDERS";
+                    LogMessage($"[RECONCILE] Unrecognized working order {id} for {detail.Symbol}; new entries halted for review.");
+                }
+                OnOpenOrderReceived(id, detail.Symbol, detail.Side, detail.Qty, detail.Type, detail.Parent);
+            }
+            foreach (string symbol in _pendingEntrySymbols.Keys.ToList())
+            {
+                if (_ordersById.Values.Any(o => o.IsEntry && o.Symbol == symbol)) continue;
+                if (!_positions.ContainsKey(symbol)) ReleasePendingEntrySlot(symbol, "broker snapshot confirms no working entry or position");
+                else
+                {
+                    _pendingEntrySymbols.TryRemove(symbol, out _);
+                    _pendingEntryCreatedUtc.TryRemove(symbol, out _);
+                    _pendingStrategyTag.TryRemove(symbol, out _);
+                    _pendingInitialRisk.TryRemove(symbol, out _);
+                    _pendingNwEntryAudit.TryRemove(symbol, out _);
+                    _pendingBracketChildren.TryRemove(symbol, out _);
+                }
+            }
+            _pendingEntryCount = _pendingEntrySymbols.Keys.Count(s => !_positions.ContainsKey(s));
+            foreach (var pos in _positions.Values)
+            {
+                if (!_openOrderSnapshotIds.Contains(pos.BracketStopId)) pos.BracketStopId = 0;
+                if (!_openOrderSnapshotIds.Contains(pos.BracketTargetId)) pos.BracketTargetId = 0;
+                if (!_openOrderSnapshotIds.Contains(pos.EntryOrderId)) pos.EntryOrderId = 0;
+                pos.ExitSubmitted = _deferredExits.ContainsKey(pos.Symbol) || _ordersById.Values.Any(o =>
+                    !o.IsEntry && o.Symbol == pos.Symbol && o.OrderId != pos.BracketStopId && o.OrderId != pos.BracketTargetId);
+            }
+            _requestedNwStops.Clear();
             _needsReconciliation = false;
             _reconciled = true;
+            foreach (string symbol in _deferredExits.Keys.ToList()) ResumeDeferredExit(symbol);
             SaveState();
         }
 
@@ -5376,7 +5211,7 @@ public partial class SimulatedBroker
     private IEnumerable<string> GetPrioritizedWatchlist()
     {
         var withPosition = new HashSet<string>(_positions.Keys, StringComparer.OrdinalIgnoreCase);
-        return _watchlist
+        return _watchlist.Concat(withPosition).Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderByDescending(s => withPosition.Contains(s) ? 2 :
                 (_marketData.TryGetValue(s, out var c) && c.Count > 0 &&
                  SafeATR(c, 14) / (c.LastOrDefault()?.Close ?? 1m) >= MIN_ATR_PCT ? 1 : 0));
@@ -5535,6 +5370,7 @@ public partial class SimulatedBroker
     {
         lock (_lock)
         {
+            if (HaltRequiresReview()) return;
             if (_manualResumeOverride)
             {
                 _haltTrading = false;
@@ -5899,6 +5735,11 @@ public partial class SimulatedBroker
             double GetF(string k, double fb) => Get<double>(k, fb);
             bool GetB(string k, bool fb) { if (!root.TryGetProperty(k, out var el)) return fb; return el.GetBoolean(); }
 
+            ValidateNwEnvelopeSettings(GetI("NW_LOOKBACK", NW_LOOKBACK), GetD("NW_BANDWIDTH", NW_BANDWIDTH), GetD("NW_MULT", NW_MULT));
+            ValidateNwStopLossPct(GetD("NW_STOP_LOSS_PCT", NW_STOP_LOSS_PCT));
+            ValidateNwTakeProfitPct(GetD("NW_TAKE_PROFIT_PCT", NW_TAKE_PROFIT_PCT));
+            ReadNwTimeframes(root, NW_TIMEFRAMES_MINUTES);
+
             TOTAL_BUDGET = GetD("TOTAL_BUDGET", TOTAL_BUDGET);
             MAX_POSITIONS = GetI("MAX_POSITIONS", MAX_POSITIONS);
             POSITION_SIZE = GetD("POSITION_SIZE", POSITION_SIZE);
@@ -6038,7 +5879,9 @@ public partial class SimulatedBroker
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[CONFIG] Load failed ({ex.Message}), using defaults.");
+            _haltTrading = true;
+            _haltReason = "CONFIG_INVALID";
+            Console.WriteLine($"[CONFIG] Load failed ({ex.Message}); new entries halted until the configuration is corrected and trading is resumed.");
         }
     }
 
@@ -6456,6 +6299,7 @@ public partial class SimulatedBroker
 
                     // Validate before entering the mutation block so a bad value
                     // cannot leave the live configuration only partially applied.
+                    ValidateNwEnvelopeSettings(GetI("NW_LOOKBACK", NW_LOOKBACK), GetD("NW_BANDWIDTH", NW_BANDWIDTH), GetD("NW_MULT", NW_MULT));
                     decimal requestedNwTakeProfitPct = ValidateNwTakeProfitPct(
                         GetD("NW_TAKE_PROFIT_PCT", NW_TAKE_PROFIT_PCT));
                     decimal requestedNwStopLossPct = ValidateNwStopLossPct(
@@ -6612,6 +6456,9 @@ public partial class SimulatedBroker
                     if (nwHistoryReloadNeeded)
                     {
                         _hourlyCandles.Clear();
+                        _nwHistoryReady.Clear();
+                        _nwHistoryLoads.Clear();
+                        _nwLiveThrough.Clear();
                     }
 
                     _ = Task.Run(async () =>
@@ -8058,7 +7905,7 @@ public partial class SimulatedBroker
         // Nadaraya-Watson band strategy uses a flat percentage stop (user-configured),
         // not an ATR-based one — checked before the scalp/swing branches below.
         if (strategyTag.StartsWith("NW_BAND_", StringComparison.OrdinalIgnoreCase))
-            return Math.Max(minStop, price * NW_STOP_LOSS_PCT);
+            return price * NW_STOP_LOSS_PCT;
 
         // All scalp strategies now get 1.4-1.8x ATR (was 0.70-0.85x)
         decimal scalpAtrMult = strategyTag.StartsWith("SCALP_ORB_", StringComparison.OrdinalIgnoreCase)

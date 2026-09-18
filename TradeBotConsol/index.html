@@ -3280,11 +3280,11 @@
                 { value: 30, label: '30 min' },
                 { value: 60, label: '1 hour' },
                 { value: 240, label: '4 hours' }
-            ], CFG.NW_TIMEFRAMES_MINUTES, 'Each checked timeframe runs its own completed-bar envelope and fresh-cross state. 30m, 1h and 4h are enabled by default; 15m is available but left off until its noisier signals have evidence.')}
+            ], CFG.NW_TIMEFRAMES_MINUTES, 'Each checked timeframe runs independently. 30m, 1h and 4h are enabled by default; 15m is optional. No timeframe has a validated performance advantage yet.')}
                                                                                                                                                ${field('NW_LOOKBACK', 'NW Lookback (bars)', 'number', CFG.NW_LOOKBACK, 'Completed regular-session bars used by the independent NW envelope. Current profile = 250.')}
-                                                                                                                                               ${field('NW_BANDWIDTH', 'NW Bandwidth', 'number', CFG.NW_BANDWIDTH, 'Gaussian kernel bandwidth — larger = smoother centerline, fewer signals')}
+                                                                                                                                               ${field('NW_BANDWIDTH', 'NW Bandwidth', 'number', CFG.NW_BANDWIDTH, 'Gaussian kernel bandwidth in bars. Larger values smooth the centerline more and can increase lag; signal frequency is not guaranteed to fall.')}
                                                                                                                                                ${field('NW_MULT', 'NW Band Multiplier', 'number', CFG.NW_MULT, 'Band width = kernel MAE x this multiplier — larger = wider bands, fewer signals')}
-                                                                                                                                                ${percentField('NW_STOP_LOSS_PCT', 'NW Stop Loss (%)', CFG.NW_STOP_LOSS_PCT, 'Protective stop from the actual submitted entry. Enter 3 for 3%.')}
+                                                                                                                                                ${percentField('NW_STOP_LOSS_PCT', 'NW Stop Loss (%)', CFG.NW_STOP_LOSS_PCT, 'Stop from the average fill. Enter 3 for 3%; maximum 4%. Existing NW stops update at IBKR while connected; rejected updates halt new entries. Check the working stop in TWS.', 4)}
                                                                                                                                                ${percentField('NW_TAKE_PROFIT_PCT', 'NW Take Profit (%)', CFG.NW_TAKE_PROFIT_PCT, 'Closes the entire NW position when this gain is reached from the actual average fill. Enter 5 for 5%.')}
                                                                                                                                                 ${field('NW_MAX_TRADES_PER_HOUR', 'NW Trades / Rolling Hour', 'number', CFG.NW_MAX_TRADES_PER_HOUR, 'Dedicated NW entry cap. Ordinary strategy trades do not consume it; 0 disables this NW-specific cap.')}
                                                                                                                                                 ${field('NW_MAX_TRADES_PER_DAY', 'NW Trades / Day', 'number', CFG.NW_MAX_TRADES_PER_DAY, 'Dedicated NW strategy-family cap. Account-wide Max Trades / Day still applies; 0 disables only this NW-specific cap.')}
@@ -3425,7 +3425,7 @@
                                                                                                                                     </div>`;
         }
 
-        function percentField(id, label, val, hint = '') {
+        function percentField(id, label, val, hint = '', max = 100) {
             const numericValue = Number(val);
             const displayValue = Number.isFinite(numericValue)
                 ? Number((numericValue * 100).toFixed(4))
@@ -3433,7 +3433,7 @@
             return `<div class="sm-field" title="${hint}">
                     <span class="sm-label">${label}</span>
                     <input class="sm-input" id="cfg-${id}" type="number" value="${displayValue}"
-                           min="0.01" max="100" step="0.01" data-percent="true">
+                           min="0.01" max="${max}" step="0.01" data-percent="true">
                 </div>`;
         }
 
@@ -3552,9 +3552,9 @@
                     .map(inp => Number(inp.value))
                     .filter(Number.isFinite)
                     .sort((a, b) => a - b);
-                // Never send an empty timeframe list; keep the established 30m
-                // profile selected if the user unchecks every option.
-                CFG[key] = values.length ? values : [30];
+                // The backend rejects an empty list. Do not silently re-enable
+                // a timeframe the user explicitly unchecked.
+                CFG[key] = values;
             });
         }
 
