@@ -5055,7 +5055,17 @@ public partial class SimulatedBroker
                 }
                 else
                 {
-                    LogMessage($"[RECONCILE] Injected: {sym} x{ibkrQty} @ {ibkrCost:F2}");
+                    // Recover the strategy tag for positions the bot did not track
+                    // (restart with lost state, manual entry, etc.). In NW-only
+                    // mode an unknown LONG can only be an NW trade — every other
+                    // strategy is disabled — so restore the NW tag (timeframe
+                    // genuinely unknown) to keep correct management: EOD
+                    // exemption, NW profit/stop exits, native stop sync. A bare
+                    // UNKNOWN_RESUME tag would be EOD-liquidated and run through
+                    // generic exits, which is wrong for NW positions.
+                    string recoveredTag = _pendingStrategyTag.GetValueOrDefault(sym)
+                        ?? (NW_ONLY_MODE && ibkrQty > 0 ? "NW_BAND_UNKNOWN_LONG" : "UNKNOWN_RESUME");
+                    LogMessage($"[RECONCILE] Injected: {sym} x{ibkrQty} @ {ibkrCost:F2} tag={recoveredTag}");
                     _positions[sym] = new SimPosition
                     {
                         Symbol = sym,
@@ -5066,7 +5076,7 @@ public partial class SimulatedBroker
                         EntryTime = DateTime.UtcNow,
                         IsShort = ibkrQty < 0,
                         ExitSubmitted = false,
-                        StrategyTag = _pendingStrategyTag.GetValueOrDefault(sym) ?? "UNKNOWN_RESUME",
+                        StrategyTag = recoveredTag,
                         NwEntryAudit = _pendingNwEntryAudit.GetValueOrDefault(sym),
                         InitialRiskPerShare = _pendingInitialRisk.GetValueOrDefault(sym),
                         BracketStopId = _pendingBracketChildren.GetValueOrDefault(sym).stopId,

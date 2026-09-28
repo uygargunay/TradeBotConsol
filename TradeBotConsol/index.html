@@ -2540,13 +2540,15 @@
                 'SCALP_PULLBACK_LONG': 'Pullback ↑',
                 'SCALP_PULLBACK_SHORT': 'Pullback ↓',
                 'OUTSIDE_CANDLE_LONG': 'Outside ↑',
-                'OUTSIDE_CANDLE_SHORT': 'Outside ↓'
+                'OUTSIDE_CANDLE_SHORT': 'Outside ↓',
+                'UNKNOWN_RESUME': 'resumed ?'
             };
             if ((s || '').startsWith('PATTERN_')) {
                 return s.replace('PATTERN_', '').replace('_LONG', ' ↑').replace('_SHORT', ' ↓').replaceAll('_', ' ');
             }
             if ((s || '').startsWith('NW_BAND_')) {
                 const match = s.match(/^NW_BAND_(\d+)(M|H)_LONG$/i);
+                if (/UNKNOWN/i.test(s)) return 'NW ? ↑';
                 let label = nwTimeframeLabel(nwTf);
                 if (match) label = match[2].toUpperCase() === 'H'
                     ? `${Number(match[1])}h`
