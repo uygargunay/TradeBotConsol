@@ -6,6 +6,10 @@ public partial class SimulatedBroker
                                       TradeSide Side, string Reason, string Type);
     private readonly Dictionary<string, DeferredExit> _deferredExits = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, (int Id, int Qty, decimal Price)> _requestedNwStops = new();
+    private readonly Dictionary<string, (int Id, int Qty, decimal Price)> _requestedNwProfitTargets = new();
+    // Cooldown after a failed native profit-target submission so a rejected order
+    // cannot spam IBKR on every tick; the local profit exit stays as fallback.
+    private readonly Dictionary<string, DateTime> _nwProfitTargetRetryAfterUtc = new();
     private bool _positionSnapshotComplete;
     private bool _openOrderSnapshotComplete;
     private readonly HashSet<int> _openOrderSnapshotIds = new();
@@ -106,6 +110,8 @@ public partial class SimulatedBroker
             _nwEnvelopeCache.Clear();
             _currentMinuteCandle.Clear();
             _requestedNwStops.Clear();
+            _requestedNwProfitTargets.Clear();
+            _nwProfitTargetRetryAfterUtc.Clear();
         }
     }
 
@@ -144,6 +150,52 @@ public partial class SimulatedBroker
             RegisterLiveOrder(id, symbol, side, totalQty);
             if (_positions.TryGetValue(symbol, out var pos)) pos.BracketStopId = id;
             _bracketExitReasonByOrderId[id] = "NW_STOP_LOSS";
+            SaveState();
+        }
+    }
+
+    // Keep a native GTC limit sell at AvgPrice*(1+NW_TAKE_PROFIT_PCT) working at
+    // IBKR for every NW long position, so the profit target survives a bot or
+    // connection outage. Opt-in via NW_NATIVE_PROFIT_TARGET (default false);
+    // the local CheckExits() profit sell remains as the fallback whenever no
+    // native order is working.
+    private void SyncNwProfitTarget(SimPosition pos)
+    {
+        if (!NW_NATIVE_PROFIT_TARGET) return;
+        if (!IsNwPosition(pos) || pos.ExitSubmitted || pos.IsShort || !_reconciled || RealBroker?.IsReady != true) return;
+        if (pos.AvgPrice <= 0m || pos.Quantity <= 0) return;
+        // The target is measured from the actual average fill, which is only
+        // known once the parent entry order is done. Skip while it is working.
+        if (pos.EntryOrderId > 0 && _ordersById.ContainsKey(pos.EntryOrderId)) return;
+        if (_nwProfitTargetRetryAfterUtc.TryGetValue(pos.Symbol, out var retryAfter) && DateTime.UtcNow < retryAfter) return;
+        decimal target = pos.AvgPrice >= 1m
+            ? Math.Round(pos.AvgPrice * (1m + NW_TAKE_PROFIT_PCT), 2, MidpointRounding.AwayFromZero)
+            : Math.Round(pos.AvgPrice * (1m + NW_TAKE_PROFIT_PCT), 4, MidpointRounding.AwayFromZero);
+        var requested = (pos.BracketTargetId, pos.Quantity, target);
+        if (_requestedNwProfitTargets.TryGetValue(pos.Symbol, out var previous) && previous == requested) return;
+        // IBKR's TotalQuantity includes shares already filled on this order.
+        int filledOnTarget = _ordersById.TryGetValue(pos.BracketTargetId, out var trackedTarget) ? trackedTarget.FilledQty : 0;
+        int id = RealBroker.EnsureNwProfitTarget(pos.Symbol, pos.BracketTargetId, pos.Quantity + filledOnTarget,
+            TradeSide.Sell, target);
+        if (id <= 0)
+        {
+            _nwProfitTargetRetryAfterUtc[pos.Symbol] = DateTime.UtcNow.AddSeconds(60);
+            LogMessage($"[NW PROFIT] {pos.Symbol} native target submission failed; retrying in 60s (local exit remains as fallback).");
+            return;
+        }
+        _nwProfitTargetRetryAfterUtc.Remove(pos.Symbol);
+        pos.BracketTargetId = id;
+        _bracketExitReasonByOrderId[id] = "NW_TAKE_PROFIT";
+        _requestedNwProfitTargets[pos.Symbol] = (id, pos.Quantity, target);
+    }
+
+    public void RegisterNwProfitTarget(int id, string symbol, TradeSide side, int totalQty)
+    {
+        lock (_lock)
+        {
+            RegisterLiveOrder(id, symbol, side, totalQty);
+            if (_positions.TryGetValue(symbol, out var pos)) pos.BracketTargetId = id;
+            _bracketExitReasonByOrderId[id] = "NW_TAKE_PROFIT";
             SaveState();
         }
     }
@@ -399,7 +451,10 @@ public partial class SimulatedBroker
             if (_tradeHistoryLog.Count > 50) _tradeHistoryLog.RemoveAt(0);
             if (terminal) FinishTrackedOrder(order);
             if (terminal && order.IsEntry && _positions.TryGetValue(order.Symbol, out var filledPosition))
+            {
                 SyncNwProtectiveStop(filledPosition);
+                SyncNwProfitTarget(filledPosition);
+            }
             if (terminal)
                 _ = SendEmail($"Fill: {order.Symbol} {order.Side} x{cumulativeQty}",
                     $"Order {orderId}: {cumulativeQty} shares at average {averagePrice:F4}. " +

@@ -14,7 +14,7 @@
   "COMMISSION_PER_SIDE": 1.0,
   "MIN_STOP_DISTANCE": 0.1,
   "MAX_QTY_SANITY": 500,
-  "RISK_PCT": 0.004,
+  "RISK_PCT": 0.002,
   "ORB_MINUTES": 10,
   "VOL_EXPAND_MULT": 1.3,
   "RSI_LONG_MIN": 58.0,
@@ -74,7 +74,7 @@
   "STRATEGY_NADARAYA_WATSON": true,
   "NW_LOOKBACK": 250,
   "NW_BANDWIDTH": 6.0,
-  "NW_MULT": 2.5,
+  "NW_MULT": 3.0,
   "NW_MAX_TRADES_PER_HOUR": 4,
   "NW_MAX_TRADES_PER_DAY": 4,
   "earnings_blacklist": [],
@@ -132,11 +132,13 @@
     "BLK",
     "V"
   ],
-  "notes": "NW-only profile: monitors selected completed-bar timeframes independently, requires a fresh live cross from above the lower band, and holds across sessions for the configured 5% target or 3% protective stop.",
+  "notes": "NW-only profile: monitors selected completed-bar timeframes independently, requires a fresh live cross from above the lower band, and holds across sessions for the configured 4% target or 3% protective stop. Bands are wider (mult 3.0); risk is 0.2%/entry.",
   "USE_SMA100": true,
   "MinGrossTargetToCommissionMult": 3.0,
   "NW_STOP_LOSS_PCT": 0.03,
-  "NW_TAKE_PROFIT_PCT": 0.05,
+  "NW_TAKE_PROFIT_PCT": 0.04,
   "NW_TIMEFRAMES_MINUTES": [30, 60, 240],
-  "NW_TIMEFRAME_MINUTES": 30
+  "NW_TIMEFRAME_MINUTES": 30,
+  "NW_NATIVE_PROFIT_TARGET": false,
+  "NW_ALLOW_SINGLE_SHARE_ABOVE_RISK": false
 }

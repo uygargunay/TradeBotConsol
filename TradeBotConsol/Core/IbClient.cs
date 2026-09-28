@@ -448,6 +448,61 @@ public class IbClient : EWrapper, IBroker
         }
     }
 
+    // IBroker.EnsureNwProfitTarget — standalone native GTC profit limit for NW.
+    // Mirrors EnsureNwStop: idempotent on (orderId, qty, price); returns the working
+    // order id, or 0 when submission was not attempted. A transport exception keeps
+    // the retained-identity contract (fills of a possibly accepted order must be
+    // tracked — an ignored fill could desync the position), and routes through
+    // OnOrderSubmissionUncertain exactly like entries and stops do.
+    public int EnsureNwProfitTarget(string symbol, int orderId, int qty, TradeSide side, decimal limitPrice)
+    {
+        if (!_isReady || qty <= 0 || limitPrice <= 0m || _cancelRequestedOrderIds.ContainsKey(orderId)) return 0;
+        Contract contract;
+        Order target;
+        if (orderId > 0)
+        {
+            if (!_submittedOrders.TryGetValue(orderId, out var existing)
+                || _terminalOrderIds.ContainsKey(orderId)) return 0;
+            if (existing.Order.OrderType != "LMT" || existing.Contract.Symbol != symbol) return 0;
+            if ((decimal)existing.Order.LmtPrice == limitPrice && existing.Order.TotalQuantity == qty) return orderId;
+            contract = existing.Contract;
+            target = new Order
+            {
+                Action = ActionString(side), OrderType = "LMT", TotalQuantity = qty,
+                LmtPrice = (double)limitPrice,
+                Tif = "GTC", Transmit = true
+            };
+        }
+        else
+        {
+            orderId = Interlocked.Increment(ref _currentOrderId);
+            contract = new Contract { Symbol = symbol, SecType = "STK", Exchange = "SMART", Currency = "USD" };
+            target = new Order
+            {
+                Action = ActionString(side), OrderType = "LMT", TotalQuantity = qty,
+                LmtPrice = (double)limitPrice,
+                Tif = "GTC", Transmit = true
+            };
+            _activeOrderIds[orderId] = true;
+        }
+        _broker.RegisterNwProfitTarget(orderId, symbol, side, qty);
+        _submittedOrders[orderId] = (contract, target);
+        try
+        {
+            _client.placeOrder(orderId, contract, target);
+            _submittedOrders[orderId] = (contract, target);
+            Console.WriteLine($"[NW PROFIT] {symbol} x{qty} {ActionString(side)}@{limitPrice:F2} GTC order={orderId}");
+            return orderId;
+        }
+        catch (Exception ex)
+        {
+            _broker.OnOrderSubmissionUncertain(symbol, $"NW profit target: {ex.Message}");
+            Console.WriteLine($"[NW PROFIT] submission failed for {symbol}: {ex.Message}");
+            // Retain the identity of a possibly accepted order until reconciliation.
+            return orderId;
+        }
+    }
+
     // IBroker.RequestPositions
     public void RequestPositions()
     {

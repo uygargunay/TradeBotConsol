@@ -37,6 +37,10 @@ public interface IBroker
     bool IsReady { get; }
     void RequestPositions();
     int EnsureNwStop(string symbol, int orderId, int qty, TradeSide side, decimal stopPrice);
+    // Standalone native GTC profit target for NW positions. Mirrors EnsureNwStop:
+    // returns the working order id (retained across transport exceptions so fills
+    // of a possibly accepted order stay tracked), 0 when submission was not attempted.
+    int EnsureNwProfitTarget(string symbol, int orderId, int qty, TradeSide side, decimal limitPrice);
     void RequestDailyHistoricalData(string symbol);
     void RequestHourlyHistoricalData(string symbol, int timeframeMinutes);
     bool SupportsBrackets { get; }
@@ -215,7 +219,7 @@ public partial class SimulatedBroker
     private decimal COMMISSION_PER_SIDE = 1m;
     private decimal MIN_STOP_DISTANCE = 0.10m;
     private int MAX_QTY_SANITY = 500;
-    private decimal RISK_PCT = 0.004m;
+    private decimal RISK_PCT = 0.002m;
     private int ORB_MINUTES = 10;              // looser ORB window; still avoids first-minute noise
     private decimal VOL_EXPAND_MULT = 1.30m;
     private double RSI_LONG_MIN = 58.0;
@@ -356,9 +360,17 @@ public partial class SimulatedBroker
     private int[] NW_TIMEFRAMES_MINUTES = { 30, 60, 240 };
     private int NW_LOOKBACK = 250;          // completed regular-session bars per selected timeframe
     private decimal NW_BANDWIDTH = 6m;      // Gaussian kernel bandwidth — larger = smoother centerline
-    private decimal NW_MULT = 2.5m;         // band width = kernel MAE * this multiplier
+    private decimal NW_MULT = 3.0m;         // band width = kernel MAE * this multiplier
     private decimal NW_STOP_LOSS_PCT = 0.03m;  // flat % stop-loss for NW_BAND_ trades (not ATR-based)
-    private decimal NW_TAKE_PROFIT_PCT = 0.05m; // close the full NW position at this gain from average fill
+    private decimal NW_TAKE_PROFIT_PCT = 0.04m; // close the full NW position at this gain from average fill
+    // Native GTC profit target: when true, a GTC limit sell at AvgPrice*(1+NW_TAKE_PROFIT_PCT)
+    // is kept at IBKR for every NW position so the target survives a bot/connection outage.
+    // Default false preserves the previous local-only behavior.
+    private bool NW_NATIVE_PROFIT_TARGET = false;
+    // Single-share override: when true, an NW signal whose risk-sized quantity rounds to
+    // zero (expensive stock) may still buy 1 share if it fits the position slot and cash.
+    // The per-trade risk budget is exceeded by design; default false keeps the block.
+    private bool NW_ALLOW_SINGLE_SHARE_ABOVE_RISK = false;
     private bool EARLY_PATTERN_ENTRY_ENABLED = false;
     private int PATTERN_MIN_SCORE = 68;
     private int INTRABAR_SIGNAL_COOLDOWN_SECONDS = 30;
@@ -2216,11 +2228,27 @@ public partial class SimulatedBroker
         int qty = CalcQty(price, stopDistance);
         if (qty <= 0)
         {
-            string decision = $"TOUCH blocked ({confirmationLabel}): size is zero";
-            _lastNwDecisionBySymbol[symbol] = decision;
-            _lastNwTouchDecisionBySymbol[symbol] =
-                $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
-            return false;
+            // A risk-sized quantity rounds to zero when the share price exceeds what the
+            // per-trade risk budget can cover: price > TOTAL_BUDGET * RISK_PCT * sizeMult / NW_STOP_LOSS_PCT.
+            decimal riskBudget = TOTAL_BUDGET * RISK_PCT * GetDynamicSizeMultiplier();
+            decimal maxRiskSizedPrice = NW_STOP_LOSS_PCT > 0m ? riskBudget / NW_STOP_LOSS_PCT : 0m;
+            decimal deployedCapital = _positions.Values.Sum(p => p.AvgPrice * p.Quantity) + _pendingEntryCount * POSITION_SIZE;
+            decimal remainingCash = Math.Max(0m, TOTAL_BUDGET - deployedCapital);
+            if (NW_ALLOW_SINGLE_SHARE_ABOVE_RISK && price > 0m && price <= POSITION_SIZE && price <= remainingCash)
+            {
+                qty = 1;
+                LogMessage($"[NW SINGLE-SHARE] {symbol} price={price:F2} exceeds risk-sized max {maxRiskSizedPrice:F2}; " +
+                           $"buying 1 share by override (risk budget ${riskBudget:F2} exceeded by design).");
+            }
+            else
+            {
+                string decision = $"TOUCH blocked ({confirmationLabel}): size is zero — price {price:F2} " +
+                                  $"exceeds risk-sized max {maxRiskSizedPrice:F2} at {RISK_PCT:P2} risk/trade";
+                _lastNwDecisionBySymbol[symbol] = decision;
+                _lastNwTouchDecisionBySymbol[symbol] =
+                    $"Last {GetEasternTime():HH:mm:ss} ET — {decision}";
+                return false;
+            }
         }
 
         var nwEntryAudit = new NwEntryAudit
@@ -4160,7 +4188,10 @@ public partial class SimulatedBroker
                     SubmitOrder(symbol, pos.Quantity, currentPrice,
                         pos.IsShort ? TradeSide.Buy : TradeSide.Sell, "NW_STOP_LOSS", "MKT");
                 else
+                {
                     SyncNwProtectiveStop(pos);
+                    SyncNwProfitTarget(pos);
+                }
                 return;
             }
             if (!_marketData.TryGetValue(symbol, out var candles)) return;
@@ -4241,6 +4272,15 @@ public partial class SimulatedBroker
 
                 if (nwExitHit)
                 {
+                    if (NW_NATIVE_PROFIT_TARGET && pos.BracketTargetId > 0)
+                    {
+                        // A native GTC profit order is working at IBKR; let the
+                        // fill arrive through the normal execution path instead of
+                        // sending a second local market sell. If the native order
+                        // disappears, the next evaluation re-syncs it (or falls
+                        // back to the local sell below).
+                        return;
+                    }
                     CancelBracketChildren(pos);
                     pos.ExitSubmitted = true;
                     const string reason = "NW_TAKE_PROFIT";
@@ -5073,6 +5113,8 @@ public partial class SimulatedBroker
                     !o.IsEntry && o.Symbol == pos.Symbol && o.OrderId != pos.BracketStopId && o.OrderId != pos.BracketTargetId);
             }
             _requestedNwStops.Clear();
+            _requestedNwProfitTargets.Clear();
+            _nwProfitTargetRetryAfterUtc.Clear();
             _needsReconciliation = false;
             _reconciled = true;
             foreach (string symbol in _deferredExits.Keys.ToList()) ResumeDeferredExit(symbol);
@@ -5796,6 +5838,8 @@ public partial class SimulatedBroker
             NW_TAKE_PROFIT_PCT = ValidateNwTakeProfitPct(GetD("NW_TAKE_PROFIT_PCT", NW_TAKE_PROFIT_PCT));
             NW_MAX_TRADES_PER_HOUR = Math.Max(0, GetI("NW_MAX_TRADES_PER_HOUR", NW_MAX_TRADES_PER_HOUR));
             NW_MAX_TRADES_PER_DAY = Math.Max(0, GetI("NW_MAX_TRADES_PER_DAY", NW_MAX_TRADES_PER_DAY));
+            NW_NATIVE_PROFIT_TARGET = GetB("NW_NATIVE_PROFIT_TARGET", NW_NATIVE_PROFIT_TARGET);
+            NW_ALLOW_SINGLE_SHARE_ABOVE_RISK = GetB("NW_ALLOW_SINGLE_SHARE_ABOVE_RISK", NW_ALLOW_SINGLE_SHARE_ABOVE_RISK);
             if (NW_ONLY_MODE && !hasExplicitNwOnlyMode)
             {
                 // One-time in-memory migration from the merged pre-NW-only
@@ -6372,6 +6416,8 @@ public partial class SimulatedBroker
                         NW_TAKE_PROFIT_PCT = requestedNwTakeProfitPct;
                         NW_MAX_TRADES_PER_HOUR = Math.Max(0, GetI("NW_MAX_TRADES_PER_HOUR", NW_MAX_TRADES_PER_HOUR));
                         NW_MAX_TRADES_PER_DAY = Math.Max(0, GetI("NW_MAX_TRADES_PER_DAY", NW_MAX_TRADES_PER_DAY));
+                        NW_NATIVE_PROFIT_TARGET = GetB("NW_NATIVE_PROFIT_TARGET", NW_NATIVE_PROFIT_TARGET);
+                        NW_ALLOW_SINGLE_SHARE_ABOVE_RISK = GetB("NW_ALLOW_SINGLE_SHARE_ABOVE_RISK", NW_ALLOW_SINGLE_SHARE_ABOVE_RISK);
                         EARLY_PATTERN_ENTRY_ENABLED = GetB("EARLY_PATTERN_ENTRY", EARLY_PATTERN_ENTRY_ENABLED);
                         PATTERN_MIN_SCORE = GetI("PATTERN_MIN_SCORE", PATTERN_MIN_SCORE);
                         INTRABAR_SIGNAL_COOLDOWN_SECONDS = GetI("INTRABAR_SIGNAL_COOLDOWN_SECONDS", INTRABAR_SIGNAL_COOLDOWN_SECONDS);

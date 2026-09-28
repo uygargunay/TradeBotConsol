@@ -268,6 +268,9 @@ sealed class FakeBroker(SimulatedBroker bot) : IBroker
     public readonly List<(int Id, int Qty, decimal Price)> Stops = new();
     public int EnsureNwStop(string symbol, int id, int qty, TradeSide side, decimal price)
     { if (id == 0) id = 2000 + Stops.Count; Stops.Add((id, qty, price)); return id; }
+    public readonly List<(int Id, int Qty, decimal Price)> ProfitTargets = new();
+    public int EnsureNwProfitTarget(string symbol, int orderId, int qty, TradeSide side, decimal limitPrice)
+    { if (orderId == 0) orderId = 3000 + ProfitTargets.Count; ProfitTargets.Add((orderId, qty, limitPrice)); return orderId; }
     public void SubmitOrder(string symbol, int qty, decimal price, TradeSide side, double currentRsi = 0, string orderType = "LMT")
     { Sent.Add((symbol, qty, price, side)); bot.RegisterLiveOrder(1000 + Sent.Count, symbol, side, qty); }
     public bool SubmitBracketOrder(string s, int q, decimal e, TradeSide side, decimal stop, decimal limit, decimal target,
