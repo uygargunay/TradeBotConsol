@@ -839,6 +839,16 @@ public partial class SimulatedBroker
         return (fallbackPrice, fallbackPrice > 0 ? "bar" : "none", double.PositiveInfinity, bid, ask, last);
     }
 
+    // Live price for PnL math — the same source the dashboard position cards use.
+    // p.CurrentPrice only moves on trade ticks, so it can sit stale (entry fill,
+    // reconcile cost) while quotes keep flowing. Using it made topbar Unrealized /
+    // Total Equity disagree with the position cards and with IBKR.
+    private decimal GetLivePositionPrice(SimPosition p)
+    {
+        var q = GetDisplayQuote(p.Symbol, p.CurrentPrice > 0 ? p.CurrentPrice : p.AvgPrice);
+        return q.price > 0 ? q.price : p.CurrentPrice;
+    }
+
     private void UpdateVwap(string symbol, decimal price, long size)
     {
         if (size <= 0) return;
@@ -6725,8 +6735,7 @@ public partial class SimulatedBroker
             foreach (var kv in _positions)
             {
                 var p = kv.Value;
-                var posQuote = GetDisplayQuote(p.Symbol, p.CurrentPrice > 0 ? p.CurrentPrice : p.AvgPrice);
-                decimal px = posQuote.price > 0 ? posQuote.price : p.CurrentPrice;
+                decimal px = GetLivePositionPrice(p);
                 decimal unrl = p.UnrealizedPnL(px);
                 decimal pnlPt = p.AvgPrice > 0
                     ? (px - p.AvgPrice) / p.AvgPrice * (p.IsShort ? -1 : 1) * 100 : 0;
@@ -7010,7 +7019,7 @@ public partial class SimulatedBroker
             int rollingNwHourTrades;
             lock (_lock)
             {
-                foreach (var p in _positions.Values) unrealizedPnl += p.UnrealizedPnL(p.CurrentPrice);
+                foreach (var p in _positions.Values) unrealizedPnl += p.UnrealizedPnL(GetLivePositionPrice(p));
                 rollingHourTrades = GetRollingHourEntryCountLocked(DateTime.UtcNow);
                 rollingNwHourTrades = GetRollingNwHourEntryCountLocked(DateTime.UtcNow);
             }
@@ -7135,7 +7144,7 @@ public partial class SimulatedBroker
 
             // ── Risk management status line ──
             decimal unrealPnlConsole = 0m;
-            lock (_lock) { foreach (var p in _positions.Values) unrealPnlConsole += p.UnrealizedPnL(p.CurrentPrice); }
+            lock (_lock) { foreach (var p in _positions.Values) unrealPnlConsole += p.UnrealizedPnL(GetLivePositionPrice(p)); }
             decimal totalEqConsole = _totalRealizedPnL + unrealPnlConsole;
             decimal sizeMult = GetDynamicSizeMultiplier();
             string ddFlag = IsUnrealizedDrawdownBreached() ? "⚠ BREACHED" : "OK";
@@ -7164,9 +7173,10 @@ public partial class SimulatedBroker
                     foreach (var p in _positions.Values)
                     {
                         double mins = (DateTime.UtcNow - p.EntryTime).TotalMinutes;
-                        decimal pnl = p.UnrealizedPnL(p.CurrentPrice);
+                        decimal pxLive = GetLivePositionPrice(p);
+                        decimal pnl = p.UnrealizedPnL(pxLive);
                         decimal pnlPct = p.AvgPrice > 0
-                            ? (p.CurrentPrice - p.AvgPrice) / p.AvgPrice * 100 : 0;
+                            ? (pxLive - p.AvgPrice) / p.AvgPrice * 100 : 0;
                         _vwap.TryGetValue(p.Symbol, out decimal v);
                         _marketData.TryGetValue(p.Symbol, out var pc);
                         decimal atr = SafeATR(pc, 14);
@@ -7892,7 +7902,7 @@ public partial class SimulatedBroker
         lock (_lock)
         {
             foreach (var pos in _positions.Values)
-                unrealized += pos.UnrealizedPnL(pos.CurrentPrice);
+                unrealized += pos.UnrealizedPnL(GetLivePositionPrice(pos));
         }
         return _totalRealizedPnL + unrealized;
     }
